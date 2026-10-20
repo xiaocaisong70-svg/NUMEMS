@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect } from "react";
+import { useCodexTools } from "./worker-tools";
 import { ArrowRight, ArrowUpRight, Bell, Check, ChevronRight, Clock3, FileText, History, LayoutDashboard, LogIn, Play, Plus, RefreshCw, Send, ShieldCheck, SlidersHorizontal, Sparkles, Users, X } from "lucide-react";
 
 type Data = { user: { userId: string; email: string; displayName?: string; isAdmin?: boolean } | null; view?: Record<string, unknown> | null; connection?: { memberAdapter?: string; scheduler?: boolean; mail?: boolean; lastDeliveryError?: string | null }; error?: string };
@@ -25,6 +26,7 @@ export default function Portal({ initialData }: { initialData: Data }) {
   const [message, setMessage] = useState("");
   const current = demo || data || { user: null };
   const user = current.user;
+  useCodexTools<Data>(Boolean(user?.isAdmin && !demo), setData);
   const codexMode = !demo && current.connection?.memberAdapter?.startsWith("codex_");
   const view = current.view || {};
   const config = { totalSeats: 4, reservedSeats: 1, leaseHours: 3, automationEnabled: false, inventoryVerified: false, workspaceId: "", whitelist: [] as string[], ...(view.config as Record<string, unknown> || {}) };
