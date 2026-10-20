@@ -23,21 +23,28 @@ export function useCodexTools<T>(enabled: boolean, update: (data: T) => void) {
         arguments: { type: "object" },
       }, required: ["operation", "arguments"], additionalProperties: false },
       async execute(input: unknown) {
+        try {
         const value = input as { operation?: string; arguments?: Record<string, unknown> };
         if (!value || !operations.includes(value.operation ?? "") || !value.arguments ||
             typeof value.arguments !== "object" || Array.isArray(value.arguments))
           throw new Error("自动化工具参数无效。");
-        const response = await fetch("/mcp", { method: "POST",
+        const response = await fetch("/api/codex", { method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method: "tools/call",
             params: { name: value.operation, arguments: value.arguments } }),
         });
+        if (!response.headers.get("content-type")?.includes("application/json"))
+          throw new Error(`门户连接失败（HTTP ${response.status}）。`);
         const body = await response.json() as { result?: { isError?: boolean; content?: {text?: string}[] }; error?: unknown };
         if (!response.ok || body.error || body.result?.isError)
           throw new Error(body.result?.content?.[0]?.text || "门户操作未完成。");
         const data = await fetch("/api/portal", { cache: "no-store" });
         if (data.ok) update(await data.json() as T);
         return body.result;
+        } catch (error) {
+          return { isError: true, content: [{ type: "text", text:
+            error instanceof Error ? error.message : "门户操作未完成。" }] };
+        }
       },
     }, { signal: lifecycle.signal })).catch(() => { /* Normal UI stays usable. */ });
     return () => lifecycle.abort();
