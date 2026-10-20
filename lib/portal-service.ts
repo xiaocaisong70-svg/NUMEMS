@@ -69,12 +69,16 @@ export async function portalData() {
   const view = viewState(state, user ?? anonymous);
   const runtime = (state as State & { runtime?: { lastTickAt?: string; lastDeliveryError?: string } }).runtime;
   const codex = (state as BridgeState).codex;
+  const onDemand = codex?.scheduleId?.startsWith("local:queue-checker:") ?? false;
+  const checkerFresh = Boolean(runtime?.lastTickAt &&
+    Date.now() - Date.parse(runtime.lastTickAt) < 3 * 60_000);
   return {
     user,
     view,
     connection: {
       memberAdapter: codex?.enabled ? (codex.testOnly ? "codex_test" : "codex_browser") : "not_connected",
-      scheduler: Boolean(codex?.scheduleId) || env.PORTAL_SCHEDULE_ENABLED === "true",
+      scheduler: onDemand ? checkerFresh : Boolean(codex?.scheduleId) || env.PORTAL_SCHEDULE_ENABLED === "true",
+      schedulerMode: onDemand ? "on_demand" : "heartbeat",
       lastTickAt: runtime?.lastTickAt ?? null,
       mail: Boolean(codex?.mailVerifiedAt || (env.REMINDER_WEBHOOK_URL && env.REMINDER_WEBHOOK_TOKEN)),
       lastDeliveryError: user?.isAdmin ? codex?.lastError ?? runtime?.lastDeliveryError ?? null : undefined,

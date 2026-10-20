@@ -15,7 +15,7 @@ const observationSchema = { type: "object", properties: {
 }, required: ["workspaceId", "accountEmail", "pageUrl", "observedAt", "complete", "totalSeats", "members", "invites"], additionalProperties: false };
 const tools = [
   {
-    name: "record_codex_schedule", description: "本地Codex定时任务已实际创建并核对后登记其ID；空字符串表示清除登记，不代替真正暂停任务。",
+    name: "record_codex_schedule", description: "本地定时任务或按需队列检查程序已实际安装核对后登记其ID；空字符串表示清除登记，不代替真正暂停任务。",
     inputSchema: { type: "object", properties: { scheduleId: { type: "string" } }, required: ["scheduleId"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
