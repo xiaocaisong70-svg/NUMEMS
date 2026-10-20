@@ -112,6 +112,8 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
   };
   const remove = (r: RequestRecord, action: string, type: string, message: string) => {
     update(r, "pending_removal", action); r.operationId = id("remove");
+    for (const item of next.notices)
+      if (item.requestId === r.id && item.type === "expiry_30m" && item.status === "pending") item.status = "cancelled";
     notice(r, type, "席位等待回收确认", message);
   };
   if (!command || typeof command.type !== "string") throw new Error("操作类型无效。");

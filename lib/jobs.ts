@@ -90,7 +90,8 @@ export async function runJobs() {
     pendingRemovals: state.requests.filter(r => r.status === "pending_removal").length,
     pendingNotices: state.notices.filter(n => n.status === "pending").length,
     unresolvedDeliveries: Object.values(state.deliveries ?? {}).filter(d => d.status !== "sent").length,
-    emailConfigured: Boolean(url && token),
-    memberAdapter: "not_connected",
+    emailConfigured: Boolean((state as BridgeState).codex?.mailVerifiedAt || (url && token)),
+    memberAdapter: (state as BridgeState).codex?.enabled
+      ? ((state as BridgeState).codex?.testOnly ? "codex_test" : "codex_browser") : "not_connected",
   };
 }

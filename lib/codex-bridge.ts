@@ -178,7 +178,12 @@ export function workPlan(input: BridgeState, now: string) {
     invites: input.requests.filter(r => r.status === "pending_invite" && allowed(r.email)),
     removals: input.requests.filter(r => r.status === "pending_removal" && allowed(r.email)),
     awaitingAcceptance: input.requests.filter(r => r.status === "invited" && allowed(r.email)),
-    reminders: input.notices.filter(n => n.type === "expiry_30m" && n.status === "pending" && allowed(n.email)),
+    reminders: input.notices.filter(n => {
+      const r = input.requests.find(r => r.id === n.requestId);
+      return n.type === "expiry_30m" && n.status === "pending" && allowed(n.email) &&
+        r?.status === "active" && Boolean(r.expiresAt) && n.key.endsWith(":" + r.expiresAt) &&
+        time(r.expiresAt!) > time(now) && time(r.expiresAt!) - time(now) <= 30 * minute;
+    }),
     receipts: b?.receipts.slice(-10) ?? [], checkedAt: now,
   };
 }
@@ -204,8 +209,10 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     if (!b.observation) throw new Error("缺少官方成员证据。");
     const s = validateObservation(b.observation, now);
     const member = s.members.find(p => norm(p.email) === r.email);
-    originalPresence = member ? "member" : s.invites.some(p => norm(p.email) === r.email) ? "invite" : "absent";
-    if (member && member.role !== "member") throw new Error("禁止自动移除管理员或 Owner。");
+    const invitation = s.invites.find(p => norm(p.email) === r.email);
+    originalPresence = member ? "member" : invitation ? "invite" : "absent";
+    if ((member && member.role !== "member") || (invitation && invitation.role !== "member"))
+      throw new Error("禁止自动移除管理员或 Owner。");
     if (kind === "invite") {
       if ([...s.members, ...s.invites].some(p => norm(p.email) === r.email))
         throw new Error("目标邮箱已存在，请重新同步状态。");

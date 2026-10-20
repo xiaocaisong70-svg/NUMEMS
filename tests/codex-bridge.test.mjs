@@ -124,6 +124,24 @@ test("new Owners halt the worker and cannot enter removal", () => {
   assert.equal(s.codex.enabled, false); assert.equal(s.config.automationEnabled, false);
   assert.ok(s.config.protectedEmails.includes("second-owner@example.com"));
 });
+
+test("an invitation promoted to admin cannot be automatically revoked", () => {
+  let s = invited(); const id = s.requests[0].id;
+  s = transition(s, owner, { type: "release", id }, at(2));
+  s = observeWorkspace(s, snapshot(3, [], [{ email: TEST_EMAIL, role: "admin" }]), at(3));
+  assert.throws(() => claimOperation(s, "remove", id, "protected-invite", at(3)), /管理员/);
+});
+
+test("expired or released leases do not leave stale email work", () => {
+  let s = active(); const id = s.requests[0].id;
+  s = setTestDeadline(s, id, "reminder", at(3));
+  assert.equal(workPlan(s, at(1803)).reminders.length, 0);
+  const expired = transition(s, owner, { type: "tick" }, at(1803));
+  assert.equal(expired.notices.find(n => n.type === "expiry_30m").status, "cancelled");
+  const released = transition(s, owner, { type: "release", id }, at(4));
+  assert.equal(workPlan(released, at(4)).reminders.length, 0);
+  assert.equal(released.notices.find(n => n.type === "expiry_30m").status, "cancelled");
+});
 test("test clock cannot change ordinary employee leases", () => {
   let s = active(); s.requests[0].isTest = false;
   assert.throws(() => setTestDeadline(s, s.requests[0].id, "expire", at(3)), /授权测试/);
