@@ -80,6 +80,7 @@ const tools = [
       operationId: { type: "string" }, token: { type: "string" },
       outcome: { type: "string", enum: ["verified", "uncertain", "blocked"] },
       observation: observationSchema, providerMessageId: { type: "string" }, detail: { type: "string" },
+      invitationSentAt: { type: "string", description: "邀请点击发送成功时记录的UTC时间；只能是本次claim后、官方核实前的真实时间，用于5分钟加入倒计时。" },
       failureCode: { type: "string", enum: FAILURE_CODES },
     }, required: ["operationId", "token", "outcome"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },

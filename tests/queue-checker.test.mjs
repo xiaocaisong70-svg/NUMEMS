@@ -34,12 +34,13 @@ test("a queued/unknown in-flight wake prevents overlapping new work",()=>{
   assert.equal(prepareWake({halted:{reason:"unknown"}},p,now).kind,"halted");
   assert.equal(prepareWake({active:{createdAt:new Date(now-31*60000).toISOString()}},p,now).kind,"stalled");
 });
-test("acceptance checks use backoff rather than minute-by-minute inference",()=>{
+test("acceptance checks are bounded within the five-minute window",()=>{
   const invitedAt=new Date(now).toISOString();const p=plan({awaitingAcceptance:[{id:"req_1",invitedAt}]});
   assert.equal(pendingEvents(p,now+60000).length,0);
   const at=m=>pendingEvents(p,now+m*60000)[0].key;
-  assert.equal(at(2),at(4));assert.notEqual(at(4),at(5));assert.equal(at(5),at(14));
-  assert.equal(at(60),at(119));assert.notEqual(at(119),at(120));
+  assert.equal(at(2),at(3));assert.notEqual(at(3),at(4));
+  assert.equal(pendingEvents(p, now+5*60000).length,0);
+  assert.equal(pendingEvents(p, now+120*60000).length,0);
 });
 test("expired reminder generations do not share a dispatch identity",()=>{
   const a=pendingEvents(plan({reminders:[{id:"n_1",key:"expiry:old"}]}),now)[0];

@@ -73,9 +73,16 @@ export async function portalData() {
     connection: { memberAdapter: "not_connected", scheduler: false, mail: false },
   });
   if (!user) return closed("signin_required");
-  const { state } = await readState();
-  if (portalAccess(state.config, user) !== "allowed") return closed("not_authorized");
-  const view = viewState(state, user);
+  const before = await readState();
+  if (portalAccess(before.state.config, user) !== "allowed") return closed("not_authorized");
+  const serverNow = new Date().toISOString();
+  // Pure, atomic queue processing also runs on an authorized refresh. It never
+  // sends email or changes official members, even if the local checker is offline.
+  const state = await mutateState(current => {
+    requirePortalAccess(current.config, user);
+    return transition(current, schedulerActor, { type: "tick" }, serverNow);
+  });
+  const view = viewState(state, user, serverNow);
   const runtime = (state as State & { runtime?: { lastTickAt?: string; lastDeliveryError?: string } }).runtime;
   const codex = (state as BridgeState).codex;
   const onDemand = codex?.scheduleId?.startsWith("local:queue-checker:") ?? false;

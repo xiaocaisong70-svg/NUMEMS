@@ -1,4 +1,5 @@
 import { PROTECTED_OWNER_EMAIL, AUTHORIZED_TEST_EMAIL, transition, type State, type Actor } from "./seat-engine.ts";
+import { invitationDeadline } from "./queue-estimate.ts";
 
 export const TARGET_WORKSPACE_ID = "cd01c344-8ff9-41fd-a750-f7b30af9a7c9";
 export const TEST_EMAIL = AUTHORIZED_TEST_EMAIL;
@@ -125,6 +126,8 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
       known.add(address);
     }
   }
+  // Set the timeout state before resolving the final official membership check.
+  next = transition(next, systemActor, { type: "tick" }, now) as BridgeState;
   // Fresh full snapshots reconcile accepted invitations and already absent users.
   for (const old of [...next.requests]) {
     const member = checked.members.find(p => norm(p.email) === old.email);
@@ -141,8 +144,13 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
     const current = next.requests.find(r => r.id === old.id)!;
     if (current.status === "invited") current.acceptanceCheckedAt = checked.observedAt;
     if (current.status === "invited" && member && current.invitedAt &&
-        time(current.invitedAt) + next.config.acceptHours * 3_600_000 > time(now)) {
+        time(invitationDeadline(current)!) > time(now)) {
       next = transition(next, systemActor, { type: "confirm_active", id: old.id }, now) as BridgeState;
+    }
+    if (current.status === "pending_removal" && current.removalReason === "invitation_expired" &&
+        member?.role === "member" && !targetHeld(next, "remove", current.id, current.email) &&
+        !(next.codex?.lease?.kind === "remove" && next.codex.lease.requestId === current.id)) {
+      next = transition(next, systemActor, { type: "confirm_joined_after_timeout", id: current.id }, now) as BridgeState;
     }
     if (current.status === "pending_removal" && !member && !invited) {
       next = transition(next, systemActor, { type: "confirm_removed", id: old.id }, now) as BridgeState;
@@ -250,6 +258,8 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     originalPresence = member ? "member" : invitation ? "invite" : "absent";
     if ((member && member.role !== "member") || (invitation && invitation.role !== "member"))
       throw new Error("禁止自动移除管理员或 Owner。");
+    if (kind === "remove" && r.removalReason === "invitation_expired" && member)
+      throw new Error("员工已经加入，请重新核对；邀请超时不能作为移除已加入成员的依据。");
     if (kind === "invite") {
       if ([...s.members, ...s.invites].some(p => norm(p.email) === r.email))
         throw new Error("目标邮箱已存在，请重新同步状态。");
@@ -272,7 +282,7 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
 }
 export function completeOperation(input: BridgeState, args: {
     operationId: string; token: string; outcome: "verified" | "uncertain" | "blocked";
-    observation?: Observation; providerMessageId?: string; detail?: string; failureCode?: FailureCode;
+    observation?: Observation; providerMessageId?: string; detail?: string; failureCode?: FailureCode; invitationSentAt?: string;
   }, now: string): BridgeState {
   let next = structuredClone(input); let b = bridge(next);
   if (!["verified", "uncertain", "blocked"].includes(args.outcome)) throw new Error("办理结果无效。");
@@ -315,6 +325,13 @@ export function completeOperation(input: BridgeState, args: {
       throw new Error("实际目标角色异常，禁止确认办理成功。");
     if (op.kind === "invite" && !member && !invited) throw new Error("没有核实到实际邀请。");
     if (op.kind === "remove" && (member || invited)) throw new Error("目标邮箱仍在成员或邀请列表中。");
+    if (op.kind === "invite" && args.invitationSentAt) {
+      if (time(args.invitationSentAt) < time(op.claimedAt) || time(args.invitationSentAt) > time(s.observedAt))
+        throw new Error("邀请发出时间必须位于本次实际办理与核实之间。");
+      const r = next.requests.find(r => r.id === op.requestId);
+      if (r?.status === "pending_invite")
+        next = transition(next, systemActor, { type: "confirm_invited", id: r.id, sentAt: args.invitationSentAt }, now) as BridgeState;
+    }
     next = observeWorkspace(next, s, now); b = bridge(next);
     if (op.kind === "invite") b.inviteVerifiedAt = now;
     else if (op.originalPresence === "member") b.removalVerifiedAt = now;

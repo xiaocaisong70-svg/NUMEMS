@@ -140,7 +140,7 @@ test('protected owner never auto-expires even when a corrupt lease exists', () =
 });
 test('bounded audit and no-op revisions', () => {
   let state = createState(NOW);
-  for (let i = 0; i < 1005; i++) state = act(state, { type: 'configure', config: { acceptHours: i % 2 ? 24 : 25 } });
+  for (let i = 0; i < 1005; i++) state = act(state, { type: 'configure', config: { leaseHours: i % 2 ? 3 : 2 } });
   assert.equal(state.audit.length, 1000); assert.equal(new Set(state.audit.map(r => r.id)).size, 1000);
   assert.equal(act(state, { type: 'tick' }).revision, state.revision);
 });
@@ -174,7 +174,7 @@ test('same verified email on a different user ID cannot expose an old normal req
 });
 test('equal-millisecond requests preserve insertion order across revision digit boundaries', () => {
   let state = configured();
-  for (let i = 0; i < 6; i++) state = act(state, { type: 'configure', config: { acceptHours: i % 2 ? 24 : 25 } });
+  for (let i = 0; i < 6; i++) state = act(state, { type: 'configure', config: { leaseHours: i % 2 ? 3 : 2 } });
   assert.equal(state.revision, 8);
   state = apply(state, alice); state = apply(state, bob);
   assert.equal(viewState(state, alice).queuePosition, 1);

@@ -3,7 +3,7 @@ import { PortalAccessError } from "@/lib/portal-access";
 
 export const dynamic = "force-dynamic";
 const allowed = new Set([
-  "apply", "cancel", "release", "renew", "configure", "sync_inventory",
+  "apply", "cancel", "release", "renew", "request_acceptance_check", "configure", "sync_inventory",
   "confirm_invited", "confirm_active", "confirm_removed", "tick",
 ]);
 const privateHeaders = { "Cache-Control": "no-store", "Vary": "Cookie" };

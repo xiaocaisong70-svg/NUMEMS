@@ -32,14 +32,20 @@ export function pendingEvents(plan, nowMs = Date.now()) {
   for (const r of plan.awaitingAcceptance) {
     if (!validId(r.id)) throw new Error("Invalid invitation ID.");
     const since = nowMs - Date.parse(r.invitedAt);
-    if (!Number.isFinite(since) || since < 2 * minute) continue;
-    // Only genuine pending invitations get bounded status checks. No invitations
-    // means no model calls. After 2/5/15/30 min, check at most once per hour.
-    const slot = since >= 60 * minute ? 4 + Math.floor(since / (60 * minute))
-      : since >= 30 * minute ? 3 : since >= 15 * minute ? 2 : since >= 5 * minute ? 1 : 0;
+    const deadline = r.joinDeadlineAt ? Date.parse(r.joinDeadlineAt) : Date.parse(r.invitedAt) + 5 * minute;
+    if (!Number.isFinite(since) || since < 0 || nowMs >= deadline) continue;
+    if (r.acceptanceRequestedAt && (!r.acceptanceCheckedAt || r.acceptanceRequestedAt > r.acceptanceCheckedAt)) {
+      events.push(event("acceptance", r.id, `hint:${r.acceptanceRequestedAt}`));
+      continue;
+    }
+    // At most two fallback checks in the five-minute window; no empty polling
+    // wakes. A user acceptance hint can wake the checker sooner.
+    if (since < 2 * minute) continue;
+    const slot = since >= 4 * minute ? 1 : 0;
     events.push(event("acceptance", r.id, `${r.invitedAt}:${slot}`));
   }
-  return events.sort((a, b) => a.key.localeCompare(b.key));
+  const priority = { remove: 0, invite: 1, mail: 2, acceptance: 3 };
+  return events.sort((a, b) => priority[a.kind] - priority[b.kind] || a.key.localeCompare(b.key));
 }
 
 export function prepareWake(state, plan, nowMs = Date.now()) {
