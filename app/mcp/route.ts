@@ -1,6 +1,7 @@
+import { env } from "cloudflare:workers";
 import { currentActor, readState, mutateState, schedulerActor } from "@/lib/portal-service";
 import { runJobs } from "@/lib/jobs";
-import { observeWorkspace, prepareTest, workPlan, claimOperation, completeOperation, setBridgeMode,
+import { observeWorkspace, prepareTest, workPlan, claimOperation, completeOperation, deferOperation, reviewFailure, FAILURE_CODES, setBridgeMode,
   setTestDeadline, recordSchedule, type BridgeState, type Observation } from "@/lib/codex-bridge";
 import { transition } from "@/lib/seat-engine";
 export const dynamic = "force-dynamic";
@@ -14,6 +15,24 @@ const observationSchema = { type: "object", properties: {
   members: { type: "array", items: personSchema }, invites: { type: "array", items: personSchema },
 }, required: ["workspaceId", "accountEmail", "pageUrl", "observedAt", "complete", "totalSeats", "members", "invites"], additionalProperties: false };
 const tools = [
+  {
+    name: "defer_seat_operation",
+    description: "登记操作故障。邮件/单一成员/单次审批隔离目标，保留记录且不重试；登录、工作空间、容量、角色或未知异常全局暂停。不会确认成功或释放席位。",
+    inputSchema: { type: "object", properties: {
+      kind: { type: "string", enum: ["invite", "remove", "mail"] }, targetId: { type: "string" },
+      failureCode: { type: "string", enum: FAILURE_CODES }, detail: { type: "string" },
+    }, required: ["kind", "targetId", "failureCode"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "review_seat_failure",
+    description: "仅在管理员完成核查后恢复。retry_not_started只重排明确未开始外部操作的隔离项；已尝试操作须使用真实回执核实，不能自动重试。resume_workspace需最新完整官方证据，无未完成租约，不清除目标隔离。",
+    inputSchema: { type: "object", properties: {
+      decision: { type: "string", enum: ["retry_not_started", "resume_workspace"] },
+      operationId: { type: "string" }, observation: observationSchema,
+    }, required: ["decision"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
   {
     name: "record_codex_schedule", description: "本地定时任务或按需队列检查程序已实际安装核对后登记其ID；空字符串表示清除登记，不代替真正暂停任务。",
     inputSchema: { type: "object", properties: { scheduleId: { type: "string" } }, required: ["scheduleId"], additionalProperties: false },
@@ -56,11 +75,12 @@ const tools = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   },
   {
-    name: "complete_seat_operation", description: "提交实际执行回执。邀请/移除必须提供操作后的完整官方快照；邮件必须提供Gmail消息ID。失败或结果不明会保留锁并要求核查。",
+    name: "complete_seat_operation", description: "提交实际执行回执。邀请/移除必须提供操作后的完整官方快照；邮件必须提供Gmail消息ID。用failureCode明确故障：邮件或单一目标隔离并保留核查记录；登录、容量、角色或未知异常全局暂停。",
     inputSchema: { type: "object", properties: {
       operationId: { type: "string" }, token: { type: "string" },
       outcome: { type: "string", enum: ["verified", "uncertain", "blocked"] },
       observation: observationSchema, providerMessageId: { type: "string" }, detail: { type: "string" },
+      failureCode: { type: "string", enum: FAILURE_CODES },
     }, required: ["operationId", "token", "outcome"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
@@ -122,10 +142,13 @@ export async function POST(request: Request) {
         const state = await mutateState(current => {
           const s = current as BridgeState;
           if (name === "observe_workspace") return observeWorkspace(s, args.observation as Observation, now);
+          if (name === "defer_seat_operation") return deferOperation(s, args, now);
+          if (name === "review_seat_failure") return reviewFailure(s, args, now);
           if (name === "prepare_test_request") return prepareTest(s, now);
           if (name === "record_codex_schedule") return recordSchedule(s, args.scheduleId, now);
           if (name === "set_test_deadline") return setTestDeadline(s, args.requestId, args.stage, now);
           if (name === "claim_seat_operation") {
+            if (args.kind === "mail" && env.REMINDER_DELIVERY_MODE === "relay") throw new Error("邮件由普通程序通道办理，禁止另行发送。");
             if (!["invite", "remove", "mail"].includes(args.kind) || typeof args.targetId !== "string") throw new Error("办理参数无效。");
             return claimOperation(s, args.kind, args.targetId, token, now);
           }

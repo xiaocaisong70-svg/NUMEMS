@@ -13,12 +13,19 @@ export type Lease = {
   expectedExpiry?: string; status: "claimed" | "uncertain";
   originalPresence?: "member" | "invite" | "absent";
 };
+export const FAILURE_CODES = ["mail_delivery", "member_action", "approval_required",
+  "login_expired", "workspace_mismatch", "capacity_mismatch", "role_mismatch", "unknown"] as const;
+export type FailureCode = (typeof FAILURE_CODES)[number];
+export type OperationHold = {
+  operation: Lease; code: FailureCode; detail: string; at: string; attempted: boolean;
+};
 export type BridgeState = State & {
   codex?: {
     enabled: boolean; testOnly: boolean; mailEnabled: boolean;
     inviteVerifiedAt?: string; removalVerifiedAt?: string; invitationRevokedAt?: string; mailVerifiedAt?: string;
     lastRunAt?: string; lastError?: string; lease?: Lease; observation?: Observation;
     scheduleId?: string;
+    holds?: OperationHold[]; globalFailureCode?: FailureCode; mailChannelError?: string;
     receipts: { id: string; kind: string; email: string; at: string; evidence: string }[];
   };
 };
@@ -29,6 +36,21 @@ function time(value: string) { const n = Date.parse(value); if (!Number.isFinite
 function bridge(state: BridgeState) {
   state.codex ??= { enabled: false, testOnly: true, mailEnabled: true, receipts: [] };
   return state.codex;
+}
+function failureCode(code: unknown, kind: Lease["kind"]): FailureCode {
+  const value = code ?? (kind === "mail" ? "mail_delivery" : "unknown");
+  if (!FAILURE_CODES.includes(value as FailureCode)) throw new Error("故障分类无效。");
+  if (value === "mail_delivery" && kind !== "mail") throw new Error("邮件故障不能用于成员操作。");
+  if (value === "member_action" && kind === "mail") throw new Error("成员故障不能用于邮件操作。");
+  return value as FailureCode;
+}
+function isIsolated(code: FailureCode) {
+  return ["mail_delivery", "member_action", "approval_required"].includes(code);
+}
+function targetHeld(input: BridgeState, kind: Lease["kind"] | "acceptance", targetId: string, email: string) {
+  return input.codex?.holds?.some(h => h.operation.kind === "mail"
+    ? kind === "mail" && h.operation.targetId === targetId
+    : kind !== "mail" && h.operation.email === email) ?? false;
 }
 function record(state: BridgeState, action: string, now: string, requestId?: string) {
   state.revision++;
@@ -44,7 +66,7 @@ export function validateObservation(snapshot: Observation, now: string) {
   if (url.protocol !== "https:" || url.hostname !== "admin.openai.com" ||
       url.pathname !== "/workspace/" + TARGET_WORKSPACE_ID + "/members")
     throw new Error("成员证据必须来自目标工作空间的官方成员页。");
-  if (Math.abs(time(now) - time(snapshot.observedAt)) > minute)
+  if (time(snapshot.observedAt) > time(now) || time(now) - time(snapshot.observedAt) > minute)
     throw new Error("成员证据已过期，请重新读取官方页面。");
   if (!Number.isInteger(snapshot.totalSeats) || snapshot.totalSeats < 2 ||
       !Array.isArray(snapshot.members) || !Array.isArray(snapshot.invites))
@@ -60,9 +82,18 @@ export function validateObservation(snapshot: Observation, now: string) {
 }
 export function observeWorkspace(input: BridgeState, snapshot: Observation, now: string): BridgeState {
   const checked = validateObservation(snapshot, now);
+  if (input.codex?.observation && time(checked.observedAt) < time(input.codex.observation.observedAt))
+    throw new Error("不能用较旧的成员证据覆盖更新的核对结果。");
   let next = structuredClone(input);
   if (next.config.workspaceId && next.config.workspaceId !== checked.workspaceId)
     throw new Error("门户绑定的工作空间不匹配。");
+  if (next.config.inventoryVerified && checked.totalSeats !== next.config.totalSeats) {
+    const b = bridge(next);
+    b.lastError = "已购容量与门户配置不一致，需管理员核对后恢复。";
+    b.globalFailureCode = "capacity_mismatch";
+    record(next, "codex_capacity_mismatch", now);
+    return next;
+  }
   if (!next.config.inventoryVerified) {
     const owners = new Set(checked.members.filter(p => p.role === "owner").map(p => norm(p.email)));
     next = transition(next, systemActor, { type: "configure", config: {
@@ -108,6 +139,7 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
       next = transition(next, systemActor, { type: "confirm_invited", id: old.id }, now) as BridgeState;
     }
     const current = next.requests.find(r => r.id === old.id)!;
+    if (current.status === "invited") current.acceptanceCheckedAt = checked.observedAt;
     if (current.status === "invited" && member && current.invitedAt &&
         time(current.invitedAt) + next.config.acceptHours * 3_600_000 > time(now)) {
       next = transition(next, systemActor, { type: "confirm_active", id: old.id }, now) as BridgeState;
@@ -174,13 +206,16 @@ export function workPlan(input: BridgeState, now: string) {
     workspaceId: input.config.workspaceId, administrator: PROTECTED_OWNER_EMAIL,
     enabled: b?.enabled ?? false, testOnly: b?.testOnly ?? true,
     lastError: b?.lastError ?? null, busy: Boolean(b?.lease), lease: b?.lease ?? null,
+    faultIsolationVersion: 1, globalFailureCode: b?.globalFailureCode ?? null,
+    blockedOperations: b?.holds ?? [],
+    mailChannelError: b?.mailChannelError ?? null,
     scheduleId: b?.scheduleId ?? null, lastRunAt: b?.lastRunAt ?? null,
-    invites: input.requests.filter(r => r.status === "pending_invite" && allowed(r.email)),
-    removals: input.requests.filter(r => r.status === "pending_removal" && allowed(r.email)),
-    awaitingAcceptance: input.requests.filter(r => r.status === "invited" && allowed(r.email)),
+    invites: input.requests.filter(r => r.status === "pending_invite" && allowed(r.email) && !targetHeld(input, "invite", r.id, r.email)),
+    removals: input.requests.filter(r => r.status === "pending_removal" && allowed(r.email) && !targetHeld(input, "remove", r.id, r.email)),
+    awaitingAcceptance: input.requests.filter(r => r.status === "invited" && allowed(r.email) && !targetHeld(input, "acceptance", r.id, r.email)),
     reminders: input.notices.filter(n => {
       const r = input.requests.find(r => r.id === n.requestId);
-      return n.type === "expiry_30m" && n.status === "pending" && allowed(n.email) &&
+      return !b?.mailChannelError && n.type === "expiry_30m" && n.status === "pending" && allowed(n.email) && !targetHeld(input, "mail", n.id, n.email) &&
         r?.status === "active" && Boolean(r.expiresAt) && n.key.endsWith(":" + r.expiresAt) &&
         time(r.expiresAt!) > time(now) && time(r.expiresAt!) - time(now) <= 30 * minute;
     }),
@@ -191,10 +226,12 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     token: string, now: string): BridgeState {
   const next = structuredClone(input); const b = bridge(next);
   if (!b.enabled) throw new Error("Codex 执行器尚未启用。");
+  if (b.lastError && !b.lease) throw new Error("执行器有未解决错误，请先核实。");
   if (b.lease) throw new Error("已有办理未结束；结果不明时必须先核对，不能重试。");
   let email: string, requestId: string, expectedExpiry: string | undefined;
   let originalPresence: Lease["originalPresence"];
   if (kind === "mail") {
+    if (b.mailChannelError) throw new Error("邮件通道已暂停，成员回收不受影响。");
     const n = next.notices.find(n => n.id === targetId);
     const r = n && next.requests.find(r => r.id === n.requestId);
     if (!n || !r || n.type !== "expiry_30m" || n.status !== "pending" ||
@@ -224,6 +261,8 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
   }
   if (next.config.protectedEmails.includes(email) || email === PROTECTED_OWNER_EMAIL)
     throw new Error("Owner 保留账号受保护。");
+  if (targetHeld(next, kind, targetId, email))
+    throw new Error("此目标已隔离，须核实原操作；禁止重复办理。");
   if (b.testOnly && email !== TEST_EMAIL) throw new Error("测试模式只能处理指定测试邮箱。");
   b.lease = { id: "op_" + token, token, kind, targetId, email, requestId, claimedAt: now,
     expiresAt: new Date(time(now) + 2 * minute).toISOString(), status: "claimed", expectedExpiry, originalPresence };
@@ -233,20 +272,35 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
 }
 export function completeOperation(input: BridgeState, args: {
     operationId: string; token: string; outcome: "verified" | "uncertain" | "blocked";
-    observation?: Observation; providerMessageId?: string; detail?: string;
+    observation?: Observation; providerMessageId?: string; detail?: string; failureCode?: FailureCode;
   }, now: string): BridgeState {
   let next = structuredClone(input); let b = bridge(next);
-  const op = b.lease;
+  if (!["verified", "uncertain", "blocked"].includes(args.outcome)) throw new Error("办理结果无效。");
+  const hold = b.holds?.find(h => h.operation.id === args.operationId && h.operation.token === args.token);
+  const op = b.lease?.id === args.operationId ? b.lease : hold?.operation;
   if (!op && args.outcome === "verified" && b.receipts.some(r => r.id === args.operationId)) return next;
   if (!op || op.id !== args.operationId || op.token !== args.token) throw new Error("执行回执不匹配。");
+  if (hold && b.lease) throw new Error("其他操作正在办理，请稍后核对隔离记录。");
   if (args.outcome !== "verified") {
-    op.status = "uncertain"; b.lastError = (args.detail ?? "操作结果不明，请先核对真实状态。").slice(0, 500);
-    record(next, "codex_operation_uncertain", now, op.requestId); return next;
+    const code = failureCode(args.failureCode, op.kind);
+    const detail = (args.detail ?? "操作结果不明，请先核对真实状态。").slice(0, 500);
+    op.status = "uncertain";
+    if (isIsolated(code)) {
+      b.holds ??= [];
+      if (hold) { hold.code = code; hold.detail = detail; }
+      else b.holds.push({ operation: op, code, detail, at: now, attempted: true });
+      if (b.lease?.id === op.id) delete b.lease;
+      record(next, "codex_isolate_" + op.kind, now, op.requestId);
+    } else {
+      b.lastError = detail; b.globalFailureCode = code;
+      record(next, "codex_workspace_blocked", now, op.requestId);
+    }
+    return next;
   }
   let evidence: string;
   if (op.kind === "mail") {
     if (!args.providerMessageId || !/^[a-zA-Z0-9_-]{5,200}$/.test(args.providerMessageId))
-      throw new Error("需要 Gmail 返回的消息 ID。");
+      throw new Error("需要 Gmail 或发信服务返回的消息 ID。");
     const notice = next.notices.find(n => n.id === op.targetId);
     if (!notice) throw new Error("提醒记录不存在。");
     notice.status = "sent"; notice.sentAt = now; evidence = args.providerMessageId;
@@ -268,7 +322,72 @@ export function completeOperation(input: BridgeState, args: {
     evidence = s.pageUrl;
   }
   b.receipts.push({ id: op.id, kind: op.kind, email: op.email, at: now, evidence });
-  b.receipts = b.receipts.slice(-500); delete b.lease; delete b.lastError;
+  b.receipts = b.receipts.slice(-500);
+  if (hold) b.holds = b.holds?.filter(h => h.operation.id !== op.id);
+  else {
+    delete b.lease;
+    // A verified target receipt cannot clear a workspace-wide safety incident.
+    if (!b.globalFailureCode) delete b.lastError;
+  }
   record(next, "codex_verified_" + op.kind, now, op.requestId);
+  return next;
+}
+
+/** Report a failure before an external action, or isolate the matching active lease.
+ * No retry, success receipt, seat release or access change is implied. */
+export function deferOperation(input: BridgeState, args: {
+  kind: Lease["kind"]; targetId: string; failureCode: FailureCode; detail?: string;
+}, now: string): BridgeState {
+  const next = structuredClone(input), b = bridge(next);
+  const code = failureCode(args.failureCode, args.kind);
+  if (!["mail", "invite", "remove"].includes(args.kind)) throw new Error("操作类型无效。");
+  if (b.lease) {
+    if (b.lease.kind !== args.kind || b.lease.targetId !== args.targetId)
+      throw new Error("必须先核对当前未完成操作。");
+    return completeOperation(next, { operationId: b.lease.id, token: b.lease.token,
+      outcome: "blocked", failureCode: code, detail: args.detail }, now);
+  }
+  const notice = args.kind === "mail" ? next.notices.find(n => n.id === args.targetId) : undefined;
+  const r = next.requests.find(r => r.id === (notice?.requestId ?? args.targetId));
+  if (!r || (args.kind === "mail" && (!notice || notice.type !== "expiry_30m")))
+    throw new Error("故障目标不存在。");
+  if (r.email === PROTECTED_OWNER_EMAIL || next.config.protectedEmails.includes(r.email))
+    throw new Error("Owner 保留账号受保护。");
+  const detail = (args.detail ?? "该操作已暂停，等待管理员核查。").slice(0, 500);
+  if (!isIsolated(code)) {
+    b.lastError = detail; b.globalFailureCode = code;
+  } else if (!targetHeld(next, args.kind, args.targetId, r.email)) {
+    b.holds ??= [];
+    b.holds.push({ code, detail, at: now, attempted: false, operation: {
+      id: `deferred_${next.revision}_${time(now)}`, token: "", kind: args.kind,
+      targetId: args.targetId, requestId: r.id, email: r.email,
+      claimedAt: now, expiresAt: now, status: "uncertain",
+    } });
+  }
+  record(next, isIsolated(code) ? "codex_defer_" + args.kind : "codex_workspace_blocked", now, r.id);
+  return next;
+}
+
+export function reviewFailure(input: BridgeState, args: {
+  decision: "retry_not_started" | "resume_workspace"; operationId?: string; observation?: Observation;
+}, now: string): BridgeState {
+  let next = structuredClone(input), b = bridge(next);
+  if (b.lease) throw new Error("仍有未完成操作，必须先提交真实核实回执。");
+  if (args.decision === "retry_not_started") {
+    const hold = b.holds?.find(h => h.operation.id === args.operationId);
+    if (!hold || hold.attempted) throw new Error("只有明确未开始外部操作的隔离项可重新排队；其余需核实真实结果。");
+    if (hold.operation.kind !== "mail") {
+      next = observeWorkspace(next, args.observation!, now); b = bridge(next);
+      if (b.lastError) throw new Error("工作空间异常尚未排除。");
+    }
+    b.holds = b.holds?.filter(h => h.operation.id !== args.operationId);
+    record(next, "codex_review_unstarted", now, hold.operation.requestId);
+  } else if (args.decision === "resume_workspace") {
+    validateObservation(args.observation!, now);
+    delete b.lastError; delete b.globalFailureCode;
+    next = observeWorkspace(next, args.observation!, now); b = bridge(next);
+    if (b.lastError) throw new Error("最新官方证据仍有工作空间异常。");
+    record(next, "codex_review_workspace", now);
+  } else throw new Error("核查决定无效。");
   return next;
 }

@@ -10,6 +10,7 @@ export type Config = {
 export type RequestRecord = {
   id: string; userId: string; email: string; name: string; reason: string; hours: number;
   status: RequestStatus; createdAt: string; updatedAt: string; expiresAt?: string | null;
+  acceptanceRequestedAt?: string; acceptanceCheckedAt?: string;
   invitedAt?: string; operationId?: string; error?: string; requestKey?: string; lastRenewalKey?: string; isTest?: boolean;
 };
 export type Notice = {

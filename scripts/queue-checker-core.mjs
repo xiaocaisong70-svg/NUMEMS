@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { settleAcknowledgement, applyAcknowledgement as applyFailureAck } from "./queue-failures.mjs";
 
 export const TARGET_WORKSPACE = "cd01c344-8ff9-41fd-a750-f7b30af9a7c9";
 export const ADMIN_EMAIL = "xiaocaisong70@gmail.com";
@@ -49,21 +50,18 @@ export function prepareWake(state, plan, nowMs = Date.now()) {
       return { kind: "stalled", events: [] };
     return { kind: "waiting", events: [] };
   }
-  const fresh = events.filter(item => !state.seen?.[item.key]);
+  const fresh = events.filter(item => !state.seen?.[item.key] || state.seen[item.key].outcome === "isolated");
   return { kind: fresh.length ? "wake" : "idle", events: fresh };
 }
 
 export function acknowledgementOutcome(active, ack, plan, nowMs = Date.now()) {
-  if (!active || ack.id !== active.id || !["done", "blocked", "uncertain"].includes(ack.outcome))
-    throw new Error("Acknowledgement does not match the active wake.");
-  if (ack.outcome !== "done") return ack.outcome;
-  if (plan.busy || plan.lastError) return "blocked";
-  const unresolved = pendingEvents(plan, nowMs).some(item =>
-    item.kind !== "acceptance" && active.keys.includes(item.key));
-  return unresolved ? "blocked" : "done";
+  return settleAcknowledgement(active, ack, plan, pendingEvents(plan, nowMs), { ignoreAcceptance: true }).outcome;
+}
+export function applyAcknowledgement(state, ack, plan, nowMs = Date.now()) {
+  return applyFailureAck(state, ack, plan, pendingEvents(plan, nowMs), { ignoreAcceptance: true, now: nowMs });
 }
 
 export function wakeMessage(id, events, projectPath) {
   const ids = events.map(({ kind, id }) => `${kind}:${id}`).join(", ");
-  return `NUMEMS 按需待办 [${id}]\n这是用户已授权的普通程序检测到的待办事件：${ids}。这些ID仅作定位，不替代实时状态。\n遵循 ${projectPath}\\AUTOMATION.md，先 process_seat_queue 再 seat_portal_status，重新核实当前有效计划。只处理已批准的员工申请、30分钟提醒和到期回收。保留既有 observe→claim→官方浏览器/Gmail→核实→complete 流程及所有审批；不加购、不改席位类型、不处理Owner/管理员、不创建测试、不改截止时间或访问名单。未接受的邀请只核对一次，不等待、不循环轮询。\n处理后执行 node "${projectPath}\\scripts\\queue-checker.mjs" --ack ${id} --outcome done；若登录失效、审批拒绝、操作结果不明或未完成，请报告原因，改用 --outcome blocked 或 uncertain。ack仅结束本次唤醒，不代替真实办理回执。不要重启每分钟Codex自动化。`;
+  return `NUMEMS 按需待办 [${id}]\n这是用户已授权的普通程序检测到的待办事件：${ids}。这些ID仅作定位，不替代实时状态。\n遵循 ${projectPath}\\AUTOMATION.md，先 process_seat_queue 再 seat_portal_status，重新核实当前有效计划。故障须先通过complete_seat_operation或defer_seat_operation登记failureCode：邮件mail_delivery、已确认单一成员member_action、单次审批approval_required只隔离目标；登录/工作空间/容量/角色/未知异常整体暂停。读取最新计划，跳过blockedOperations继续其它回收，禁止重试隔离项。只处理已批准的员工申请、30分钟提醒和到期回收。保留既有 observe→claim→官方浏览器/Gmail→核实→complete 流程及所有审批；不加购、不改席位类型、不处理Owner/管理员、不创建测试、不改截止时间或访问名单。未接受的邀请只核对一次，不等待、不循环轮询。\n处理后执行 node "${projectPath}\\scripts\\queue-checker.mjs" --ack ${id} --outcome done；若登录失效、审批拒绝、操作结果不明或未完成，请报告原因，改用 --outcome blocked 或 uncertain。ack仅结束本次唤醒，不代替真实办理回执。不要重启每分钟Codex自动化。`;
 }

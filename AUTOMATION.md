@@ -22,8 +22,10 @@ scripts/queue-checker.mjs。它通过官方 App Server 的 MCP 调用检查门�
 本次有效待办办完或仅核对了待接受邀请后，用消息给出的 --ack UUID --outcome done 确认
 本次唤醒结束。审批拒绝、登录失效、未完成办理用 blocked；结果不明用 uncertain。
 ack 不代表成员或邮件操作成功，不能代替 complete_seat_operation 的证据。
-blocked/uncertain 后停止新增投递；人工解决原因并核对未完成记录后，才可执行
-node scripts/queue-checker.mjs --resume。队列写入结果不明或30分钟未确认时保留记录，不重发。
+blocked/uncertain 不直接等于全局暂停：先通过云端工具登记故障分类。只有明确隔离的目标失败
+允许继续其它待办；没有分类、登录/角色/容量异常或未完成租约仍全局暂停。
+解决全局原因并核对真实状态后才可 node scripts/queue-checker.mjs --resume。
+队列写入结果不明或30分钟未确认时保留记录，不重发。
 
 网页和数据库持续托管。成员操作由本地 Codex 的浏览器完成，提醒通过管理员已连接
 Gmail 发送。电脑、Codex 及已授权浏览器会话必须可用；登录过期、安全验证、网络错误、
@@ -125,3 +127,17 @@ heartbeat 保持暂停。网页根据最近3分钟检查时间显示程序是否
 保留租约和审计，不清空记录来“修复”状态。真实账号已存在而门户未确认时，
 重新 observe_workspace 并用操作后证据 complete。新增 Owner 会停止自动办理，
 需要管理员核对保留席位。外部新增成员或邀请会作为固定占位补录，避免超配。
+
+## 故障隔离与批次回执
+
+
+- `mail_delivery`：只隔离确切通知 ID，保留发送租约与可能已发送的证据；同一员工到期回收也可以继续。
+- `member_action`：已确认仅影响该成员的操作错误，隔离此邮箱的邀请、加入核对、回收；其占位保留到官方证据确认移除。其它员工可继续。
+- `approval_required`：单个动作被拒绝或等待本人确认，只隔离目标；禁止重复请求或绕过审批。
+- `login_expired / workspace_mismatch / capacity_mismatch / role_mismatch / unknown`：整体暂停。不能把未知错误猜成局部错误。
+
+已 claim 时通过 `complete_seat_operation(outcome=blocked或uncertain, failureCode=分类)` 保留原操作；尚未 claim 时用 `defer_seat_operation(kind,targetId,failureCode,detail)` 登记。工具不存在或登记失败则整体暂停，禁止以本地 ack 代替云端记录。
+
+登记局部故障后刷新计划，跳过 `blockedOperations`，继续其它有效回收和邀请。同一批次可以用 blocked/uncertain 结束；普通检查程序只有看到云端确切目标隔离记录才会局部结算，未处理的其它事件保留供下一轮办理。没有分类证据时仍整体停止。模型不得自行清除隔离。
+
+核实到真实结果后，使用隔离记录的原租约和真实 message ID／操作后官方快照 complete。明确从未开始外部操作的项目，经管理员解决原因后可用 `review_seat_failure(decision=retry_not_started)` 重新排队；有尝试或结果不明的项目不能靠此方法重发。全局故障需无未完成租约、最新完整官方证据及 `review_seat_failure(decision=resume_workspace)`，再按需恢复本地检查程序。每次恢复保留审计。

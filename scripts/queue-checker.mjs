@@ -3,7 +3,7 @@ import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { AppServerClient } from "./app-server-client.mjs";
-import { prepareWake, wakeMessage, acknowledgementOutcome, SCHEDULE_ID } from "./queue-checker-core.mjs";
+import { prepareWake, wakeMessage, applyAcknowledgement, SCHEDULE_ID } from "./queue-checker-core.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const directory = join(root, ".sites-runtime", "queue-checker");
@@ -67,6 +67,7 @@ else {
     if (args.includes("--resume")) {
       // Run explicitly only after resolving the actual blocking condition.
       if (state.active) throw Error("An unacknowledged wake still exists; reconcile it first.");
+      state.recoveries = [...(state.recoveries ?? []), { at: new Date().toISOString(), priorHalt: state.halted, lastAcknowledgement: state.lastAcknowledgement }].slice(-100);
       delete state.halted;
       for (const [key, item] of Object.entries(state.seen))
         if (item.outcome !== "done") delete state.seen[key];
@@ -90,11 +91,7 @@ else {
       const snapshot = await client.portal(toolSession, "seat_portal_status");
       if (interactive) throw Error("Connector approval required; checker cannot approve it.");
       if (savedAck) {
-        const outcome = acknowledgementOutcome(state.active, savedAck, snapshot.plan);
-        for (const key of state.active.keys) state.seen[key] = { at: savedAck.at, outcome };
-        state.lastAcknowledgement = { ...savedAck, outcome };
-        if (outcome !== "done") state.halted = { reason: "ack_" + outcome, at: savedAck.at };
-        delete state.active;
+        applyAcknowledgement(state, savedAck, snapshot.plan);
       }
       const decision = prepareWake(state, snapshot.plan);
       state.checks++;
@@ -105,7 +102,7 @@ else {
         const id = randomUUID();
         // Persist intent BEFORE sending. A crash can never cause a blind resend.
         state.active = { id, clientId: `numems:${id}`, phase: "sending",
-          keys: decision.events.map(item => item.key), createdAt: new Date().toISOString() };
+          keys: decision.events.map(item => item.key), events: decision.events, createdAt: new Date().toISOString() };
         await save(statePath, state);
         try {
           const queued = await client.enqueue(config.threadId, state.active.clientId,
@@ -136,6 +133,7 @@ else {
       const status = { checkedAt: new Date().toISOString(), mode: "ordinary_program",
         state: state.halted ? "blocked" : state.active ? "waiting_for_codex" : decision.kind,
         modelCallsByChecker: 0, queueWakes: state.wakes, checks: state.checks,
+        isolatedOperations: snapshot.plan.blockedOperations?.length ?? 0,
         pending: { invites: snapshot.plan.invites.length, removals: snapshot.plan.removals.length,
           reminders: snapshot.plan.reminders.length, acceptance: snapshot.plan.awaitingAcceptance.length },
         ...(state.halted ? { reason: state.halted.reason } : {}),
