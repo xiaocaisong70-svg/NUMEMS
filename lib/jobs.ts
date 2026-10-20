@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { mutateState, readState, schedulerActor } from "./portal-service";
 import { transition, type State } from "./seat-engine";
+import type { BridgeState } from "./codex-bridge";
 
 type JobState = State & {
   runtime?: { lastTickAt?: string; lastDeliveryError?: string };
@@ -27,7 +28,7 @@ export async function runJobs() {
   // are retained for review instead of blindly sending a duplicate reminder.
   const url = env.REMINDER_WEBHOOK_URL;
   const token = env.REMINDER_WEBHOOK_TOKEN;
-  if (url && token) {
+  if (url && token && !(state as BridgeState).codex?.mailEnabled) {
     const destination = new URL(url);
     if (destination.protocol !== "https:") throw new Error("提醒服务必须使用 HTTPS。");
     for (const notice of state.notices

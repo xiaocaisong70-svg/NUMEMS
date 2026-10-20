@@ -2,28 +2,28 @@ export const PROTECTED_OWNER_EMAIL = "xiaocaisong70@gmail.com";
 export type Actor = { userId: string; email: string; isAdmin: boolean };
 export type RequestStatus = "queued" | "pending_invite" | "invited" | "active" | "pending_removal" | "completed" | "cancelled";
 export type Config = {
-  totalSeats: number; reservedSeats: number; leaseDays: number; acceptHours: number;
+  totalSeats: number; reservedSeats: number; leaseHours: number; reminderMinutes: number; acceptHours: number;
   automationEnabled: boolean; workspaceId: string; whitelist: string[];
   inventoryVerified: boolean; existingEmails: string[]; protectedEmails: string[];
 };
 export type RequestRecord = {
-  id: string; userId: string; email: string; name: string; reason: string; days: number;
+  id: string; userId: string; email: string; name: string; reason: string; hours: number;
   status: RequestStatus; createdAt: string; updatedAt: string; expiresAt?: string | null;
-  invitedAt?: string; operationId?: string; error?: string;
+  invitedAt?: string; operationId?: string; error?: string; requestKey?: string; lastRenewalKey?: string; isTest?: boolean;
 };
 export type Notice = {
   id: string; key: string; requestId: string; userId: string; email: string; type: string;
-  title: string; message: string; createdAt: string; status: "pending" | "sent"; sentAt?: string;
+  title: string; message: string; createdAt: string; status: "pending" | "sent" | "cancelled"; sentAt?: string;
 };
 export type AuditRecord = { id: string; at: string; actor: string; action: string; requestId?: string };
 export type State = { config: Config; requests: RequestRecord[]; audit: AuditRecord[]; notices: Notice[]; revision: number };
 export type Command =
-  | { type: "apply"; reason: string; name: string; days: number }
-  | { type: "cancel" | "release" | "renew" | "confirm_invited" | "confirm_active" | "confirm_removed"; id: string }
+  | { type: "apply"; reason: string; name: string; hours: number; requestKey?: string }
+  | { type: "renew"; id: string; hours: number; requestKey?: string }
+  | { type: "cancel" | "release" | "confirm_invited" | "confirm_active" | "confirm_removed"; id: string }
   | { type: "configure"; config: Partial<Config> }
   | { type: "tick" }
   | { type: "sync_inventory"; members: { email: string; role: string }[] };
-const DAY = 86400000;
 const HOUR = 3600000;
 const OCCUPYING = new Set<RequestStatus>(["pending_invite", "invited", "active", "pending_removal"]);
 const CLOSED = new Set<RequestStatus>(["completed", "cancelled"]);
@@ -54,13 +54,29 @@ function belongsTo(item: { userId: string; email: string }, actor: Actor) { retu
 function used(state: State) { return state.config.reservedSeats + state.requests.filter(r => OCCUPYING.has(r.status)).length; }
 export function createState(now: string | Date): State {
   timestamp(now);
-  return { config: { totalSeats: 4, reservedSeats: 1, leaseDays: 7, acceptHours: 24, automationEnabled: false, workspaceId: "", whitelist: [], inventoryVerified: false, existingEmails: [], protectedEmails: [PROTECTED_OWNER_EMAIL] }, requests: [], audit: [], notices: [], revision: 0 };
+  return { config: { totalSeats: 4, reservedSeats: 1, leaseHours: 3, reminderMinutes: 30, acceptHours: 24, automationEnabled: false, workspaceId: "", whitelist: [], inventoryVerified: false, existingEmails: [], protectedEmails: [PROTECTED_OWNER_EMAIL] }, requests: [], audit: [], notices: [], revision: 0 };
+}
+/** Upgrade JSON records without silently truncating already accepted leases. */
+export function upgradeState(value: State): State {
+  const next = structuredClone(value) as State & { schemaVersion?: number };
+  const config = next.config as Config & { leaseDays?: number };
+  config.leaseHours = Math.min(3, Math.max(1, config.leaseHours ?? 3));
+  config.reminderMinutes = 30;
+  config.protectedEmails ??= [PROTECTED_OWNER_EMAIL];
+  delete config.leaseDays;
+  for (const record of next.requests) {
+    const legacy = record as RequestRecord & { days?: number };
+    legacy.hours = legacy.hours ?? (legacy.days === 0 ? 0 : Math.min(3, (legacy.days ?? 1) * 24));
+    delete legacy.days;
+  }
+  next.schemaVersion = 2;
+  return next;
 }
 /** The actor must come from a trusted server session, never the request body. */
 export function transition(state: State, rawActor: Actor, command: Command, now: string | Date): State {
   const actor = actorIdentity(rawActor);
   const at = timestamp(now), instant = Date.parse(at);
-  const next: State = structuredClone(state);
+  const next: State = upgradeState(state);
   const protectedEmails = () => [...new Set([PROTECTED_OWNER_EMAIL, ...(next.config.protectedEmails ?? [])])];
   const isProtected = (value: string) => protectedEmails().includes(value);
   let changed = false, sequence = 0;
@@ -97,8 +113,9 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
     case "apply": {
       if (actor.isAdmin || isProtected(actor.email)) throw new Error("管理员使用保留席位，无需申请。");
       if (!next.config.whitelist.includes(actor.email)) throw new Error("此邮箱不在已授权员工名单中。");
+      if (command.requestKey && next.requests.some(r => belongsTo(r, actor) && r.requestKey === command.requestKey)) break;
       if (next.requests.some(r => !CLOSED.has(r.status) && (r.email === actor.email || r.userId === actor.userId))) throw new Error("你已有未结束的申请或席位，请勿重复申请。");
-      const r: RequestRecord = { id: id("req"), userId: actor.userId, email: actor.email, name: field(command.name, "姓名", 80), reason: field(command.reason, "用途", 1000), days: integer(command.days, "申请天数", 1, Math.min(7, next.config.leaseDays)), status: "queued", createdAt: at, updatedAt: at };
+      const r: RequestRecord = { id: id("req"), userId: actor.userId, email: actor.email, name: field(command.name, "姓名", 80), reason: field(command.reason, "用途", 1000), hours: integer(command.hours, "申请小时数", 1, next.config.leaseHours), status: "queued", createdAt: at, updatedAt: at, ...(command.requestKey ? { requestKey: field(command.requestKey, "请求标识", 100) } : {}) };
       next.requests.push(r); audit("apply", r.id);
       notice(r, "queued", "申请已进入队列", "将按提交先后分配可用席位。实际可用时间以工作空间加入确认结果为准。");
       break;
@@ -106,11 +123,11 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
     case "configure": {
       admin();
       if (!command.config || typeof command.config !== "object" || Array.isArray(command.config)) throw new Error("设置格式无效。");
-      const allowed = new Set(["totalSeats", "reservedSeats", "leaseDays", "acceptHours", "automationEnabled", "workspaceId", "whitelist"]);
+      const allowed = new Set(["totalSeats", "reservedSeats", "leaseHours", "acceptHours", "automationEnabled", "workspaceId", "whitelist"]);
       if (Object.keys(command.config).some(k => !allowed.has(k))) throw new Error("盘点状态只能通过首次成员盘点更新。");
       const c = { ...next.config, ...command.config };
       integer(c.totalSeats, "总席位", 2, 10000); integer(c.reservedSeats, "保留席位", protectedEmails().length, c.totalSeats);
-      integer(c.leaseDays, "最长租期", 1, 7); integer(c.acceptHours, "邀请有效小时数", 1, 168);
+      integer(c.leaseHours, "单次最大小时数", 1, 3); integer(c.acceptHours, "邀请有效小时数", 1, 168);
       if (typeof c.automationEnabled !== "boolean" || typeof c.workspaceId !== "string" || c.workspaceId.length > 200 || !Array.isArray(c.whitelist) || c.whitelist.length > 1000) throw new Error("设置格式无效。");
       c.workspaceId = c.workspaceId.trim(); c.whitelist = [...new Set(c.whitelist.map(email))].filter(e => !isProtected(e));
       const occupied = next.requests.filter(r => OCCUPYING.has(r.status)).length;
@@ -131,12 +148,16 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
     }
     case "renew": {
       const r = get(command.id);
+      if (command.requestKey && r.lastRenewalKey === command.requestKey) break;
       if (r.status !== "active" || !r.expiresAt) throw new Error("只有正在使用且有到期时间的席位可以续期。");
       if (Date.parse(r.expiresAt) <= instant) throw new Error("租期已结束，请等待回收后重新申请。");
       if (next.requests.some(item => item.status === "queued" && item.id !== r.id)) throw new Error("已有同事排队，租期结束后请重新申请。");
-      const expiry = new Date(instant + next.config.leaseDays * DAY).toISOString();
-      if (Date.parse(expiry) <= Date.parse(r.expiresAt)) break;
+      const hours = integer(command.hours, "续期小时数", 1, next.config.leaseHours);
+      const expiry = new Date(instant + hours * HOUR).toISOString();
+      if (Date.parse(expiry) <= Date.parse(r.expiresAt)) throw new Error("请选择比当前剩余时间更长的时长；续期从现在起计算，最多 3 小时。");
+      for (const item of next.notices) if (item.requestId === r.id && item.type === "expiry_30m" && item.status === "pending") item.status = "cancelled";
       r.expiresAt = expiry; r.updatedAt = at; audit("renew", r.id);
+      r.lastRenewalKey = command.requestKey ? field(command.requestKey, "请求标识", 100) : undefined;
       notice(r, "renewed", "席位租期已延长", `新的到期时间：${expiry}。`); break;
     }
     case "sync_inventory": {
@@ -153,7 +174,7 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
         const existing = next.requests.find(r => r.email === value && !CLOSED.has(r.status));
         if (existing?.status === "queued") throw new Error(`成员 ${value} 已在工作空间中，请先取消其排队申请再盘点。`);
         if (existing) continue;
-        const r: RequestRecord = { id: id("req"), userId: `inventory:${value}`, email: value, name: value.split("@")[0], reason: "首次盘点导入的现有成员或待接受邀请，未设置自动到期。", days: 0, status: "active", createdAt: at, updatedAt: at, expiresAt: null };
+        const r: RequestRecord = { id: id("req"), userId: `inventory:${value}`, email: value, name: value.split("@")[0], reason: "首次盘点导入的现有成员或待接受邀请，未设置自动到期。", hours: 0, status: "active", createdAt: at, updatedAt: at, expiresAt: null };
         next.requests.push(r); audit("inventory_import", r.id);
       }
       next.config.protectedEmails = [...protectedSnapshot];
@@ -172,7 +193,7 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
       const r = get(command.id, true); if (r.status === "active") break;
       if (r.status !== "invited") throw new Error("该申请不在待接受邀请状态，不能确认加入。");
       if (r.invitedAt && Date.parse(r.invitedAt) + next.config.acceptHours * HOUR <= instant) throw new Error("邀请预留已到期，请先核实并回收。");
-      update(r, "active", "confirm_active"); r.expiresAt = new Date(instant + r.days * DAY).toISOString();
+      update(r, "active", "confirm_active"); r.expiresAt = new Date(instant + r.hours * HOUR).toISOString();
       notice(r, "active", "席位已开始使用", `已确认加入工作空间，到期时间：${r.expiresAt}。`); break;
     }
     case "confirm_removed": {
@@ -188,8 +209,7 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
         if (r.status !== "active" || !r.expiresAt) continue;
         const remaining = Date.parse(r.expiresAt) - instant;
         if (remaining <= 0) remove(r, "lease_expired", "expired", "租期已到期，正在等待实际移除确认。");
-        else if (remaining <= HOUR) notice(r, "expiry_1h", "席位将在 1 小时内到期", `到期时间：${r.expiresAt}。请保存工作，可在无排队时续期。`);
-        else if (remaining <= DAY) notice(r, "expiry_24h", "席位将在 24 小时内到期", `到期时间：${r.expiresAt}。可提前释放或在无排队时续期。`);
+        else if (remaining <= next.config.reminderMinutes * 60_000) notice(r, "expiry_30m", "ChatGPT 席位将在 30 分钟内到期", `你的 ChatGPT Business 席位即将到期。截止时间（UTC）：${r.expiresAt}。如需继续使用，请在到期前打开席位申请中心续期：https://numems-seat-portal.workspace-026021.chatgpt.site/ 。如已续期，请以网页当前截止时间为准。网页按本地时区显示；有同事排队时需重新申请。`);
       }
       if (next.config.inventoryVerified && next.config.workspaceId && next.config.automationEnabled) {
         let available = Math.max(0, next.config.totalSeats - used(next));
@@ -209,15 +229,15 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
   return next;
 }
 export function viewState(state: State, rawActor: Actor) {
-  const actor = actorIdentity(rawActor, true), snapshot: State = structuredClone(state);
+  const actor = actorIdentity(rawActor, true), snapshot: State = upgradeState(state);
   const queue = snapshot.requests.filter(r => r.status === "queued").sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   const occupied = used(snapshot);
   const aggregate = { totalSeats: snapshot.config.totalSeats, reservedSeats: snapshot.config.reservedSeats, usedSeats: occupied, availableSeats: Math.max(0, snapshot.config.totalSeats - occupied), overCapacity: Math.max(0, occupied - snapshot.config.totalSeats), queued: queue.length, active: snapshot.requests.filter(r => r.status === "active").length, pendingInvites: snapshot.requests.filter(r => ["pending_invite", "invited"].includes(r.status)).length, pendingRemovals: snapshot.requests.filter(r => r.status === "pending_removal").length, inventoryVerified: snapshot.config.inventoryVerified };
   if (actor.isAdmin) return { ...snapshot, aggregate, queuePosition: null as number | null };
   const mine = (item: { userId: string; email: string }) => belongsTo(item, actor);
   const position = queue.findIndex(mine);
-  const { totalSeats, reservedSeats, leaseDays, acceptHours, automationEnabled, inventoryVerified } = snapshot.config;
-  return { config: { totalSeats, reservedSeats, leaseDays, acceptHours, automationEnabled, inventoryVerified }, requests: snapshot.requests.filter(mine), notices: snapshot.notices.filter(mine), revision: snapshot.revision, aggregate, queuePosition: position < 0 ? null : position + 1, eligible: snapshot.config.whitelist.includes(actor.email) && ![PROTECTED_OWNER_EMAIL, ...(snapshot.config.protectedEmails ?? [])].includes(actor.email) };
+  const { totalSeats, reservedSeats, leaseHours, reminderMinutes, acceptHours, automationEnabled, inventoryVerified } = snapshot.config;
+  return { config: { totalSeats, reservedSeats, leaseHours, reminderMinutes, acceptHours, automationEnabled, inventoryVerified }, requests: snapshot.requests.filter(mine), notices: snapshot.notices.filter(mine), revision: snapshot.revision, aggregate, queuePosition: position < 0 ? null : position + 1, eligible: snapshot.config.whitelist.includes(actor.email) && ![PROTECTED_OWNER_EMAIL, ...(snapshot.config.protectedEmails ?? [])].includes(actor.email) };
 }
 
 

@@ -8,7 +8,7 @@ const bob = { userId: 'b', email: 'bob@example.com', isAdmin: false };
 const carol = { userId: 'c', email: 'carol@example.com', isAdmin: false };
 const at = hours => new Date(Date.parse(NOW) + hours * 3600000).toISOString();
 const act = (state, command, actor = owner, time = NOW) => transition(state, actor, command, time);
-const apply = (state, actor = alice, days = 1, time = NOW) => act(state, { type: 'apply', name: actor.userId, reason: '项目研发', days }, actor, time);
+const apply = (state, actor = alice, hours = 1, time = NOW) => act(state, { type: 'apply', name: actor.userId, reason: '项目研发', hours }, actor, time);
 function configured({ verified = true, enabled = true, seats = 2 } = {}) {
   let state = act(createState(NOW), { type: 'configure', config: { totalSeats: seats, workspaceId: 'workspace-1', automationEnabled: enabled, whitelist: [alice.email, bob.email, carol.email] } });
   if (verified) state = act(state, { type: 'sync_inventory', members: [{ email: owner.email, role: 'owner' }] });
@@ -25,7 +25,7 @@ test('deep copying, validation and identity guardrails', () => {
   assert.equal(state.requests[0].status, 'queued');
   assert.throws(() => apply(state), /重复/);
   assert.throws(() => apply(initial, { ...alice, email: 'outsider@example.com' }), /名单/);
-  assert.throws(() => apply(initial, alice, 8), /申请天数/);
+  assert.throws(() => apply(initial, alice, 8), /申请小时数/);
   assert.throws(() => apply(initial, owner), /保留/);
   assert.throws(() => act(initial, { type: 'tick' }, alice), /管理员/);
   assert.throws(() => act(initial, { type: 'configure', config: { inventoryVerified: true } }), /盘点状态/);
@@ -57,11 +57,11 @@ test('FIFO capacity and tick idempotency', () => {
 test('expiry retains capacity until explicit removal confirmation', () => {
   let state = apply(configured()); const id = state.requests[0].id;
   state = activate(act(state, { type: 'tick' }), id); state = apply(state, bob);
-  state = act(state, { type: 'tick' }, owner, at(24));
+  state = act(state, { type: 'tick' }, owner, at(1));
   assert.deepEqual(state.requests.map(r => r.status), ['pending_removal', 'queued']);
   assert.equal(viewState(state, owner).aggregate.availableSeats, 0);
-  state = act(state, { type: 'confirm_removed', id }, owner, at(24.1));
-  state = act(state, { type: 'tick' }, owner, at(24.2));
+  state = act(state, { type: 'confirm_removed', id }, owner, at(1.1));
+  state = act(state, { type: 'tick' }, owner, at(1.2));
   assert.deepEqual(state.requests.map(r => r.status), ['completed', 'pending_invite']);
   assert.throws(() => act(state, { type: 'confirm_active', id }), /待接受/);
 });
@@ -74,21 +74,27 @@ test('invitation timeout retains reserved capacity and rejects stale accept conf
   assert.equal(state.notices.filter(n => n.type === 'invitation_expired').length, 1);
   assert.deepEqual(act(state, { type: 'tick' }, owner, at(25)), state);
 });
-test('reminders are once per lease; renewal is bounded and never jumps a queue', () => {
-  let state = apply(configured(), alice, 2); const id = state.requests[0].id;
-  state = activate(act(state, { type: 'tick' }), id); state = act(state, { type: 'tick' }, owner, at(25));
-  assert.equal(state.notices.filter(n => n.type === 'expiry_24h').length, 1);
-  assert.deepEqual(act(state, { type: 'tick' }, owner, at(26)), state);
-  state = act(state, { type: 'tick' }, owner, at(47.5));
-  assert.equal(state.notices.filter(n => n.type === 'expiry_1h').length, 1);
-  assert.throws(() => act(apply(state, bob, 1, at(47.5)), { type: 'renew', id }, alice, at(47.5)), /排队/);
-  state = act(state, { type: 'renew', id }, alice, at(47.5));
-  assert.equal(state.requests[0].expiresAt, at(47.5 + 168));
-  assert.deepEqual(act(state, { type: 'renew', id }, alice, at(47.5)), state);
-  state = act(state, { type: 'tick' }, owner, at(47.5 + 145));
-  const reminders = state.notices.filter(n => n.type === 'expiry_24h');
-  assert.equal(reminders.length, 2); assert.notEqual(reminders[0].key, reminders[1].key);
+test('30-minute reminder boundary, stale reminder cancellation and bounded renewals', () => {
+  let state = apply(configured(), alice, 3); const id = state.requests[0].id;
+  state = activate(act(state, {type:'tick'}), id);
+  assert.equal(state.requests[0].expiresAt, at(3));
+  state = act(state, {type:'tick'}, owner, at(2.49));
+  assert.equal(state.notices.filter(n => n.type === 'expiry_30m').length, 0);
+  state = act(state, {type:'tick'}, owner, at(2.5));
+  assert.equal(state.notices.filter(n => n.type === 'expiry_30m').length, 1);
+  assert.deepEqual(act(state, {type:'tick'}, owner, at(2.6)), state);
+  assert.throws(() => act(apply(state, bob, 1, at(2.6)), {type:'renew', id, hours:3}, alice, at(2.6)), /排队/);
+  state = act(state, {type:'renew', id, hours:3, requestKey:'renew-1'}, alice, at(2.6));
+  assert.equal(state.requests[0].expiresAt, at(5.6));
+  assert.equal(state.notices.find(n => n.type === 'expiry_30m').status, 'cancelled');
+  assert.deepEqual(act(state, {type:'renew', id, hours:3, requestKey:'renew-1'}, alice, at(2.6)), state);
+  assert.throws(() => act(state, {type:'renew', id, hours:4}, alice, at(2.7)), /小时数/);
+  assert.throws(() => act(state, {type:'renew', id, hours:1}, alice, at(2.7)), /更长/);
+  state = act(state, {type:'tick'}, owner, at(5.1));
+  const notices = state.notices.filter(n => n.type === 'expiry_30m');
+  assert.equal(notices.length, 2); assert.notEqual(notices[0].key, notices[1].key);
 });
+
 test('inventory imports fixed members and pending invitations without dropping occupancy', () => {
   let state = configured({ verified: false, seats: 4 });
   state = act(state, { type: 'sync_inventory', members: [{ email: owner.email, role: 'owner' }, { email: ' Alice@Example.com ', role: 'member' }, { email: alice.email, role: 'member' }, { email: bob.email, role: 'pending_invite' }] });
@@ -187,4 +193,12 @@ test('initial snapshot never changes a pending removal or counts an existing req
   const absent = act(state, { type: 'sync_inventory', members: [members[0]] });
   assert.equal(absent.requests[0].status, 'pending_removal');
   assert.equal(viewState(absent, owner).aggregate.usedSeats, 2);
+});
+
+test('hourly application bounds and submission idempotency', () => {
+  const initial = configured();
+  for (const hours of [0, 4, 1.5, NaN]) assert.throws(() => apply(initial, alice, hours), /小时数/);
+  const command = {type:'apply', name:'Alice', reason:'研发', hours:2, requestKey:'one-request'};
+  const state = act(initial, command, alice);
+  assert.deepEqual(act(state, command, alice), state);
 });

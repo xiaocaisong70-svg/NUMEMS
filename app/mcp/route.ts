@@ -1,18 +1,77 @@
-import { currentActor, readState } from "@/lib/portal-service";
+import { currentActor, readState, mutateState, schedulerActor } from "@/lib/portal-service";
 import { runJobs } from "@/lib/jobs";
+import { observeWorkspace, prepareTest, workPlan, claimOperation, completeOperation, setBridgeMode,
+  setTestDeadline, recordSchedule, type BridgeState, type Observation } from "@/lib/codex-bridge";
+import { transition } from "@/lib/seat-engine";
 export const dynamic = "force-dynamic";
 
+const personSchema = { type: "object", properties: {
+  email: { type: "string" }, role: { type: "string", enum: ["member", "admin", "owner"] },
+}, required: ["email", "role"], additionalProperties: false };
+const observationSchema = { type: "object", properties: {
+  workspaceId: { type: "string" }, accountEmail: { type: "string" }, pageUrl: { type: "string" },
+  observedAt: { type: "string" }, complete: { type: "boolean" }, totalSeats: { type: "integer" },
+  members: { type: "array", items: personSchema }, invites: { type: "array", items: personSchema },
+}, required: ["workspaceId", "accountEmail", "pageUrl", "observedAt", "complete", "totalSeats", "members", "invites"], additionalProperties: false };
 const tools = [
   {
+    name: "record_codex_schedule", description: "本地Codex定时任务已实际创建并核对后登记其ID；空字符串表示清除登记，不代替真正暂停任务。",
+    inputSchema: { type: "object", properties: { scheduleId: { type: "string" } }, required: ["scheduleId"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "set_test_deadline", description: "仅用于授权邮箱的已加入测试席位：把截止时间调至30分钟提醒窗口或立即到期，用于端到端验收，不改变其他员工租期。",
+    inputSchema: { type: "object", properties: {
+      requestId: { type: "string" }, stage: { type: "string", enum: ["reminder", "expire"] },
+    }, required: ["requestId", "stage"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
+  {
     name: "seat_portal_status",
-    description: "查看席位门户调度状态与待处理数量。仅门户管理员可以使用。",
+    description: "查看门户当前工作队列、30分钟提醒与Codex执行器状态。仅管理员可用。",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: true },
   },
   {
     name: "process_seat_queue",
-    description: "按既定规则处理排队、到期状态和提醒；不会邀请或移除真实 ChatGPT 成员。仅门户管理员可以使用。",
+    description: "处理小时制排队、到期与30分钟提醒，返回Codex待办。实际邀请/移除由授权浏览器执行后回执。",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "observe_workspace", description: "保存刚从官方后台完整读取的成员和邀请证据，核对工作空间及Owner；首次自动盘点，后续核对接受邀请和已移除状态。",
+    inputSchema: { type: "object", properties: { observation: observationSchema }, required: ["observation"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "prepare_test_request", description: "为用户明确授权的hit_wangning@outlook.com创建1小时测试申请并仅开启该邮箱的测试模式；不会发送邀请。",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "claim_seat_operation", description: "取得一个独占办理租约。邀请/移除需60秒内的完整官方证据；邮件需有效30分钟提醒。必须核实真实结果再complete，结果不明不可重试。",
+    inputSchema: { type: "object", properties: {
+      kind: { type: "string", enum: ["invite", "remove", "mail"] }, targetId: { type: "string" },
+    }, required: ["kind", "targetId"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
+  {
+    name: "complete_seat_operation", description: "提交实际执行回执。邀请/移除必须提供操作后的完整官方快照；邮件必须提供Gmail消息ID。失败或结果不明会保留锁并要求核查。",
+    inputSchema: { type: "object", properties: {
+      operationId: { type: "string" }, token: { type: "string" },
+      outcome: { type: "string", enum: ["verified", "uncertain", "blocked"] },
+      observation: observationSchema, providerMessageId: { type: "string" }, detail: { type: "string" },
+    }, required: ["operationId", "token", "outcome"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "release_test_request", description: "请求回收指定授权邮箱的测试席位；只将测试申请推进待回收，不直接移除真实成员。",
+    inputSchema: { type: "object", properties: { requestId: { type: "string" } }, required: ["requestId"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "set_codex_live", description: "完成邀请、真实成员回收与邮件验证后启用Codex正式办理；也可随时暂停。",
+    inputSchema: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
 ];
@@ -44,16 +103,46 @@ export async function POST(request: Request) {
       const actor = await currentActor();
       if (!actor?.isAdmin) throw new Error("只有已登录的门户管理员可以运行此工具。");
       if (body.params?.name === "process_seat_queue") {
-        result = { content: [{ type: "text", text: JSON.stringify(await runJobs()) }] };
+        const jobs = await runJobs();
+        result = { content: [{ type: "text", text: JSON.stringify({ ...jobs,
+          plan: workPlan((await readState()).state as BridgeState, new Date().toISOString()) }) }] };
       } else if (body.params?.name === "seat_portal_status") {
         const { state } = await readState();
         result = { content: [{ type: "text", text: JSON.stringify({
           requests: state.requests.length,
           pendingNotices: state.notices.filter(n => n.status === "pending").length,
           inventoryVerified: state.config.inventoryVerified,
-          memberAdapter: "not_connected",
+          plan: workPlan(state as BridgeState, new Date().toISOString()),
         }) }] };
-      } else throw new Error("未知工具。");
+      } else {
+        const name = body.params?.name;
+        const args = body.params?.arguments ?? {};
+        const now = new Date().toISOString();
+        const token = crypto.randomUUID();
+        const state = await mutateState(current => {
+          const s = current as BridgeState;
+          if (name === "observe_workspace") return observeWorkspace(s, args.observation as Observation, now);
+          if (name === "prepare_test_request") return prepareTest(s, now);
+          if (name === "record_codex_schedule") return recordSchedule(s, args.scheduleId, now);
+          if (name === "set_test_deadline") return setTestDeadline(s, args.requestId, args.stage, now);
+          if (name === "claim_seat_operation") {
+            if (!["invite", "remove", "mail"].includes(args.kind) || typeof args.targetId !== "string") throw new Error("办理参数无效。");
+            return claimOperation(s, args.kind, args.targetId, token, now);
+          }
+          if (name === "complete_seat_operation") return completeOperation(s, args, now);
+          if (name === "set_codex_live") {
+            if (typeof args.enabled !== "boolean") throw new Error("启用参数无效。");
+            return setBridgeMode(s, args.enabled, now);
+          }
+          if (name === "release_test_request") {
+            const r = s.requests.find(r => r.id === args.requestId && r.isTest === true);
+            if (!r) throw new Error("只允许回收已登记的测试申请。");
+            return transition(s, schedulerActor, { type: "release", id: r.id }, now);
+          }
+          throw new Error("未知工具。");
+        });
+        result = { content: [{ type: "text", text: JSON.stringify(workPlan(state as BridgeState, now)) }] };
+      }
     } else {
       return Response.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
     }
