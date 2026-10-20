@@ -7,11 +7,26 @@ const health = await request("/api/health");
 assert.equal(health.status, 200);
 assert.equal((await health.json()).storage, "ready");
 checks++;
-const publicData = await (await request("/api/portal")).json();
+const publicResponse = await request("/api/portal");
+assert.equal(publicResponse.status, 401);
+assert.match(publicResponse.headers.get("cache-control"), /no-store/);
+const publicData = await publicResponse.json();
 assert.equal(publicData.user, null);
+assert.equal(publicData.access, "signin_required");
 assert.equal(JSON.stringify(publicData).includes("whitelist"), false);
 assert.equal(JSON.stringify(publicData).includes("2712467009"), false);
-assert.equal(publicData.view.requests.length, 0);
+assert.equal(publicData.view, null);
+assert.equal(JSON.stringify(publicData).includes("availableSeats"), false);
+checks++;
+const anonymousPage = await (await request("/")).text();
+assert.match(anonymousPage, /使用 ChatGPT 登录/);
+assert.equal(anonymousPage.includes("whitelist"), false);
+checks++;
+const fakeIdentity = await request("/api/portal", { headers: {
+  "oai-authenticated-user-id": "forged",
+  "oai-authenticated-user-email": "xiaocaisong70@gmail.com",
+} });
+assert.equal(fakeIdentity.status, 401, "The preview dispatch strips caller-supplied identity headers");
 checks++;
 for (const type of ["apply", "configure", "confirm_removed"]) {
   const response = await request("/api/portal", {
@@ -41,11 +56,27 @@ const signIn = await request("/signin-with-chatgpt?return_to=/", { redirect: "ma
 assert.equal(signIn.status, 302);
 const employeeCookie = signIn.headers.get("set-cookie")?.split(";")[0];
 assert.ok(employeeCookie, "Preview employee sign-in must succeed");
-const employeeBefore = await (await request("/api/portal", {
+const employeeResponse = await request("/api/portal", {
   headers: { cookie: employeeCookie },
-})).json();
+});
+assert.ok([200, 403].includes(employeeResponse.status));
+const employeeBefore = await employeeResponse.json();
 assert.equal(employeeBefore.user.email, "seedy@sites.test");
 assert.equal(employeeBefore.user.isAdmin, false);
+if (employeeResponse.status === 403) {
+assert.equal(employeeBefore.access, "not_authorized");
+assert.equal(employeeBefore.view, null);
+for (const type of ["apply", "renew", "release", "configure", "confirm_removed"]) {
+  const denied = await request("/api/portal", {
+    method: "POST",
+    headers: { origin: base, "content-type": "application/json", cookie: employeeCookie },
+    body: JSON.stringify({ type, id: "not-owned" }),
+  });
+  assert.equal(denied.status, 403, `${type} must check the whitelist before executing`);
+  assert.equal((await denied.json()).access, "not_authorized");
+  checks++;
+}
+}
 for (const path of ["/mcp", "/api/codex"]) {
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call",
     params: { name: "process_seat_queue", arguments: {} } });

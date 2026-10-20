@@ -1,9 +1,11 @@
 "use client";
 import { useState, useEffect } from "react";
 import { useCodexTools } from "./worker-tools";
+import AccessScreen from "./access-screen";
+import type { PortalAccess } from "@/lib/portal-access";
 import { ArrowRight, ArrowUpRight, Bell, Check, ChevronRight, Clock3, FileText, History, LayoutDashboard, LogIn, Play, Plus, RefreshCw, Send, ShieldCheck, SlidersHorizontal, Sparkles, Users, X } from "lucide-react";
 
-type Data = { user: { userId: string; email: string; displayName?: string; isAdmin?: boolean } | null; view?: Record<string, unknown> | null; connection?: { memberAdapter?: string; scheduler?: boolean; schedulerMode?: string; mail?: boolean; lastDeliveryError?: string | null }; error?: string };
+type Data = { access?: PortalAccess; user: { userId: string; email: string; displayName?: string; isAdmin?: boolean } | null; view?: Record<string, unknown> | null; connection?: { memberAdapter?: string; scheduler?: boolean; schedulerMode?: string; mail?: boolean; lastDeliveryError?: string | null }; error?: string };
 type Request = { id: string; userId?: string; email: string; name?: string; reason?: string; hours?: number; status: string; createdAt?: string; expiresAt?: string | null };
 const labels: Record<string, string> = { queued: "排队中", pending_invite: "待管理员邀请", invited: "待接受邀请", active: "使用中", pending_removal: "待管理员移除", released: "已释放", completed: "已回收", cancelled: "已取消", removed: "已移除", expired: "已到期", failed: "需处理" };
 const live = ["queued", "pending_invite", "invited", "active", "pending_removal"];
@@ -18,7 +20,7 @@ export default function Portal({ initialData }: { initialData: Data }) {
   useEffect(() => {
     if (demo) return;
     let cancelled = false;
-    const refresh = async () => { try { const r = await fetch("/api/portal", {cache:"no-store"}); if (r.ok) { const d = await r.json() as Data; if (!cancelled && !d.error) setData(d); } } catch {} };
+    const refresh = async () => { try { const r = await fetch("/api/portal", {cache:"no-store"}); if (r.ok || r.status === 401 || r.status === 403) { const d = await r.json() as Data; if (!cancelled) setData(d); } } catch {} };
     const handle = setInterval(refresh, 30000);
     return () => {cancelled = true; clearInterval(handle);};
   }, [demo]);
@@ -26,7 +28,7 @@ export default function Portal({ initialData }: { initialData: Data }) {
   const [message, setMessage] = useState("");
   const current = demo || data || { user: null };
   const user = current.user;
-  useCodexTools<Data>(Boolean(user?.isAdmin && !demo), setData);
+  useCodexTools<Data>(Boolean(user?.isAdmin && data.access === "allowed" && !demo), setData);
   const codexMode = !demo && current.connection?.memberAdapter?.startsWith("codex_");
   const view = current.view || {};
   const config = { totalSeats: 4, reservedSeats: 1, leaseHours: 3, automationEnabled: false, inventoryVerified: false, workspaceId: "", whitelist: [] as string[], ...(view.config as Record<string, unknown> || {}) };
@@ -61,6 +63,7 @@ export default function Portal({ initialData }: { initialData: Data }) {
         }
         const response = await fetch("/api/portal", type === "refresh" ? { cache: "no-store" } : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type, ...payload }) });
         const next = await response.json() as Data;
+        if (next.access && next.access !== "allowed") { setData(next); setModal(""); }
         if (!response.ok || next.error) throw new Error(next.error || "操作未完成，请重试。");
         setData(next); setMessage("状态已更新。");
       }
@@ -77,6 +80,8 @@ export default function Portal({ initialData }: { initialData: Data }) {
   }
   function table(items: Request[], admin = false) { return items.length ? <div className="table-scroll"><table><thead><tr><th>{admin ? "申请人" : "申请用途"}</th><th>提交时间</th><th>使用期限</th><th>状态</th><th>操作</th></tr></thead><tbody>{items.map(r => <tr key={r.id}><td><strong>{admin ? r.name || r.email : r.reason}</strong><small>{admin ? r.email : `#${r.id.slice(-8)}`}</small></td><td>{dt(r.createdAt)}</td><td>{r.status === "active" && !r.expiresAt ? "固定成员" : r.expiresAt ? `${dt(r.expiresAt)} 到期` : `${r.hours} 小时`}</td><td><span className={`badge ${r.status}`}>{labels[r.status] || r.status}</span></td><td>{controls(r, admin)}</td></tr>)}</tbody></table></div> : <div className="empty"><History size={27} /><h3>还没有申请记录</h3><p>提交第一份申请后，在这里查看每一步进展。</p></div>; }
   const applyButton = (className = "button primary") => user?.isAdmin && !demo ? <button className={className} onClick={() => setNav("admin")}>管理席位<ArrowRight size={16} /></button> : user && !demo && view.eligible === false ? <button className={className} disabled title="请联系管理员加入员工邮箱白名单">等待员工授权</button> : user ? <button className={className} disabled={!!active || busy} onClick={() => setModal("apply")}>{active ? "申请已登记" : "申请席位"}{active ? <Check size={16} /> : <ArrowRight size={16} />}</button> : <a className={className} href="/signin-with-chatgpt?return_to=/" target="_top">登录并申请<ArrowRight size={16} /></a>;
+  if (!demo && data.access !== "allowed")
+    return <AccessScreen access={data.access ?? "signin_required"} email={data.user?.email} />;
   return <div className="portal-shell"><aside className="sidebar"><a className="brand" href="/"><span className="brand-mark"><i /><i /><i /></span><span>NUMEMS<small>WORKSPACE</small><small className="developer-credit">Developed by xcsong</small></span></a><div className="workspace-switch"><Users size={18} /><div><strong>团队席位管理</strong><small>ChatGPT Business</small></div><ChevronRight size={14} /></div><p className="nav-label">工作空间</p><nav>{navs.map(n => <button key={n.id} className={nav === n.id ? "selected" : ""} onClick={() => setNav(n.id)}><n.icon size={18} />{n.label}{nav === n.id && <i />}</button>)}</nav><div className="sidebar-bottom"><div className="sidebar-note"><ShieldCheck size={21} /><strong>独立账号，安心协作</strong><p>使用自己的邮箱申请。<br />账号与个人信息由你掌握。</p></div><div className="profile"><span className="avatar">{(user?.displayName || "N")[0]}</span><div><strong>{user?.displayName || (user ? "团队成员" : "访客")}</strong><small>{user?.email || "登录后开始申请"}</small></div></div></div></aside>
     <div className="main-shell">{demo && <div className="demo-banner"><span><Play size={13} /><b>演示数据</b> 所有操作仅在浏览器内模拟，不影响真实席位。</span><button onClick={() => { setDemo(null); setNav("mine"); setMessage(""); }}>退出演示<X size={14} /></button></div>}<header className="topbar"><div>席位申请中心<ChevronRight size={12} /><strong>{navs.find(n => n.id === nav)?.label}</strong></div><div><span className="manual-pill"><i />{current.connection?.memberAdapter === "codex_test" ? "Codex验收测试" : codexMode ? "Codex自动办理" : "人工确认模式"}</span><button className="icon-button" aria-label="刷新状态" disabled={busy} onClick={() => void action("refresh")}><RefreshCw size={17} /></button><button className="icon-button" aria-label="查看通知" onClick={() => setModal("notices")}><Bell size={18} /></button></div></header>
     <main className="content">{current.connection?.lastDeliveryError && <div role="alert" className="admin-notice"><ShieldCheck size={20}/><div><strong>自动办理需要核查</strong><p>{current.connection.lastDeliveryError}</p></div></div>}<div className="page-heading"><div><span className="eyebrow">TEAM ACCESS, SIMPLIFIED</span><h1>{navs.find(n => n.id === nav)?.label || "我的申请"}</h1><p>{nav === "mine" ? "把时间留给工作，让席位申请更简单。" : "每一次申请、使用与释放，都有清晰记录。"}</p></div><div className="heading-actions">{!demo && <button className="button secondary" onClick={startDemo}><Play size={14} />体验演示</button>}{nav !== "admin" && applyButton()}</div></div>
