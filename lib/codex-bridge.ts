@@ -1,7 +1,7 @@
-import { PROTECTED_OWNER_EMAIL, transition, type State, type Actor } from "./seat-engine.ts";
+import { PROTECTED_OWNER_EMAIL, AUTHORIZED_TEST_EMAIL, transition, type State, type Actor } from "./seat-engine.ts";
 
 export const TARGET_WORKSPACE_ID = "cd01c344-8ff9-41fd-a750-f7b30af9a7c9";
-export const TEST_EMAIL = "hit_wangning@outlook.com";
+export const TEST_EMAIL = AUTHORIZED_TEST_EMAIL;
 export type Person = { email: string; role: "member" | "admin" | "owner" };
 export type Observation = {
   workspaceId: string; accountEmail: string; pageUrl: string; observedAt: string;

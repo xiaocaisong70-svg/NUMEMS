@@ -1,4 +1,5 @@
 export const PROTECTED_OWNER_EMAIL = "xiaocaisong70@gmail.com";
+export const AUTHORIZED_TEST_EMAIL = "hit_wangning@outlook.com";
 export type Actor = { userId: string; email: string; isAdmin: boolean };
 export type RequestStatus = "queued" | "pending_invite" | "invited" | "active" | "pending_removal" | "completed" | "cancelled";
 export type Config = {
@@ -50,7 +51,12 @@ function actorIdentity(actor: Actor, anonymous = false): Actor {
   if (!actor || typeof actor.isAdmin !== "boolean") throw new Error("身份无效。");
   return { userId: field(actor.userId, "用户标识", 200), email: anonymous && !actor.email ? "" : email(actor.email), isAdmin: actor.isAdmin };
 }
-function belongsTo(item: { userId: string; email: string }, actor: Actor) { return Boolean(actor.email) && item.email === actor.email && (item.userId === actor.userId || item.userId === `inventory:${item.email}`); }
+function belongsTo(item: { userId: string; email: string }, actor: Actor) {
+  // Admin-created test records precede this employee's first portal sign-in.
+  const authorizedTest = item.email === AUTHORIZED_TEST_EMAIL && item.userId === `test:${AUTHORIZED_TEST_EMAIL}`;
+  return Boolean(actor.email) && item.email === actor.email &&
+    (item.userId === actor.userId || item.userId === `inventory:${item.email}` || authorizedTest);
+}
 function used(state: State) { return state.config.reservedSeats + state.requests.filter(r => OCCUPYING.has(r.status)).length; }
 export function createState(now: string | Date): State {
   timestamp(now);

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createState, transition, PROTECTED_OWNER_EMAIL, upgradeState } from "../lib/seat-engine.ts";
+import { createState, transition, viewState, PROTECTED_OWNER_EMAIL, upgradeState } from "../lib/seat-engine.ts";
 import { TARGET_WORKSPACE_ID, TEST_EMAIL, observeWorkspace, prepareTest, claimOperation,
   completeOperation, workPlan, setTestDeadline, setBridgeMode } from "../lib/codex-bridge.ts";
 const NOW = "2026-10-20T06:00:00.000Z";
@@ -22,6 +22,22 @@ function invited() {
     observation:snapshot(1, [], [member]) }, at(1));
 }
 function active() { return observeWorkspace(invited(), snapshot(2, [member]), at(2)); }
+
+test("verified test employee can see and renew their admin-created pilot only", () => {
+  const s = active(); const id = s.requests[0].id;
+  const employee = { userId: "actual-sites-user-id", email: TEST_EMAIL, isAdmin: false };
+  assert.equal(viewState(s, employee).requests[0].id, id);
+  assert.ok(viewState(s, employee).notices.length > 0);
+  const renewed = transition(s, employee, { type: "renew", id, hours: 3 }, at(3));
+  assert.equal(renewed.requests[0].expiresAt, at(10803));
+  const outsider = { ...employee, email: "outsider@example.com" };
+  assert.equal(viewState(s, outsider).requests.length, 0);
+  assert.equal(viewState(s, outsider).notices.length, 0);
+  assert.throws(() => transition(s, outsider, { type: "renew", id, hours: 3 }, at(3)), /未找到/);
+  const ordinary = structuredClone(s);
+  ordinary.requests[0].userId = "another-real-account";
+  assert.equal(viewState(ordinary, employee).requests.length, 0);
+});
 
 test("wrong workspace, account, URL, incomplete or stale evidence is rejected", () => {
   for (const change of [
