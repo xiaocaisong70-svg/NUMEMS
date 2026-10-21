@@ -1,5 +1,7 @@
 import { readFile, writeFile, rename, mkdir, open, unlink } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import path from "node:path";
+import { promisify } from "node:util";
 import { loadConfig, runtimeDir } from "./config.mjs";
 import { BrowserAdapter } from "./browser.mjs";
 import { PortalClient } from "./portal-client.mjs";
@@ -11,6 +13,7 @@ const lockPath = path.join(runtimeDir, "worker.lock");
 const statusPath = path.join(runtimeDir, "status.json");
 const legacyStatusPath = path.join(runtimeDir, "..", "queue-checker", "status.json");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const execFileAsync = promisify(execFile);
 export const EXECUTOR_SCHEDULE_ID = "local:seat-executor:NUMEMS-Seat-Queue";
 const unhealthyResults = new Set(["dry_run", "mail_uncertain", "mail_channel_required"]);
 
@@ -31,12 +34,31 @@ async function saveStatus(status) {
   await rename(temporary, statusPath);
 }
 
-export async function assertLegacyInactive(config, now = Date.now()) {
+export async function queryLegacyTaskState() {
+  if (process.platform !== "win32") throw new Error("无法在非 Windows 环境核实旧计划任务状态。");
+  // Query the exact root-level task. Exit errors, a missing task, duplicate
+  // matches or unexpected output all fail closed before any portal mutation.
+  const command = "$ErrorActionPreference='Stop'; " +
+    "$tasks=@(Get-ScheduledTask -TaskPath '\\' -TaskName 'NUMEMS-Seat-Queue' -ErrorAction Stop); " +
+    "if($tasks.Count -ne 1){throw 'Legacy task missing or ambiguous'}; " +
+    "[Console]::Out.WriteLine($tasks[0].State.ToString())";
+  const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command],
+    { windowsHide: true, timeout: 10_000, maxBuffer: 16_384 });
+  return stdout.trim();
+}
+
+export async function assertLegacyInactive(config, now = Date.now(),
+  queryTaskState = queryLegacyTaskState, readStatusFile = readFile) {
   if (!config.liveActions) return;
   if (!config.legacyCheckerDisabled)
     throw new Error("旧队列检查任务未确认停止。");
+  let state;
+  try { state = await queryTaskState(); }
+  catch { throw new Error("无法核实旧 Windows 计划任务已禁用，拒绝并行办理。"); }
+  if (state !== "Disabled")
+    throw new Error(`旧 Windows 计划任务状态为 ${state || "未知"}，拒绝并行办理。`);
   try {
-    const status = JSON.parse(await readFile(legacyStatusPath, "utf8"));
+    const status = JSON.parse(await readStatusFile(legacyStatusPath, "utf8"));
     if (!Number.isFinite(Date.parse(status.checkedAt)) ||
         now - Date.parse(status.checkedAt) < 180_000)
       throw new Error("旧队列检查任务最近仍在运行，拒绝并行执行。");

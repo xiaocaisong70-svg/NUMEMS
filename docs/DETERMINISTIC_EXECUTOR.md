@@ -13,7 +13,7 @@
 
 1. 用 `npm ci` 安装锁定依赖，运行 `node --test tests/*.test.mjs`、`node node_modules/typescript/bin/tsc --noEmit` 和 `node scripts/run-framework.mjs build`。执行器文件不作为 Cloudflare 请求处理代码打包。
 2. 在 `.sites-runtime/seat-executor/config.json` 配置确切的原版站点、工作空间和管理员资料。默认配置已绑定 `My Workspace`、四席位和 `xiaocaisong70@gmail.com`，且 `liveActions:false`。先运行 `node scripts/seat-executor/login.mjs`，由管理员本人在专用 Edge 档案的两个标签页完成官方管理后台与门户登录。密码、Cookie 和令牌不会经脚本输出或提交到 Git。之后运行 `node scripts/seat-executor/main.mjs --once` 只读核对待办数量；它不会办理成员或邮件。
-3. 核实旧 `NUMEMS-Seat-Queue` 计划任务的实际状态；停止旧检查程序及任何旧唤醒入口后，确认三分钟内无新 `queue-checker/status.json` 记录，门户无未完成租约。旧版、优化版和本地零模型版不能同时对同一工作空间执行成员写入。`legacyCheckerDisabled` 只有在**真实停用并核实**后才能设为 `true`；程序还会拒绝最近仍运行过的旧检查器。
+3. 核实旧 `NUMEMS-Seat-Queue` 计划任务的实际状态；停止旧检查程序及任何旧唤醒入口后，确认三分钟内无新 `queue-checker/status.json` 记录，门户无未完成租约。旧版、优化版和本地零模型版不能同时对同一工作空间执行成员写入。`legacyCheckerDisabled` 只有在**真实停用并核实**后才能设为 `true`；真实执行的每一轮还会从 Windows 查询旧任务必须为 `Disabled`，并拒绝最近仍运行过的旧检查器。任务缺失或系统查询失败时也会停止，不把配置标志当作停用证据。
 4. 邮件若选 `relay`，须先在原版 Sites 环境变量中实际配置 `REMINDER_DELIVERY_MODE=relay`、`REMINDER_WEBHOOK_URL`、`REMINDER_WEBHOOK_TOKEN`、`PORTAL_PUBLIC_URL`，并对一次真实有效提醒核对中继消息 ID。若选 `gmail_connector`，需配置本机 `codexCli`，对真实提醒核对 Gmail 消息 ID 和“已发送”，且云端不得同时启用 relay。不能通过模拟成功回执来验收。未验收通道时保持原邮件办理方式。
 5. 使用真实、已批准的普通成员申请做完整加入、五分钟超时保护、续期、三十分钟提醒、到期或提前释放和回收的端到端验收。不得创建测试申请或改变真实截止时间来缩短流程。移除前若出现即时审批要求，停止并按 `AUTOMATION.md` 办理；审批拒绝时记录 `approval_required` 并保持 `liveActions:false`。只有此前所有条件满足后才可考虑开启执行器写入并登记其调度标识。当前交付默认**不接管线上任务**。
 

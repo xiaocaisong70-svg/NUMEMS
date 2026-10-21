@@ -4,7 +4,34 @@ import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { sendFatalAlert, markExecutorHealthy } from "../scripts/seat-executor/alert.mjs";
-import { registerLiveSchedule, EXECUTOR_SCHEDULE_ID } from "../scripts/seat-executor/main.mjs";
+import { assertLegacyInactive, registerLiveSchedule, EXECUTOR_SCHEDULE_ID } from "../scripts/seat-executor/main.mjs";
+
+test("live executor requires the actual legacy Windows task to be disabled on every check", async () => {
+  const now = Date.parse("2026-10-20T21:00:00.000Z");
+  const config = { liveActions: true, legacyCheckerDisabled: true };
+  let reads = 0;
+  const oldStatus = async () => { reads++; return JSON.stringify({ checkedAt: new Date(now - 240_000).toISOString() }); };
+  await assertLegacyInactive(config, now, async () => "Disabled", oldStatus);
+  assert.equal(reads, 1);
+  for (const state of ["Ready", "Running", "Unknown", ""]) {
+    await assert.rejects(assertLegacyInactive(config, now, async () => state, oldStatus), /拒绝并行办理/);
+  }
+  assert.equal(reads, 1, "do not accept the status file as proof when the OS task is enabled or unknown");
+  await assert.rejects(assertLegacyInactive(config, now, async () => { throw new Error("task missing"); }, oldStatus),
+    /无法核实旧 Windows 计划任务已禁用/);
+  assert.equal(reads, 1);
+});
+
+test("a disabled Windows task still needs a stale legacy status record", async () => {
+  const now = Date.parse("2026-10-20T21:00:00.000Z");
+  const config = { liveActions: true, legacyCheckerDisabled: true };
+  const recent = async () => JSON.stringify({ checkedAt: new Date(now - 60_000).toISOString() });
+  await assert.rejects(assertLegacyInactive(config, now, async () => "Disabled", recent), /最近仍在运行/);
+  let queried = false;
+  await assertLegacyInactive({ ...config, liveActions: false }, now,
+    async () => { queried = true; throw new Error("unexpected query"); }, recent);
+  assert.equal(queried, false);
+});
 
 async function fixture(t) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "numems-alert-test-"));
