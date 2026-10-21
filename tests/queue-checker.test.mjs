@@ -12,7 +12,8 @@ test("invalid identity or partial snapshots fail closed", () => {
   assert.throws(()=>pendingEvents(plan({reminders:null}),now));
 });
 test("disabled, test, busy or blocked executors never dispatch",()=>{
-  for (const change of [{enabled:false},{testOnly:true},{busy:true},{lastError:"review"}])
+  for (const change of [{enabled:false},{testOnly:true},{busy:true},{lastError:"review"},
+    {globalFailureCode:"workspace_mismatch"}])
     assert.deepEqual(pendingEvents(plan({...change,invites:[{id:"req_1"}]}),now),[]);
 });
 test("task fingerprints ignore clock/revision churn and employee free text",()=>{

@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { AppServerClient } from "./app-server-client.mjs";
 import { prepareWake, wakeMessage, applyAcknowledgement, SCHEDULE_ID } from "./queue-checker-core.mjs";
+import { codexDispatchPlan, drainDirectReminders } from "./queue-checker-mail.mjs";
+import { GmailConnectorMailer } from "./seat-executor/gmail-mailer.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const directory = join(root, ".sites-runtime", "queue-checker");
@@ -78,6 +80,9 @@ else {
       const config = await readJson(configPath);
       if (!config.cli || !config.threadId || config.projectPath !== root)
         throw Error("Checker configuration is missing or inconsistent.");
+      if (config.mailMode && !["codex", "gmail_connector"].includes(config.mailMode))
+        throw Error("Unsupported checker mail mode.");
+      const directMail = config.mailMode === "gmail_connector";
       // Use the user's normal Codex credential store. No passwords, cookies,
       // connector bearer tokens or current-turn environment are copied or saved.
       const cleanEnv = Object.fromEntries(Object.entries(process.env)
@@ -87,13 +92,32 @@ else {
       client.on("interactiveRequest", () => { interactive = true; });
       await client.initialize();
       const toolSession = await client.createToolSession(root);
-      await client.portal(toolSession, "process_seat_queue");
-      const snapshot = await client.portal(toolSession, "seat_portal_status");
+      const jobs = await client.portal(toolSession, "process_seat_queue");
+      if (directMail && jobs.mailMode !== "codex")
+        throw Error("Cloud mail mode conflicts with local Gmail connector; sending stopped.");
+      let snapshot = await client.portal(toolSession, "seat_portal_status");
       if (interactive) throw Error("Connector approval required; checker cannot approve it.");
       if (savedAck) {
         applyAcknowledgement(state, savedAck, snapshot.plan);
       }
-      const decision = prepareWake(state, snapshot.plan);
+      let reminderResult = { sent: 0, uncertain: 0 };
+      if (directMail && snapshot.plan.reminders?.length) {
+        const mailer = new GmailConnectorMailer({ codexCli: config.cli,
+          siteUrl: "https://numems-seat-portal.workspace-026021.chatgpt.site/" });
+        // A pre-opt-in Codex wake may still own a mail event. Its specific
+        // notice stays with Codex until that wake is acknowledged.
+        const oldEvents = state.active?.events;
+        const blockedNoticeIds = state.active && !Array.isArray(oldEvents)
+          ? snapshot.plan.reminders.map(item => item.id)
+          : oldEvents?.filter(item => item.kind === "mail").map(item => item.id) ?? [];
+        reminderResult = await drainDirectReminders({ client, session: toolSession,
+          plan: snapshot.plan, mailer, blockedNoticeIds });
+        snapshot = { ...snapshot, plan: reminderResult.plan };
+      }
+      // Gmail owns reminder delivery in this opt-in mode. Codex continues to
+      // handle only member and acceptance events, without duplicate mail wakes.
+      const dispatchPlan = codexDispatchPlan(snapshot.plan, directMail);
+      const decision = prepareWake(state, dispatchPlan);
       state.checks++;
       if (decision.kind === "stalled") {
         state.halted = { reason: "wake_not_acknowledged", at: new Date().toISOString() };
@@ -126,7 +150,8 @@ else {
         }
       }
       const registeredId = state.halted || config.taskName !== "NUMEMS-Seat-Queue" ||
-        !snapshot.plan.enabled || snapshot.plan.testOnly || snapshot.plan.lastError ? "" : SCHEDULE_ID;
+        !snapshot.plan.enabled || snapshot.plan.testOnly || snapshot.plan.lastError ||
+        snapshot.plan.globalFailureCode ? "" : SCHEDULE_ID;
       if (snapshot.plan.scheduleId !== registeredId)
         await client.portal(toolSession, "record_codex_schedule", { scheduleId: registeredId });
       await save(statePath, state);
@@ -136,6 +161,8 @@ else {
         isolatedOperations: snapshot.plan.blockedOperations?.length ?? 0,
         pending: { invites: snapshot.plan.invites.length, removals: snapshot.plan.removals.length,
           reminders: snapshot.plan.reminders.length, acceptance: snapshot.plan.awaitingAcceptance.length },
+        ...(directMail ? { mailMode: "gmail_connector",
+          remindersSent: reminderResult.sent, remindersUncertain: reminderResult.uncertain } : {}),
         ...(state.halted ? { reason: state.halted.reason } : {}),
         ...(state.active ? { wakeId: state.active.id } : {}),
       };

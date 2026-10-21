@@ -18,7 +18,7 @@ export function pendingEvents(plan, nowMs = Date.now()) {
     if (!Array.isArray(plan[key])) throw new Error("Incomplete work plan.");
   if (typeof plan.enabled !== "boolean" || typeof plan.busy !== "boolean")
     throw new Error("Invalid executor state.");
-  if (!plan.enabled || plan.testOnly || plan.busy || plan.lastError) return [];
+  if (!plan.enabled || plan.testOnly || plan.busy || plan.lastError || plan.globalFailureCode) return [];
   const events = [];
   for (const [kind, requests] of [["invite", plan.invites], ["remove", plan.removals]])
     for (const r of requests) {
