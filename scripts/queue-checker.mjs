@@ -3,6 +3,7 @@ import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { AppServerClient } from "./app-server-client.mjs";
+import { resolveCodexCli } from "./codex-cli-resolver.mjs";
 import { prepareWake, wakeMessage, applyAcknowledgement, SCHEDULE_ID } from "./queue-checker-core.mjs";
 import { codexDispatchPlan, drainDirectReminders } from "./queue-checker-mail.mjs";
 import { GmailConnectorMailer } from "./seat-executor/gmail-mailer.mjs";
@@ -78,16 +79,17 @@ else {
       console.log(JSON.stringify(await readJson(statusPath, { state: "not_started" }), null, 2));
     } else {
       const config = await readJson(configPath);
-      if (!config.cli || !config.threadId || config.projectPath !== root)
+      if (!config.threadId || config.projectPath !== root)
         throw Error("Checker configuration is missing or inconsistent.");
       if (config.mailMode && !["codex", "gmail_connector"].includes(config.mailMode))
         throw Error("Unsupported checker mail mode.");
       const directMail = config.mailMode === "gmail_connector";
+      const codexCli = await resolveCodexCli(config.cli);
       // Use the user's normal Codex credential store. No passwords, cookies,
       // connector bearer tokens or current-turn environment are copied or saved.
       const cleanEnv = Object.fromEntries(Object.entries(process.env)
         .filter(([key]) => !/^(CODEX|OPENAI|MCP|CXX|RUST)/i.test(key)));
-      client = new AppServerClient(config.cli, { cwd: root, env: cleanEnv });
+      client = new AppServerClient(codexCli, { cwd: root, env: cleanEnv });
       let interactive = false;
       client.on("interactiveRequest", () => { interactive = true; });
       await client.initialize();
@@ -102,7 +104,7 @@ else {
       }
       let reminderResult = { sent: 0, uncertain: 0 };
       if (directMail && !state.halted && snapshot.plan.reminders?.length) {
-        const mailer = new GmailConnectorMailer({ codexCli: config.cli,
+        const mailer = new GmailConnectorMailer({ codexCli,
           siteUrl: "https://numems-seat-portal.workspace-026021.chatgpt.site/" });
         // A pre-opt-in Codex wake may still own a mail event. Its specific
         // notice stays with Codex until that wake is acknowledged.

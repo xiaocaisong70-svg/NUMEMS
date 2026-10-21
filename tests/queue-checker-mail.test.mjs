@@ -216,7 +216,37 @@ test("sender is rechecked in the same mail transport session before send", async
     }, async close() {},
   };
   const mailer = new GmailConnectorMailer({ codexCli: "fake", siteUrl: "https://numems-seat-portal.workspace-026021.chatgpt.site/" },
-    { clientFactory: () => transport });
+    { clientFactory: () => transport, cliResolver: async cli => cli });
   await assert.rejects(mailer.send(notice, lease.expectedExpiry), /发件账号不是指定管理员邮箱/);
   assert.deepEqual(calls, [["mailer-session", "gmail.get_profile"]]);
+});
+
+test("Gmail transport uses a resolved CLI after desktop app rotation", async () => {
+  const calls = [];
+  const transport = {
+    on() {}, async initialize() {}, async createToolSession() { return "mailer-session"; },
+    async connector(_session, name, args) {
+      calls.push(name);
+      if (name === "gmail.get_profile") return { email: ADMIN_EMAIL };
+      if (name === "gmail.send_email") {
+        assert.equal(args.to, notice.email);
+        assert.match(args.subject, /NUMEMS:notice_123/);
+        return { id: "gmail_rotated_123" };
+      }
+      throw Error("Unexpected connector call");
+    }, async close() {},
+  };
+  const mailer = new GmailConnectorMailer({ codexCli: "C:\\old\\codex.exe",
+    siteUrl: "https://numems-seat-portal.workspace-026021.chatgpt.site/" }, {
+    cliResolver: async configured => {
+      assert.equal(configured, "C:\\old\\codex.exe");
+      return "C:\\current\\codex.exe";
+    },
+    clientFactory: cli => {
+      assert.equal(cli, "C:\\current\\codex.exe");
+      return transport;
+    },
+  });
+  assert.equal(await mailer.send(notice, lease.expectedExpiry), "gmail_rotated_123");
+  assert.deepEqual(calls, ["gmail.get_profile", "gmail.send_email"]);
 });

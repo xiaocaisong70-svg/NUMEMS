@@ -13,6 +13,20 @@ $configPath = Join-Path $runtimePath 'config.json'
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 if ($identity -match 'CodexSandbox') { throw 'Install under the actual signed-in Windows user.' }
 $taskName = 'NUMEMS-Seat-Queue'
+$preservedMailMode = $null
+if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+  $oldConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+  if ($oldConfig.projectPath -ne $projectPath -or $oldConfig.taskName -ne $taskName) {
+    throw 'Existing checker configuration belongs to a different project or task.'
+  }
+  $mailModeProperty = $oldConfig.PSObject.Properties['mailMode']
+  if ($mailModeProperty) {
+    if ($mailModeProperty.Value -notin @('codex', 'gmail_connector')) {
+      throw 'Existing checker mail mode is unsupported; review before reinstalling.'
+    }
+    $preservedMailMode = $mailModeProperty.Value
+  }
+}
 $runner = Join-Path $projectPath 'scripts\queue-checker.mjs'
 $windowlessHost = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $windowlessLauncher = Join-Path $PSScriptRoot 'run-queue-checker-hidden.vbs'
@@ -35,8 +49,9 @@ if ($existing) {
   if (-not $validOldAction) { throw 'Existing task targets a different script; review before replacing.' }
 }
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description $description -Force | Out-Null
-@{cli=[IO.Path]::GetFullPath($CodexCli); threadId=$ThreadId; projectPath=$projectPath; taskName=$taskName} |
-  ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding utf8
+$savedConfig = @{cli=[IO.Path]::GetFullPath($CodexCli); threadId=$ThreadId; projectPath=$projectPath; taskName=$taskName}
+if ($preservedMailMode) { $savedConfig.mailMode = $preservedMailMode }
+$savedConfig | ConvertTo-Json | Set-Content -LiteralPath $configPath -Encoding utf8
 Start-ScheduledTask -TaskName $taskName
 $saved = Get-ScheduledTask -TaskName $taskName
 [pscustomobject]@{TaskName=$saved.TaskName; State=$saved.State.ToString(); User=$saved.Principal.UserId; LogonType=$saved.Principal.LogonType.ToString(); Interval=$saved.Triggers.Repetition.Interval; Launcher=$saved.Actions.Execute; Node=$nodePath; Script=$runner} | ConvertTo-Json

@@ -1,4 +1,5 @@
 import { AppServerClient } from "../app-server-client.mjs";
+import { resolveCodexCli } from "../codex-cli-resolver.mjs";
 import { root } from "./config.mjs";
 
 export const EXPECTED_GMAIL_SENDER = "xiaocaisong70@gmail.com";
@@ -29,15 +30,16 @@ export function reminderText(notice, expiry, siteUrl) {
 // The connected Gmail app is a transport, not a Codex turn. No model is run.
 // If sending is ambiguous, the caller isolates the notice and never retries.
 export class GmailConnectorMailer {
-  constructor(config, { clientFactory = (cli, options) => new AppServerClient(cli, options) } = {}) {
-    this.config = config; this.clientFactory = clientFactory;
+  constructor(config, { clientFactory = (cli, options) => new AppServerClient(cli, options),
+    cliResolver = resolveCodexCli } = {}) {
+    this.config = config; this.clientFactory = clientFactory; this.cliResolver = cliResolver;
   }
   async send(notice, expiry) {
-    if (!this.config.codexCli) throw new Error("尚未配置无模型 Gmail 连接器。");
     const { subject, text } = reminderText(notice, expiry, this.config.siteUrl);
+    const codexCli = await this.cliResolver(this.config.codexCli);
     const cleanEnv = Object.fromEntries(Object.entries(process.env)
       .filter(([key]) => !/^(CODEX|OPENAI|MCP|CXX|RUST)/i.test(key)));
-    const client = this.clientFactory(this.config.codexCli, { cwd: root, env: cleanEnv });
+    const client = this.clientFactory(codexCli, { cwd: root, env: cleanEnv });
     let interactive = false;
     client.on("interactiveRequest", () => { interactive = true; });
     try {

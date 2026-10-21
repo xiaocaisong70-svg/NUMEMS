@@ -12,6 +12,10 @@ Windows 任务 NUMEMS-Seat-Queue 每分钟运行一次普通 Node 程序
 scripts/queue-checker.mjs。它通过官方 App Server 的 MCP 调用检查门户，不调用 turn/start、
 不运行模型。仅检测到新的有效待办时，通过官方 thread/queue/add（codex queue 对应接口）
 投递到本聊天 01a1522f-edd9-7b01-9c10-70c0899e3ba8；桌面端继续使用原会话办理。
+Codex 桌面更新后若原 `codex.exe` 路径消失，检查器只在本机
+`%LOCALAPPDATA%\OpenAI\Codex\bin` 下恰有一个可用 `codex.exe` 时自动改用它；
+没有或有多个候选则停止并报告，不猜测版本。重新安装计划任务时保留已启用的
+`mailMode`，不得因为重装意外切回模型发信。
 不得改用独立 CLI 模型会话替代本聊天的浏览器与审批。
 
 空队列、历史通知、时间戳变化不投递。邀请加入窗口固定5分钟；第2、4分钟至多各核对一次，
