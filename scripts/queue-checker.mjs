@@ -101,7 +101,7 @@ else {
         applyAcknowledgement(state, savedAck, snapshot.plan);
       }
       let reminderResult = { sent: 0, uncertain: 0 };
-      if (directMail && snapshot.plan.reminders?.length) {
+      if (directMail && !state.halted && snapshot.plan.reminders?.length) {
         const mailer = new GmailConnectorMailer({ codexCli: config.cli,
           siteUrl: "https://numems-seat-portal.workspace-026021.chatgpt.site/" });
         // A pre-opt-in Codex wake may still own a mail event. Its specific
