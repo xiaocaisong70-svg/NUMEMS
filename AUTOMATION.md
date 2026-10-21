@@ -164,3 +164,12 @@ heartbeat 保持暂停。网页根据最近3分钟检查时间显示程序是否
 登记局部故障后刷新计划，跳过 `blockedOperations`，继续其它有效回收和邀请。同一批次可以用 blocked/uncertain 结束；普通检查程序只有看到云端确切目标隔离记录才会局部结算，未处理的其它事件保留供下一轮办理。没有分类证据时仍整体停止。模型不得自行清除隔离。
 
 核实到真实结果后，使用隔离记录的原租约和真实 message ID／操作后官方快照 complete。明确从未开始外部操作的项目，经管理员解决原因后可用 `review_seat_failure(decision=retry_not_started)` 重新排队；有尝试或结果不明的项目不能靠此方法重发。全局故障需无未完成租约、最新完整官方证据及 `review_seat_failure(decision=resume_workspace)`，再按需恢复本地检查程序。每次恢复保留审计。
+
+## 确定性执行器候选（2026-10-20）
+
+`scripts/seat-executor` 是本项目内新增的普通程序执行层；当前默认
+`liveActions:false`，没有接管本规程的旧 `NUMEMS-Seat-Queue`。
+其部署、单执行器切换及审批边界见 `docs/DETERMINISTIC_EXECUTOR.md`，
+回退基线、触发条件和步骤见 `docs/DETERMINISTIC_EXECUTOR_ROLLBACK.md`。
+保存或发布其代码不等于启用真实邀请、邮件或移除；没有完成各项真实验收前，
+本规程中原有办理路径持续有效。遇到即时移除审批要求，禁止改用此本地执行器绕过。

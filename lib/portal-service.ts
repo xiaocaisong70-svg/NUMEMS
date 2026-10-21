@@ -86,6 +86,7 @@ export async function portalData() {
   const runtime = (state as State & { runtime?: { lastTickAt?: string; lastDeliveryError?: string } }).runtime;
   const codex = (state as BridgeState).codex;
   const onDemand = codex?.scheduleId?.startsWith("local:queue-checker:") ?? false;
+  const deterministic = codex?.scheduleId?.startsWith("local:seat-executor:") ?? false;
   const checkerFresh = Boolean(runtime?.lastTickAt &&
     Date.now() - Date.parse(runtime.lastTickAt) < 3 * 60_000);
   return {
@@ -93,9 +94,9 @@ export async function portalData() {
     access: "allowed" as const,
     view,
     connection: {
-      memberAdapter: codex?.enabled ? (codex.testOnly ? "codex_test" : "codex_browser") : "not_connected",
-      scheduler: onDemand ? checkerFresh : Boolean(codex?.scheduleId) || env.PORTAL_SCHEDULE_ENABLED === "true",
-      schedulerMode: onDemand ? "on_demand" : "heartbeat",
+      memberAdapter: codex?.enabled ? (codex.testOnly ? "codex_test" : deterministic ? "deterministic_browser" : "codex_browser") : "not_connected",
+      scheduler: onDemand || deterministic ? checkerFresh : Boolean(codex?.scheduleId) || env.PORTAL_SCHEDULE_ENABLED === "true",
+      schedulerMode: deterministic ? "deterministic" : onDemand ? "on_demand" : "heartbeat",
       lastTickAt: runtime?.lastTickAt ?? null,
       mail: Boolean(codex?.mailVerifiedAt || (env.REMINDER_WEBHOOK_URL && env.REMINDER_WEBHOOK_TOKEN)),
       lastDeliveryError: user?.isAdmin ? codex?.lastError ?? codex?.mailChannelError ?? runtime?.lastDeliveryError ?? null : undefined,

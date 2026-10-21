@@ -71,6 +71,14 @@ export class AppServerClient extends EventEmitter {
     const text = result.content?.filter(item => item.type === "text").map(item => item.text).join("");
     try { return JSON.parse(text); } catch { throw new Error(`NUMEMS ${tool} returned invalid data.`); }
   }
+  async connector(toolThreadId, tool, args = {}) {
+    const result = await this.request("mcpServer/tool/call", { threadId: toolThreadId,
+      server: "codex_apps", tool, arguments: args });
+    if (result.isError) throw new Error(`Connected app ${tool} rejected the request.`);
+    const value = result.structuredContent ?? result.content?.find(item => item.type === "text")?.text;
+    if (typeof value !== "string") return value;
+    try { return JSON.parse(value); } catch { throw new Error(`Connected app ${tool} returned invalid data.`); }
+  }
   async queued(threadId) {
     const entries = []; let cursor;
     do {
