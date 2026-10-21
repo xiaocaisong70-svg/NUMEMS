@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createState, upgradeState, transition, viewState, PROTECTED_OWNER_EMAIL } from "../lib/seat-engine.ts";
 import { queueForecast } from "../lib/queue-estimate.ts";
 import { remainingSeconds, serverClock, countdownText } from "../lib/portal-time.ts";
-import { observeWorkspace, claimOperation, completeOperation, TARGET_WORKSPACE_ID } from "../lib/codex-bridge.ts";
+import { observeWorkspace, claimOperation, completeOperation, workPlan, TARGET_WORKSPACE_ID } from "../lib/codex-bridge.ts";
 import { pendingEvents, ADMIN_EMAIL, TARGET_WORKSPACE } from "../scripts/queue-checker-core.mjs";
 const base = "2026-10-20T12:00:00.000Z";
 const at = seconds => new Date(Date.parse(base) + seconds * 1000).toISOString();
@@ -69,13 +69,38 @@ test("timeout reserves capacity until a fresh official absence and then assigns 
   assert.equal(s.requests.filter(r=>r.status==="pending_invite").length,1);
   assert.equal(tick(s,313).notices.filter(n=>n.type==="invitation_expired").length,1);
 });
-test("accepted employee observed at deadline is retained, never removed solely for invitation timeout", () => {
-  let s = tick(apply(invited(),1,15),310);
-  s = observeWorkspace(s,observation(311,[staff(0).email]),at(311));
+test("membership snapshot taken before deadline activates even if processed after deadline", () => {
+  let s = apply(invited(),1,15);
+  // The complete official snapshot predates the deadline, while processing
+  // occurs after it.
+  s = observeWorkspace(s,observation(309,[staff(0).email]),at(311));
   assert.equal(s.requests[0].status,"active");
-  assert.equal(s.requests[0].expiresAt,at(3911));
+  assert.equal(s.requests[0].expiresAt,at(3909));
   assert.equal(s.requests[1].status,"queued");
   assert.throws(()=>claimOperation(s,"remove",s.requests[0].id,"stale-removal",at(311)),/状态/);
+});
+test("first membership sighting after deadline triggers actual member recovery and preserves FIFO", () => {
+  let s=apply(invited(),1,15);
+  s=observeWorkspace(s,observation(305,[],[staff(0).email]),at(305));
+  s=observeWorkspace(s,observation(311,[staff(0).email]),at(311));
+  const r=s.requests[0];
+  assert.equal(r.status,"pending_removal");
+  assert.equal(r.joinTimingEvidence.firstMemberSeenAt,at(311));
+  assert.equal(r.joinTimingEvidence.lastPendingSeenAt,at(305));
+  assert.equal(s.requests[1].status,"queued");
+  assert.equal(viewState(s,owner,at(311)).aggregate.availableSeats,0);
+  assert.equal(workPlan(s,at(311)).removals.length,1);
+  s=claimOperation(s,"remove",r.id,"reviewed",at(312));
+  s=completeOperation(s,{operationId:s.codex.lease.id,token:"reviewed",outcome:"verified",observation:observation(313)},at(313));
+  assert.equal(s.requests[0].status,"completed");
+  assert.equal(s.requests[1].status,"pending_invite");
+});
+test("after-deadline member is not falsely confirmed active without timely evidence", () => {
+  let s=observeWorkspace(invited(),observation(311,[staff(0).email]),at(311));
+  assert.equal(s.requests[0].status,"pending_removal");
+  assert.equal(s.requests[0].expiresAt,undefined);
+  assert.equal(workPlan(s,at(311)).removals.length,1);
+  assert.equal(s.requests[0].joinTimingEvidence.firstMemberSeenAt,at(311));
 });
 test("explicit early release is not undone just because the employee still appears in official membership", () => {
   let s = observeWorkspace(invited(),observation(20,[staff(0).email]),at(20));

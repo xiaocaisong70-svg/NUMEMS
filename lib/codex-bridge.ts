@@ -86,6 +86,7 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
   if (input.codex?.observation && time(checked.observedAt) < time(input.codex.observation.observedAt))
     throw new Error("不能用较旧的成员证据覆盖更新的核对结果。");
   let next = structuredClone(input);
+  const previousObservation = next.codex?.observation;
   if (next.config.workspaceId && next.config.workspaceId !== checked.workspaceId)
     throw new Error("门户绑定的工作空间不匹配。");
   if (next.config.inventoryVerified && checked.totalSeats !== next.config.totalSeats) {
@@ -126,6 +127,13 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
       known.add(address);
     }
   }
+  // A complete membership snapshot taken before the deadline is positive
+  // evidence even if this transaction is processed a little later.
+  for (const request of next.requests.filter(r => r.status === "invited")) {
+    if (invitationDeadline(request) && time(checked.observedAt) < time(invitationDeadline(request)!) &&
+        checked.members.some(p => norm(p.email) === request.email && p.role === "member"))
+      next = transition(next, systemActor, { type: "confirm_active", id: request.id }, checked.observedAt) as BridgeState;
+  }
   // Set the timeout state before resolving the final official membership check.
   next = transition(next, systemActor, { type: "tick" }, now) as BridgeState;
   // Fresh full snapshots reconcile accepted invitations and already absent users.
@@ -150,7 +158,13 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
     if (current.status === "pending_removal" && current.removalReason === "invitation_expired" &&
         member?.role === "member" && !targetHeld(next, "remove", current.id, current.email) &&
         !(next.codex?.lease?.kind === "remove" && next.codex.lease.requestId === current.id)) {
-      next = transition(next, systemActor, { type: "confirm_joined_after_timeout", id: current.id }, now) as BridgeState;
+      // Business membership snapshots show presence, not the time the invitation
+      // was accepted. An after-deadline first sighting cannot prove compliance.
+      if (!current.joinTimingEvidence) current.joinTimingEvidence = {
+        firstMemberSeenAt: checked.observedAt,
+        ...(previousObservation?.invites.some(p => norm(p.email) === current.email)
+          ? { lastPendingSeenAt: previousObservation.observedAt } : {}),
+      };
     }
     if (current.status === "pending_removal" && !member && !invited) {
       next = transition(next, systemActor, { type: "confirm_removed", id: old.id }, now) as BridgeState;
@@ -219,7 +233,8 @@ export function workPlan(input: BridgeState, now: string) {
     mailChannelError: b?.mailChannelError ?? null,
     scheduleId: b?.scheduleId ?? null, lastRunAt: b?.lastRunAt ?? null,
     invites: input.requests.filter(r => r.status === "pending_invite" && allowed(r.email) && !targetHeld(input, "invite", r.id, r.email)),
-    removals: input.requests.filter(r => r.status === "pending_removal" && allowed(r.email) && !targetHeld(input, "remove", r.id, r.email)),
+    removals: input.requests.filter(r => r.status === "pending_removal" &&
+      allowed(r.email) && !targetHeld(input, "remove", r.id, r.email)),
     awaitingAcceptance: input.requests.filter(r => r.status === "invited" && allowed(r.email) && !targetHeld(input, "acceptance", r.id, r.email)),
     reminders: input.notices.filter(n => {
       const r = input.requests.find(r => r.id === n.requestId);
@@ -258,8 +273,9 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     originalPresence = member ? "member" : invitation ? "invite" : "absent";
     if ((member && member.role !== "member") || (invitation && invitation.role !== "member"))
       throw new Error("禁止自动移除管理员或 Owner。");
-    if (kind === "remove" && r.removalReason === "invitation_expired" && member)
-      throw new Error("员工已经加入，请重新核对；邀请超时不能作为移除已加入成员的依据。");
+    if (kind === "remove" && r.removalReason === "invitation_expired" && member &&
+        !r.joinTimingEvidence)
+      throw new Error("员工已经加入，请先核对加入状态与截止时间。");
     if (kind === "invite") {
       if ([...s.members, ...s.invites].some(p => norm(p.email) === r.email))
         throw new Error("目标邮箱已存在，请重新同步状态。");
