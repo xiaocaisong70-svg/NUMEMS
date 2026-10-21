@@ -75,10 +75,10 @@ const tools = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   },
   {
-    name: "complete_seat_operation", description: "提交实际执行回执。邀请/移除必须提供操作后的完整官方快照；邮件必须提供Gmail消息ID。用failureCode明确故障：邮件或单一目标隔离并保留核查记录；登录、容量、角色或未知异常全局暂停。",
+    name: "complete_seat_operation", description: "提交实际执行回执。邀请/移除必须提供操作后的完整官方快照；撤回待接受邀请期间若员工已成为普通成员，使用joined加完整快照安全结束原租约并保留成员，不算移除成功；邮件必须提供Gmail消息ID。用failureCode明确故障。",
     inputSchema: { type: "object", properties: {
       operationId: { type: "string" }, token: { type: "string" },
-      outcome: { type: "string", enum: ["verified", "uncertain", "blocked"] },
+      outcome: { type: "string", enum: ["verified", "joined", "uncertain", "blocked"] },
       observation: observationSchema, providerMessageId: { type: "string" }, detail: { type: "string" },
       invitationSentAt: { type: "string", description: "邀请点击发送成功时记录的UTC时间；只能是本次claim后、官方核实前的真实时间，用于5分钟加入倒计时。" },
       failureCode: { type: "string", enum: FAILURE_CODES },

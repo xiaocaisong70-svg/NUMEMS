@@ -25,7 +25,7 @@ export type State = { config: Config; requests: RequestRecord[]; audit: AuditRec
 export type Command =
   | { type: "apply"; reason: string; name: string; hours: number; requestKey?: string }
   | { type: "renew"; id: string; hours: number; requestKey?: string }
-  | { type: "cancel" | "release" | "request_acceptance_check" | "confirm_active" | "confirm_removed"; id: string }
+  | { type: "cancel" | "release" | "request_acceptance_check" | "confirm_active" | "confirm_joined_after_timeout" | "confirm_removed"; id: string }
   | { type: "confirm_invited"; id: string; sentAt?: string }
   | { type: "configure"; config: Partial<Config> }
   | { type: "tick" }
@@ -232,6 +232,15 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
       update(r, "active", "confirm_active"); r.expiresAt = new Date(instant + r.hours * HOUR).toISOString();
       notice(r, "active", "席位已开始使用", `已确认加入工作空间，到期时间：${r.expiresAt}。`); break;
     }
+    case "confirm_joined_after_timeout": {
+      const r = get(command.id, true); if (r.status === "active") break;
+      if (r.status !== "pending_removal" || r.removalReason !== "invitation_expired")
+        throw new Error("该申请不是待核实的加入窗口截止状态。");
+      update(r, "active", "official_join_confirmed_before_revoke");
+      delete r.removalReason;
+      r.expiresAt = new Date(instant + r.hours * HOUR).toISOString();
+      notice(r, "active", "已核实加入，席位开始使用", `撤回前已在官方列表确认加入；官方页面不提供精确接受时间。到期时间：${r.expiresAt}。`); break;
+    }
     case "confirm_removed": {
       const r = get(command.id, true); if (r.status === "completed") break;
       if (r.status !== "pending_removal") throw new Error("该申请不在待回收状态，不能确认移除。");
@@ -241,7 +250,7 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
       admin();
       for (const r of next.requests) {
         if (isProtected(r.email) || r.email === actor.email) continue;
-        if (r.status === "invited" && invitationDeadline(r) && Date.parse(invitationDeadline(r)!) <= instant) remove(r, "invitation_expired", "invitation_expired", "5 分钟加入窗口已结束。截止前未核实加入的申请将回收：未接受的邀请会撤回，已成为成员则移除成员。核实完成前不会释放预留席位。");
+        if (r.status === "invited" && invitationDeadline(r) && Date.parse(invitationDeadline(r)!) <= instant) remove(r, "invitation_expired", "invitation_expired", "5 分钟加入窗口已结束，正在核对官方状态：仍待接受则撤回邀请，已加入则保留席位。核实完成前不会释放预留席位。");
         if (r.status !== "active" || !r.expiresAt) continue;
         const remaining = Date.parse(r.expiresAt) - instant;
         if (remaining <= 0) remove(r, "lease_expired", "expired", "租期已到期，正在等待实际移除确认。");

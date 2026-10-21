@@ -158,13 +158,14 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
     if (current.status === "pending_removal" && current.removalReason === "invitation_expired" &&
         member?.role === "member" && !targetHeld(next, "remove", current.id, current.email) &&
         !(next.codex?.lease?.kind === "remove" && next.codex.lease.requestId === current.id)) {
-      // Business membership snapshots show presence, not the time the invitation
-      // was accepted. An after-deadline first sighting cannot prove compliance.
+      // Preserve a joined member until the pending invitation is actually revoked.
+      // The official snapshot does not establish the exact acceptance time.
       if (!current.joinTimingEvidence) current.joinTimingEvidence = {
         firstMemberSeenAt: checked.observedAt,
         ...(previousObservation?.invites.some(p => norm(p.email) === current.email)
           ? { lastPendingSeenAt: previousObservation.observedAt } : {}),
       };
+      next = transition(next, systemActor, { type: "confirm_joined_after_timeout", id: current.id }, now) as BridgeState;
     }
     if (current.status === "pending_removal" && !member && !invited) {
       next = transition(next, systemActor, { type: "confirm_removed", id: old.id }, now) as BridgeState;
@@ -273,9 +274,11 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     originalPresence = member ? "member" : invitation ? "invite" : "absent";
     if ((member && member.role !== "member") || (invitation && invitation.role !== "member"))
       throw new Error("禁止自动移除管理员或 Owner。");
-    if (kind === "remove" && r.removalReason === "invitation_expired" && member &&
-        !r.joinTimingEvidence)
-      throw new Error("员工已经加入，请先核对加入状态与截止时间。");
+    if (kind === "remove" && r.removalReason === "invitation_expired") {
+      if (time(s.observedAt) < time(invitationDeadline(r)!))
+        throw new Error("须先取得加入窗口截止后的完整官方快照。");
+      if (member) throw new Error("员工已加入，禁止按邀请超时回收成员；请重新同步官方状态。");
+    }
     if (kind === "invite") {
       if ([...s.members, ...s.invites].some(p => norm(p.email) === r.email))
         throw new Error("目标邮箱已存在，请重新同步状态。");
@@ -297,16 +300,36 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
   return next;
 }
 export function completeOperation(input: BridgeState, args: {
-    operationId: string; token: string; outcome: "verified" | "uncertain" | "blocked";
+    operationId: string; token: string; outcome: "verified" | "joined" | "uncertain" | "blocked";
     observation?: Observation; providerMessageId?: string; detail?: string; failureCode?: FailureCode; invitationSentAt?: string;
   }, now: string): BridgeState {
   let next = structuredClone(input); let b = bridge(next);
-  if (!["verified", "uncertain", "blocked"].includes(args.outcome)) throw new Error("办理结果无效。");
+  if (!["verified", "joined", "uncertain", "blocked"].includes(args.outcome)) throw new Error("办理结果无效。");
   const hold = b.holds?.find(h => h.operation.id === args.operationId && h.operation.token === args.token);
   const op = b.lease?.id === args.operationId ? b.lease : hold?.operation;
-  if (!op && args.outcome === "verified" && b.receipts.some(r => r.id === args.operationId)) return next;
+  if (!op && ["verified", "joined"].includes(args.outcome) && b.receipts.some(r => r.id === args.operationId)) return next;
   if (!op || op.id !== args.operationId || op.token !== args.token) throw new Error("执行回执不匹配。");
   if (hold && b.lease) throw new Error("其他操作正在办理，请稍后核对隔离记录。");
+  if (args.outcome === "joined") {
+    if (op.kind !== "remove" || op.originalPresence !== "invite" ||
+        next.requests.find(r => r.id === op.requestId)?.removalReason !== "invitation_expired")
+      throw new Error("只有撤回未接受邀请时转为普通成员，才可提交加入竞态回执。");
+    const s = validateObservation(args.observation!, now);
+    if (time(s.observedAt) < time(op.claimedAt) ||
+        !s.members.some(p => norm(p.email) === op.email && p.role === "member") ||
+        s.invites.some(p => norm(p.email) === op.email))
+      throw new Error("须提供本次办理后已成为普通成员、且无待接受邀请的完整官方证据。");
+    if (hold) b.holds = b.holds?.filter(h => h.operation.id !== op.id);
+    else delete b.lease;
+    next = observeWorkspace(next, s, now); b = bridge(next);
+    if (next.requests.find(r => r.id === op.requestId)?.status !== "active")
+      throw new Error("官方加入状态未能确认，不能结束撤回租约。");
+    b.receipts.push({ id: op.id, kind: "joined_during_revocation", email: op.email, at: now, evidence: s.pageUrl });
+    b.receipts = b.receipts.slice(-500);
+    if (!b.globalFailureCode) delete b.lastError;
+    record(next, "codex_joined_during_revocation", now, op.requestId);
+    return next;
+  }
   if (args.outcome !== "verified") {
     const code = failureCode(args.failureCode, op.kind);
     const detail = (args.detail ?? "操作结果不明，请先核对真实状态。").slice(0, 500);

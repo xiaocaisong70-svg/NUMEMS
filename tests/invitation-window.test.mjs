@@ -79,28 +79,46 @@ test("membership snapshot taken before deadline activates even if processed afte
   assert.equal(s.requests[1].status,"queued");
   assert.throws(()=>claimOperation(s,"remove",s.requests[0].id,"stale-removal",at(311)),/状态/);
 });
-test("first membership sighting after deadline triggers actual member recovery and preserves FIFO", () => {
+test("first membership sighting after deadline protects the member and retains FIFO capacity", () => {
   let s=apply(invited(),1,15);
   s=observeWorkspace(s,observation(305,[],[staff(0).email]),at(305));
   s=observeWorkspace(s,observation(311,[staff(0).email]),at(311));
   const r=s.requests[0];
-  assert.equal(r.status,"pending_removal");
+  assert.equal(r.status,"active");
   assert.equal(r.joinTimingEvidence.firstMemberSeenAt,at(311));
   assert.equal(r.joinTimingEvidence.lastPendingSeenAt,at(305));
+  assert.equal(r.expiresAt,at(3911));
   assert.equal(s.requests[1].status,"queued");
   assert.equal(viewState(s,owner,at(311)).aggregate.availableSeats,0);
-  assert.equal(workPlan(s,at(311)).removals.length,1);
-  s=claimOperation(s,"remove",r.id,"reviewed",at(312));
-  s=completeOperation(s,{operationId:s.codex.lease.id,token:"reviewed",outcome:"verified",observation:observation(313)},at(313));
-  assert.equal(s.requests[0].status,"completed");
-  assert.equal(s.requests[1].status,"pending_invite");
+  assert.equal(workPlan(s,at(311)).removals.length,0);
+  assert.throws(()=>claimOperation(s,"remove",r.id,"unsafe",at(312)),/状态/);
 });
-test("after-deadline member is not falsely confirmed active without timely evidence", () => {
+test("after-deadline member is retained without claiming the click was within five minutes", () => {
   let s=observeWorkspace(invited(),observation(311,[staff(0).email]),at(311));
-  assert.equal(s.requests[0].status,"pending_removal");
-  assert.equal(s.requests[0].expiresAt,undefined);
-  assert.equal(workPlan(s,at(311)).removals.length,1);
+  assert.equal(s.requests[0].status,"active");
+  assert.equal(s.requests[0].expiresAt,at(3911));
+  assert.equal(workPlan(s,at(311)).removals.length,0);
   assert.equal(s.requests[0].joinTimingEvidence.firstMemberSeenAt,at(311));
+});
+test("an expired invitation cannot be claimed from a pre-deadline snapshot", () => {
+  let s=observeWorkspace(invited(),observation(305,[],[staff(0).email]),at(305));
+  s=tick(s,310);
+  assert.throws(()=>claimOperation(s,"remove",s.requests[0].id,"stale",at(311)),/截止后/);
+  s=observeWorkspace(s,observation(311,[],[staff(0).email]),at(311));
+  assert.equal(claimOperation(s,"remove",s.requests[0].id,"fresh",at(311)).codex.lease.originalPresence,"invite");
+});
+test("joining during an invitation revocation ends that lease without removing the member", () => {
+  let s=apply(invited(),1,15);
+  s=observeWorkspace(s,observation(311,[],[staff(0).email]),at(311));
+  s=claimOperation(s,"remove",s.requests[0].id,"race",at(311));
+  const args={operationId:s.codex.lease.id,token:"race",outcome:"joined",observation:observation(312,[staff(0).email])};
+  s=completeOperation(s,args,at(312));
+  assert.equal(s.requests[0].status,"active");
+  assert.equal(s.requests[1].status,"queued");
+  assert.equal(s.codex.lease,undefined);
+  assert.equal(s.codex.receipts.at(-1).kind,"joined_during_revocation");
+  assert.equal(s.codex.removalVerifiedAt,undefined);
+  assert.deepEqual(completeOperation(s,args,at(313)),s);
 });
 test("explicit early release is not undone just because the employee still appears in official membership", () => {
   let s = observeWorkspace(invited(),observation(20,[staff(0).email]),at(20));
