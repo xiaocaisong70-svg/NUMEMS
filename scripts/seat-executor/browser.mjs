@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { root, normalizeEmail } from "./config.mjs";
 import { validateObservation, presence, assertOrdinary } from "./inventory.mjs";
+import { OfficialPageError, waitForOfficialPage } from "./official-readiness.mjs";
 
 export const ui = {
   members: /^(用户|活跃成员(?:\s+\d+)?|Users|Members(?:\s+\d+)?)$/,
@@ -75,19 +76,30 @@ export class BrowserAdapter {
   async guard() {
     const p = await this.open(), url = new URL(p.url()), expected = new URL(this.url());
     if (url.origin !== expected.origin || !url.pathname.startsWith(`/workspace/${this.config.workspaceId}/members`))
-      throw new Error("管理员登录失效或跳转到非目标工作空间，请手动重新登录。");
+      throw new OfficialPageError("管理员登录失效或跳转到非目标工作空间，请手动重新登录。",
+        /auth\.openai\.com|\/(log-in|login|sign-in)/.test(p.url()) ? "login_expired" : "workspace_mismatch");
     const body = await p.locator("body").innerText();
     if (/verify you are human|captcha|完成验证|验证您是真人|安全验证|sign in to continue|登录以继续/i.test(body))
-      throw new Error("出现登录或安全验证，程序停止，需管理员接管。");
+      throw new OfficialPageError("出现登录或安全验证，成员操作已停止。",
+        /sign in to continue|登录以继续/i.test(body) ? "login_expired" : "browser_unavailable");
     if (!body.includes(this.config.workspaceName)) throw new Error("目标工作空间名称不匹配。");
     const switcher = p.getByRole("button", { name: new RegExp(`(?:当前选择[：:]|Current selection:).*${escape(this.config.workspaceName)}`) });
     await only(switcher, "工作空间选择器");
   }
   async load(tab = "members") {
     const p = await this.open();
-    await p.goto(this.url(tab), { waitUntil: "domcontentloaded", timeout: 30_000 });
+    try { await p.goto(this.url(tab), { waitUntil: "domcontentloaded", timeout: 30_000 }); }
+    catch (error) {
+      if (/Timeout|net::ERR_(TIMED_OUT|CONNECTION|NETWORK|INTERNET_DISCONNECTED|NAME_NOT_RESOLVED)/i.test(String(error)))
+        throw new OfficialPageError("官方后台暂时无法连接，未开始成员操作。", "browser_unavailable");
+      throw error;
+    }
     const selected = p.getByRole("tab", { name: tab === "members" ? ui.members : ui.invites });
-    await selected.waitFor({ state: "visible", timeout: 25_000 });
+    await waitForOfficialPage({
+      inspect: async () => ({ url: p.url(), expectedUrl: this.url(tab),
+        body: await p.locator("body").innerText(), ready: await selected.isVisible() }),
+      pause: ms => p.waitForTimeout(ms),
+    });
     await this.guard();
     const tabControl = await only(selected, "成员标签页");
     if (await tabControl.getAttribute("aria-selected") !== "true") {

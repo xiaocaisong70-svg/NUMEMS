@@ -77,8 +77,9 @@ export async function processOnce({ portal, browser, mailer, config, clock = () 
     before = await browser.observe();
     await portal.call("observe_workspace", { observation: bridgeObservation(before) });
   } catch (error) {
-    if (wanted) await portal.call("defer_seat_operation", { kind: wanted.kind,
-      targetId: wanted.request.id, failureCode: "unknown",
+    const target = wanted ?? { kind: "invite", request: plan.awaitingAcceptance.find(r => acceptanceDue(r, clock().getTime())) };
+    if (target.request) await portal.call("defer_seat_operation", { kind: target.kind,
+      targetId: target.request.id, failureCode: error.failureCode ?? "unknown",
       detail: "读取官方完整成员清单失败，已停止成员操作。" });
     throw error;
   }

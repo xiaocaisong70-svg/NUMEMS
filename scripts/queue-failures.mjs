@@ -9,7 +9,7 @@ export function settleAcknowledgement(active, ack, plan, events, { ignoreAccepta
     held.some(h => (h.kind === "mail" ? e.kind === "mail" : e.kind !== "mail") && h.targetId === e.id));
   const remaining = events.filter(e => active.keys.includes(e.key) &&
     !(ignoreAcceptance && e.kind === "acceptance"));
-  const fatal = plan.busy || plan.lastError;
+  const fatal = plan.busy || plan.lease || plan.lastError || plan.globalFailureCode;
   const isolatedFailure = !fatal && plan.faultIsolationVersion === 1 && isolated.length > 0;
   const outcome = fatal ? "blocked" : isolatedFailure ? "isolated"
     : ack.outcome !== "done" ? ack.outcome : remaining.length ? "blocked" : "done";

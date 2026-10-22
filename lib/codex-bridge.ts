@@ -15,7 +15,7 @@ export type Lease = {
   originalPresence?: "member" | "invite" | "absent";
 };
 export const FAILURE_CODES = ["mail_delivery", "member_action", "approval_required",
-  "login_expired", "workspace_mismatch", "capacity_mismatch", "role_mismatch", "unknown"] as const;
+  "browser_unavailable", "login_expired", "workspace_mismatch", "capacity_mismatch", "role_mismatch", "unknown"] as const;
 export type FailureCode = (typeof FAILURE_CODES)[number];
 export type OperationHold = {
   operation: Lease; code: FailureCode; detail: string; at: string; attempted: boolean;
@@ -27,6 +27,7 @@ export type BridgeState = State & {
     lastRunAt?: string; lastError?: string; lease?: Lease; observation?: Observation;
     scheduleId?: string;
     holds?: OperationHold[]; globalFailureCode?: FailureCode; mailChannelError?: string;
+    browserUnavailableAt?: string; workspaceReviewedAt?: string;
     receipts: { id: string; kind: string; email: string; at: string; evidence: string }[];
   };
 };
@@ -43,6 +44,7 @@ function failureCode(code: unknown, kind: Lease["kind"]): FailureCode {
   if (!FAILURE_CODES.includes(value as FailureCode)) throw new Error("故障分类无效。");
   if (value === "mail_delivery" && kind !== "mail") throw new Error("邮件故障不能用于成员操作。");
   if (value === "member_action" && kind === "mail") throw new Error("成员故障不能用于邮件操作。");
+  if (value === "browser_unavailable" && kind === "mail") throw new Error("浏览器故障不能用于邮件操作。");
   return value as FailureCode;
 }
 function isIsolated(code: FailureCode) {
@@ -230,6 +232,9 @@ export function workPlan(input: BridgeState, now: string) {
     enabled: b?.enabled ?? false, testOnly: b?.testOnly ?? true,
     lastError: b?.lastError ?? null, busy: Boolean(b?.lease), lease: b?.lease ?? null,
     faultIsolationVersion: 1, globalFailureCode: b?.globalFailureCode ?? null,
+    workspaceReviewedAt: b?.workspaceReviewedAt ?? null,
+    browserRecovery: b?.globalFailureCode === "browser_unavailable" && b.browserUnavailableAt && !b.lease
+      ? { eligible: true, blockedAt: b.browserUnavailableAt } : null,
     blockedOperations: b?.holds ?? [],
     mailChannelError: b?.mailChannelError ?? null,
     scheduleId: b?.scheduleId ?? null, lastRunAt: b?.lastRunAt ?? null,
@@ -250,7 +255,9 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     token: string, now: string): BridgeState {
   const next = structuredClone(input); const b = bridge(next);
   if (!b.enabled) throw new Error("Codex 执行器尚未启用。");
-  if (b.lastError && !b.lease) throw new Error("执行器有未解决错误，请先核实。");
+  if ((b.lastError || b.globalFailureCode) && !b.lease &&
+      !(kind === "mail" && b.globalFailureCode === "browser_unavailable" && b.browserUnavailableAt))
+    throw new Error("执行器有未解决错误，请先核实。");
   if (b.lease) throw new Error("已有办理未结束；结果不明时必须先核对，不能重试。");
   let email: string, requestId: string, expectedExpiry: string | undefined;
   let originalPresence: Lease["originalPresence"];
@@ -332,6 +339,8 @@ export function completeOperation(input: BridgeState, args: {
   }
   if (args.outcome !== "verified") {
     const code = failureCode(args.failureCode, op.kind);
+    if (code === "browser_unavailable")
+      throw new Error("已取得操作租约，不能归类为未开始操作的浏览器暂不可用；须核对真实结果。");
     const detail = (args.detail ?? "操作结果不明，请先核对真实状态。").slice(0, 500);
     op.status = "uncertain";
     if (isIsolated(code)) {
@@ -410,8 +419,12 @@ export function deferOperation(input: BridgeState, args: {
   if (r.email === PROTECTED_OWNER_EMAIL || next.config.protectedEmails.includes(r.email))
     throw new Error("Owner 保留账号受保护。");
   const detail = (args.detail ?? "该操作已暂停，等待管理员核查。").slice(0, 500);
+  if (code === "browser_unavailable" && b.globalFailureCode && b.globalFailureCode !== code)
+    throw new Error("不能把现有全局故障降级为可自动恢复的浏览器故障。");
   if (!isIsolated(code)) {
     b.lastError = detail; b.globalFailureCode = code;
+    if (code === "browser_unavailable") b.browserUnavailableAt ??= now;
+    else delete b.browserUnavailableAt;
   } else if (!targetHeld(next, args.kind, args.targetId, r.email)) {
     b.holds ??= [];
     b.holds.push({ code, detail, at: now, attempted: false, operation: {
@@ -425,7 +438,7 @@ export function deferOperation(input: BridgeState, args: {
 }
 
 export function reviewFailure(input: BridgeState, args: {
-  decision: "retry_not_started" | "resume_workspace"; operationId?: string; observation?: Observation;
+  decision: "retry_not_started" | "resume_workspace" | "recover_browser"; operationId?: string; observation?: Observation;
 }, now: string): BridgeState {
   let next = structuredClone(input), b = bridge(next);
   if (b.lease) throw new Error("仍有未完成操作，必须先提交真实核实回执。");
@@ -438,12 +451,17 @@ export function reviewFailure(input: BridgeState, args: {
     }
     b.holds = b.holds?.filter(h => h.operation.id !== args.operationId);
     record(next, "codex_review_unstarted", now, hold.operation.requestId);
-  } else if (args.decision === "resume_workspace") {
+  } else if (args.decision === "resume_workspace" || args.decision === "recover_browser") {
+    if (args.decision === "recover_browser" &&
+        (b.globalFailureCode !== "browser_unavailable" || !b.browserUnavailableAt))
+      throw new Error("自动恢复仅适用于未开始外部操作的浏览器暂不可用故障。");
     validateObservation(args.observation!, now);
     delete b.lastError; delete b.globalFailureCode;
     next = observeWorkspace(next, args.observation!, now); b = bridge(next);
     if (b.lastError) throw new Error("最新官方证据仍有工作空间异常。");
-    record(next, "codex_review_workspace", now);
+    b.workspaceReviewedAt = now;
+    delete b.browserUnavailableAt;
+    record(next, args.decision === "recover_browser" ? "codex_browser_recovered" : "codex_review_workspace", now);
   } else throw new Error("核查决定无效。");
   return next;
 }

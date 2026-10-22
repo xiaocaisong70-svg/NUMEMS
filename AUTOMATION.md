@@ -28,7 +28,9 @@ Codex 桌面更新后若原 `codex.exe` 路径消失，检查器只在本机
 ack 不代表成员或邮件操作成功，不能代替 complete_seat_operation 的证据。
 blocked/uncertain 不直接等于全局暂停：先通过云端工具登记故障分类。只有明确隔离的目标失败
 允许继续其它待办；没有分类、登录/角色/容量异常或未完成租约仍全局暂停。
-解决全局原因并核对真实状态后才可 node scripts/queue-checker.mjs --resume。
+解决全局原因并核对真实状态后才可恢复。云端 review_seat_failure 保存的
+workspaceReviewedAt 晚于本地 ack_blocked 时，普通检查器会自动同步恢复；
+不会恢复 ack_uncertain、未确认队列写入、未完成租约。手动 --resume 仍只能在真实核验后使用。
 队列写入结果不明或30分钟未确认时保留记录，不重发。
 
 网页和数据库持续托管。成员操作由本地 Codex 的浏览器完成；当前本机旧巡检已启用
@@ -57,6 +59,13 @@ https://admin.openai.com/workspace/cd01c344-8ff9-41fd-a750-f7b30af9a7c9/members?
 同时核对席位卡的已购总数。角色“所有者/管理员/成员”分别记录 owner/admin/member。
 不能凭搜索无结果推定完整列表，也不能把客户端缓存或失败页面当成空列表。
 通过 observe_workspace 保存最近60秒的完整快照。
+
+初次打开若显示“请稍候／正在进行安全验证”，不立即判断登录失效或 unknown。
+先让页面自然完成加载，最多60秒内检查就绪状态，期间不反复刷新、不点击验证码、
+不重复成员动作。完整成员标签就绪后再读取两张完整清单。仍不可用且本次尚未 claim、
+未开始任何外部动作时，用 defer_seat_operation(failureCode=browser_unavailable) 登记；
+包括只核对待接受邀请失败时，以该请求ID和kind=invite登记。实际登录重定向仍是 login_expired，
+工作空间、角色、容量或无法分类的异常保持各自故障分类。已claim或操作结果不明不能降级为 browser_unavailable。
 
 ## 每个实际操作
 
@@ -178,6 +187,13 @@ heartbeat 保持暂停。网页根据最近3分钟检查时间显示程序是否
 - `mail_delivery`：只隔离确切通知 ID，保留发送租约与可能已发送的证据；同一员工到期回收也可以继续。
 - `member_action`：已确认仅影响该成员的操作错误，隔离此邮箱的邀请、加入核对、回收；其占位保留到官方证据确认移除。其它员工可继续。
 - `approval_required`：单个动作被拒绝或等待本人确认，只隔离目标；禁止重复请求或绕过审批。
+- `browser_unavailable`：只允许未claim、未开始外部动作的短暂加载、网络或安全验证页。
+  暂缓成员写入，由普通程序用现有专用管理员档案只读复核；1、2、5、15分钟退避，
+  之后最多每15分钟一次，不运行模型、不点击验证码、不自动登录。恢复需60秒内完整官方快照、
+  正确Owner/工作空间/容量且无未完成租约，并调用review_seat_failure(decision=recover_browser)，
+  保存审计后恢复派发；隔离项保留。持续失败会去重投递一次Codex只读兜底核验，
+  仅通过现有in-app会话核验并恢复，不办理成员/邮件；仍失败则报告并等待本人处理。
+  有效Gmail提醒可独立继续。只读兜底不属于每分钟模型巡检。
 - `login_expired / workspace_mismatch / capacity_mismatch / role_mismatch / unknown`：整体暂停。不能把未知错误猜成局部错误。
 
 已 claim 时通过 `complete_seat_operation(outcome=blocked或uncertain, failureCode=分类)` 保留原操作；尚未 claim 时用 `defer_seat_operation(kind,targetId,failureCode,detail)` 登记。工具不存在或登记失败则整体暂停，禁止以本地 ack 代替云端记录。

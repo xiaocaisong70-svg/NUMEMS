@@ -101,6 +101,8 @@ export async function portalData() {
       mail: Boolean(codex?.mailVerifiedAt || (env.REMINDER_WEBHOOK_URL && env.REMINDER_WEBHOOK_TOKEN)),
       lastDeliveryError: user?.isAdmin ? codex?.lastError ?? codex?.mailChannelError ?? runtime?.lastDeliveryError ?? null : undefined,
       isolatedOperations: user?.isAdmin ? codex?.holds?.length ?? 0 : undefined,
+      memberPaused: Boolean(codex?.lastError || codex?.globalFailureCode),
+      browserRecovering: codex?.globalFailureCode === "browser_unavailable" && Boolean(codex?.browserUnavailableAt),
     },
     setup: !state.config.inventoryVerified
       ? "首次使用需由管理员核对工作空间、登记当前成员并设置员工白名单。"
