@@ -156,7 +156,9 @@ export async function POST(request: Request) {
           if (name === "complete_seat_operation") return completeOperation(s, args, now);
           if (name === "set_codex_live") {
             if (typeof args.enabled !== "boolean") throw new Error("启用参数无效。");
-            return setBridgeMode(s, args.enabled, now);
+            return setBridgeMode(s, args.enabled, now, {
+              relayMail: env.REMINDER_DELIVERY_MODE === "relay",
+            });
           }
           if (name === "release_test_request") {
             const r = s.requests.find(r => r.id === args.requestId && r.isTest === true);

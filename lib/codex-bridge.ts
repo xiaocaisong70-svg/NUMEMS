@@ -180,7 +180,12 @@ export function prepareTest(input: BridgeState, now: string): BridgeState {
   const b = bridge(next);
   if (!b.observation || !next.config.inventoryVerified) throw new Error("请先核对官方成员列表。");
   const prior = next.requests.find(r => r.email === TEST_EMAIL && !["completed", "cancelled"].includes(r.status));
-  if (prior?.isTest) return next;
+  if (prior?.isTest) {
+    // 暂停后重新进入测试模式：测试申请保持原状，但需恢复执行器启用状态。
+    b.enabled = true; b.testOnly = true;
+    record(next, "codex_prepare_test", now);
+    return next;
+  }
   if (prior) throw new Error("该邮箱已有真实申请，不能覆盖为测试。");
   const snapshot = validateObservation(b.observation, now);
   if ([...snapshot.members, ...snapshot.invites].some(p => norm(p.email) === TEST_EMAIL))
@@ -197,11 +202,15 @@ export function prepareTest(input: BridgeState, now: string): BridgeState {
   record(next, "codex_prepare_test", now);
   return next;
 }
-export function setBridgeMode(input: BridgeState, enabled: boolean, now: string): BridgeState {
+export function setBridgeMode(input: BridgeState, enabled: boolean, now: string,
+    options: { relayMail?: boolean } = {}): BridgeState {
   const next = structuredClone(input); const b = bridge(next);
-  if (enabled && (!b.inviteVerifiedAt || !b.removalVerifiedAt || !b.mailVerifiedAt))
-    throw new Error("需要先验证真实邀请、回收和邮件发送。");
+  // 到期提醒已改为网页端 30 分钟倒计时，不再依赖邮件通道；
+  // 正式模式只要求邀请与回收经过真实办理核实。
+  if (enabled && (!b.inviteVerifiedAt || !b.removalVerifiedAt))
+    throw new Error("需要先验证真实邀请和回收。");
   b.enabled = enabled; b.testOnly = !enabled;
+  if (enabled) b.mailChannelError = undefined;
   record(next, enabled ? "codex_enable_live" : "codex_pause", now);
   return next;
 }
@@ -431,10 +440,17 @@ export function reviewFailure(input: BridgeState, args: {
   if (b.lease) throw new Error("仍有未完成操作，必须先提交真实核实回执。");
   if (args.decision === "retry_not_started") {
     const hold = b.holds?.find(h => h.operation.id === args.operationId);
-    if (!hold || hold.attempted) throw new Error("只有明确未开始外部操作的隔离项可重新排队；其余需核实真实结果。");
+    if (!hold) throw new Error("只有明确未开始外部操作的隔离项可重新排队；其余需核实真实结果。");
     if (hold.operation.kind !== "mail") {
-      next = observeWorkspace(next, args.observation!, now); b = bridge(next);
+      // 已尝试过的操作只有在最新官方证据证明目标确实未落地时，才允许按未开始重试。
+      const snapshot = validateObservation(args.observation!, now);
+      if (hold.attempted &&
+          [...snapshot.members, ...snapshot.invites].some(p => norm(p.email) === hold.operation.email))
+        throw new Error("官方证据显示目标仍然存在，不能按未开始重试。");
+      next = observeWorkspace(next, snapshot, now); b = bridge(next);
       if (b.lastError) throw new Error("工作空间异常尚未排除。");
+    } else if (hold.attempted) {
+      throw new Error("只有明确未开始外部操作的隔离项可重新排队；其余需核实真实结果。");
     }
     b.holds = b.holds?.filter(h => h.operation.id !== args.operationId);
     record(next, "codex_review_unstarted", now, hold.operation.requestId);

@@ -1,5 +1,7 @@
 # NUMEMS Codex 自动办理规程
 
+> **TRAE 副本说明：** 本文件中的席位业务规则和安全边界对原版与本副本都有效；Codex 聊天唤醒、`codex.exe`、旧按需检查器和 Gmail Connector 的运行步骤仅适用于原版，属于本副本的历史参考，不得在 `business-seat-portal-trae` 中执行。TRAE 运行、切换和邮件接入以 [docs/TRAE-CN-EXECUTOR.md](docs/TRAE-CN-EXECUTOR.md) 及 `.trae/skills/numems-seat-executor/SKILL.md` 为准。执行器默认关闭，未通过单执行器和 relay 前置检查时不得办理。
+
 适用于站点 appgprj_6ad6d76874cc8191a1f3191b8e66ca74。
 管理员 xiaocaisong70@gmail.com，目标工作空间
 cd01c344-8ff9-41fd-a750-f7b30af9a7c9（My Workspace）。

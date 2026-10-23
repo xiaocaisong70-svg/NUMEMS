@@ -85,7 +85,8 @@ export async function portalData() {
   const view = viewState(state, user, serverNow);
   const runtime = (state as State & { runtime?: { lastTickAt?: string; lastDeliveryError?: string } }).runtime;
   const codex = (state as BridgeState).codex;
-  const onDemand = codex?.scheduleId?.startsWith("local:queue-checker:") ?? false;
+  const onDemand = (codex?.scheduleId?.startsWith("local:queue-checker:") ||
+    codex?.scheduleId?.startsWith("local:trae-cn:")) ?? false;
   const deterministic = codex?.scheduleId?.startsWith("local:seat-executor:") ?? false;
   const checkerFresh = Boolean(runtime?.lastTickAt &&
     Date.now() - Date.parse(runtime.lastTickAt) < 3 * 60_000);

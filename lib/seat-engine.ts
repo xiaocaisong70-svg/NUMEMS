@@ -1,6 +1,13 @@
 import { INVITATION_MINUTES, INVITATION_MS, invitationDeadline, queueForecast } from "./queue-estimate.ts";
 export const PROTECTED_OWNER_EMAIL = "xiaocaisong70@gmail.com";
-export const AUTHORIZED_TEST_EMAIL = "hit_wangning@outlook.com";
+export const AUTHORIZED_TEST_EMAIL = "laplacecat8@gmail.com";
+
+function portalPublicUrl(): string {
+  const configured =
+    typeof process !== "undefined" ? process.env?.PORTAL_PUBLIC_URL?.trim() : "";
+  return `${(configured || "https://numems-seat-portal.workspace-026021.chatgpt.site").replace(/\/+$/, "")}/`;
+}
+
 export type Actor = { userId: string; email: string; isAdmin: boolean };
 export type RequestStatus = "queued" | "pending_invite" | "invited" | "active" | "pending_removal" | "completed" | "cancelled";
 export type Config = {
@@ -254,7 +261,7 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
         if (r.status !== "active" || !r.expiresAt) continue;
         const remaining = Date.parse(r.expiresAt) - instant;
         if (remaining <= 0) remove(r, "lease_expired", "expired", "租期已到期，正在等待实际移除确认。");
-        else if (remaining <= next.config.reminderMinutes * 60_000) notice(r, "expiry_30m", "ChatGPT 席位将在 30 分钟内到期", `你的 ChatGPT Business 席位即将到期。截止时间（UTC）：${r.expiresAt}。如需继续使用，请在到期前打开席位申请中心续期：https://numems-seat-portal.workspace-026021.chatgpt.site/ 。如已续期，请以网页当前截止时间为准。网页按本地时区显示；有同事排队时需重新申请。`);
+        else if (remaining <= next.config.reminderMinutes * 60_000) notice(r, "expiry_30m", "ChatGPT 席位将在 30 分钟内到期", `你的 ChatGPT Business 席位即将到期。截止时间（UTC）：${r.expiresAt}。如需继续使用，请在到期前打开席位申请中心续期：${portalPublicUrl()} 。如已续期，请以网页当前截止时间为准。网页按本地时区显示；有同事排队时需重新申请。`);
       }
       if (next.config.inventoryVerified && next.config.workspaceId && next.config.automationEnabled) {
         let available = Math.max(0, next.config.totalSeats - used(next));
