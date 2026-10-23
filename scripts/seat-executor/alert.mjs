@@ -36,7 +36,15 @@ async function destination(config, checkerConfigPath, projectRoot) {
   return { cli, threadId };
 }
 
-function alertText(alertId, projectRoot) {
+function alertText(alertId, projectRoot, kind) {
+  if (kind === "browser_recovery") return `NUMEMS 官方后台恢复提醒 [${alertId}]\n` +
+    "这是用户已批准的单次只读恢复核验。普通程序多次无法读取官方后台，成员邀请和回收暂缓。" +
+    `请管理员查看 ${path.join(projectRoot, ".sites-runtime", "queue-checker", "status.json")}。` +
+    "先读取seat_portal_status：仅对browser_unavailable且无租约的故障，使用当前已授权in-app官方浏览器" +
+    "让页面自然完成验证后，只读核对指定My Workspace的Owner、4个席位及完整成员和邀请清单；" +
+    "取得60秒内完整证据才调用review_seat_failure(decision=recover_browser)。" +
+    "不要邀请、移除、发送邮件、创建申请或改截止时间；普通检查器会根据云端核验回执恢复并另行派发有效待办。" +
+    "仍需本人登录/验证码或无法完整核实时报告一次，不循环唤醒、不绕过验证、不重试结果不明的操作。";
   return `NUMEMS 确定性执行器故障告警 [${alertId}]\n` +
     `真实执行程序已停止。请由管理员检查 ${path.join(projectRoot, ".sites-runtime", "seat-executor", "status.json")}，` +
     "并核对门户租约和官方成员／邀请状态。此告警不代表邀请、邮件或移除成功；" +
@@ -47,6 +55,7 @@ function alertText(alertId, projectRoot) {
  * reconciled read-only, never sent again. No model turn is started here. */
 export async function sendFatalAlert({ config, alertPath = defaultAlertPath,
   checkerConfigPath = defaultCheckerConfigPath, projectRoot = root,
+  alertKind = "executor",
   clock = () => new Date(), newId = randomUUID,
   clientFactory = (cli, options) => new AppServerClient(cli, options),
 } = {}) {
@@ -93,7 +102,7 @@ export async function sendFatalAlert({ config, alertPath = defaultAlertPath,
     let queued;
     try {
       queued = await client.enqueue(target.threadId, state.clientId,
-        alertText(state.id, projectRoot));
+        alertText(state.id, projectRoot, alertKind));
     } catch {
       // Even a transport error can follow a successful queue write.
       state = { ...state, phase: "uncertain" };

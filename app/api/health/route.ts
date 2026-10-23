@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   try {
     await readState();
-    return Response.json({ ok: true, variant: "numems-original-v1", faultIsolationVersion: 1, invitationWindowMinutes: 5, queuePolicyVersion: 1, storage: "ready" },
+    return Response.json({ ok: true, variant: "numems-agentless-v1.1", faultIsolationVersion: 1, invitationWindowMinutes: 5, queuePolicyVersion: 1, storage: "ready" },
       { headers: { "Cache-Control": "no-store" } });
   } catch {
     return Response.json({ ok: false, storage: "unavailable" }, { status: 503 });

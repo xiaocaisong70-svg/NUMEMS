@@ -1,6 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$NodeExe
 )
+throw 'Legacy installer disabled in this independent copy. Use scripts/agentless/install-task.ps1.'
 $ErrorActionPreference = 'Stop'
 $projectPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $runtimePath = Join-Path $projectPath '.sites-runtime\seat-executor'

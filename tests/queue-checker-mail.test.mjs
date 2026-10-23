@@ -85,6 +85,19 @@ test("mismatched lease fails closed before Gmail", async () => {
   assert.equal(sends, 0);
 });
 
+test("a verified pre-action browser pause does not suppress an unrelated direct reminder", async () => {
+  const client = fakeClient(); let sent = 0;
+  const result = await processDirectReminder({ client, session: "s", plan: plan({
+    globalFailureCode: "browser_unavailable", lastError: "verification pending",
+    browserRecovery: { eligible: true }, lease: null,
+  }), mailer: { async send() { sent++; return "gmail_browser_pause_123"; } } });
+  assert.equal(result.kind, "sent"); assert.equal(sent, 1);
+  const skipped = await processDirectReminder({ client: fakeClient(), session: "s", plan: plan({
+    globalFailureCode: "browser_unavailable", lastError: "unverified classification",
+  }), mailer: { async send() { throw Error("must not send"); } } });
+  assert.equal(skipped.kind, "skipped");
+});
+
 test("wrong connected Gmail account stops before the portal claim", async () => {
   const client = fakeClient({ sender: "other@example.com" }); let sends = 0;
   await assert.rejects(processDirectReminder({ client, session: "s", plan: plan(),

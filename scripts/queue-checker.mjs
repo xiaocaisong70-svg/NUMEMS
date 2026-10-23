@@ -1,3 +1,4 @@
+throw new Error('此独立副本已停用旧调度入口；请运行 scripts/agentless/main.mjs。');
 import { readFile, writeFile, mkdir, rename, open, unlink } from "node:fs/promises";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,8 @@ import { resolveCodexCli } from "./codex-cli-resolver.mjs";
 import { prepareWake, wakeMessage, applyAcknowledgement, SCHEDULE_ID } from "./queue-checker-core.mjs";
 import { codexDispatchPlan, drainDirectReminders } from "./queue-checker-mail.mjs";
 import { GmailConnectorMailer } from "./seat-executor/gmail-mailer.mjs";
+import { recoverBrowser, reconcileDispatchRecovery, canDeliverDuringBrowserPause } from "./browser-recovery.mjs";
+import { sendFatalAlert, markExecutorHealthy } from "./seat-executor/alert.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const directory = join(root, ".sites-runtime", "queue-checker");
@@ -14,6 +17,7 @@ const configPath = join(directory, "config.json");
 const statePath = join(directory, "state.json");
 const statusPath = join(directory, "status.json");
 const lockPath = join(directory, "checker.lock");
+const recoveryAlertPath = join(directory, "browser-recovery-alert.json");
 const args = process.argv.slice(2);
 const argument = name => args[args.indexOf(name) + 1];
 async function readJson(path, fallback) {
@@ -102,10 +106,23 @@ else {
       if (savedAck) {
         applyAcknowledgement(state, savedAck, snapshot.plan);
       }
+      if (reconcileDispatchRecovery(state, snapshot.plan)) await markExecutorHealthy(recoveryAlertPath);
+      if (config.browserRecovery !== false) {
+        const recovery = await recoverBrowser({ client, session: toolSession, plan: snapshot.plan, state });
+        snapshot = { ...snapshot, plan: recovery.plan };
+        if (recovery.kind === "recovered") await markExecutorHealthy(recoveryAlertPath);
+        else if (recovery.kind === "waiting" && state.browserRecovery.attempts >= 3 &&
+            Date.now() - Date.parse(state.browserRecovery.blockedAt) >= 5 * 60_000) {
+          const alert = await sendFatalAlert({ config: { liveActions: true,
+            alertCli: codexCli, alertThreadId: config.threadId }, alertPath: recoveryAlertPath,
+            projectRoot: root, alertKind: "browser_recovery" });
+          state.browserRecovery.alert = alert.state;
+        }
+      }
       let reminderResult = { sent: 0, uncertain: 0 };
-      if (directMail && !state.halted && snapshot.plan.reminders?.length) {
+      if (directMail && (!state.halted || canDeliverDuringBrowserPause(state, snapshot.plan)) && snapshot.plan.reminders?.length) {
         const mailer = new GmailConnectorMailer({ codexCli,
-          siteUrl: process.env.PORTAL_SITE_URL?.trim() || "https://numems-seat-portal.workspace-026021.chatgpt.site/" });
+          siteUrl: "https://numems-seat-portal.workspace-026021.chatgpt.site/" });
         // A pre-opt-in Codex wake may still own a mail event. Its specific
         // notice stays with Codex until that wake is acknowledged.
         const oldEvents = state.active?.events;
@@ -151,16 +168,20 @@ else {
           state.halted = { reason: "interrupted_queue_write", at: new Date().toISOString() };
         }
       }
-      const registeredId = state.halted || config.taskName !== "NUMEMS-Seat-Queue" ||
-        !snapshot.plan.enabled || snapshot.plan.testOnly || snapshot.plan.lastError ||
-        snapshot.plan.globalFailureCode ? "" : SCHEDULE_ID;
+      // Registration means the ordinary checker is running, not that member
+      // writes are permitted. Keep its heartbeat visible during recovery.
+      const registeredId = config.taskName !== "NUMEMS-Seat-Queue" ||
+        !snapshot.plan.enabled || snapshot.plan.testOnly ? "" : SCHEDULE_ID;
       if (snapshot.plan.scheduleId !== registeredId)
         await client.portal(toolSession, "record_codex_schedule", { scheduleId: registeredId });
       await save(statePath, state);
       const status = { checkedAt: new Date().toISOString(), mode: "ordinary_program",
-        state: state.halted ? "blocked" : state.active ? "waiting_for_codex" : decision.kind,
+        state: canDeliverDuringBrowserPause(state, snapshot.plan) ? "recovering_browser" :
+          state.halted || snapshot.plan.lastError || snapshot.plan.globalFailureCode ? "blocked" :
+          state.active ? "waiting_for_codex" : decision.kind,
         modelCallsByChecker: 0, queueWakes: state.wakes, checks: state.checks,
         isolatedOperations: snapshot.plan.blockedOperations?.length ?? 0,
+        ...(state.browserRecovery ? { browserRecovery: state.browserRecovery } : {}),
         pending: { invites: snapshot.plan.invites.length, removals: snapshot.plan.removals.length,
           reminders: snapshot.plan.reminders.length, acceptance: snapshot.plan.awaitingAcceptance.length },
         ...(directMail ? { mailMode: "gmail_connector",

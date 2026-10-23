@@ -34,7 +34,6 @@ yarn-error.log*
 # Checkout-local tool state
 /.wrangler/
 /.sites-runtime/
-/.runtime-trae/
 
 # Workspace scaffolding and publication archives
 /.agents/
@@ -44,3 +43,13 @@ yarn-error.log*
 
 # OS metadata
 .DS_Store
+
+/.runtime/
+/.runtime-trae/
+
+# Local acceptance artifacts and private key containers
+/test-results/
+/playwright-report/
+/secrets/
+*.p12
+*.pfx

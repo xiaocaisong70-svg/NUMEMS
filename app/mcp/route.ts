@@ -4,6 +4,7 @@ import { runJobs } from "@/lib/jobs";
 import { observeWorkspace, prepareTest, workPlan, claimOperation, completeOperation, deferOperation, reviewFailure, FAILURE_CODES, setBridgeMode,
   setTestDeadline, recordSchedule, type BridgeState, type Observation } from "@/lib/codex-bridge";
 import { transition } from "@/lib/seat-engine";
+import { reminderMode } from "@/lib/reminder-policy";
 export const dynamic = "force-dynamic";
 
 const personSchema = { type: "object", properties: {
@@ -17,7 +18,7 @@ const observationSchema = { type: "object", properties: {
 const tools = [
   {
     name: "defer_seat_operation",
-    description: "登记操作故障。邮件/单一成员/单次审批隔离目标，保留记录且不重试；登录、工作空间、容量、角色或未知异常全局暂停。不会确认成功或释放席位。",
+    description: "登记故障。仅在未claim且未开始外部动作时，暂时加载/网络/安全验证页使用browser_unavailable，由普通程序只读复核恢复；其它全局故障保持暂停。邮件/单一成员/单次审批仅隔离目标。不会确认成功或释放席位。",
     inputSchema: { type: "object", properties: {
       kind: { type: "string", enum: ["invite", "remove", "mail"] }, targetId: { type: "string" },
       failureCode: { type: "string", enum: FAILURE_CODES }, detail: { type: "string" },
@@ -26,9 +27,9 @@ const tools = [
   },
   {
     name: "review_seat_failure",
-    description: "仅在管理员完成核查后恢复。retry_not_started只重排明确未开始外部操作的隔离项；已尝试操作须使用真实回执核实，不能自动重试。resume_workspace需最新完整官方证据，无未完成租约，不清除目标隔离。",
+    description: "retry_not_started仅重排明确未开始的隔离项；resume_workspace需管理员核查；recover_browser仅允许程序对未开始操作的browser_unavailable故障提交最新完整官方证据后恢复。所有恢复均禁止有未完成租约，保留目标隔离及审计。",
     inputSchema: { type: "object", properties: {
-      decision: { type: "string", enum: ["retry_not_started", "resume_workspace"] },
+      decision: { type: "string", enum: ["retry_not_started", "resume_workspace", "recover_browser"] },
       operationId: { type: "string" }, observation: observationSchema,
     }, required: ["decision"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
@@ -91,7 +92,7 @@ const tools = [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
   {
-    name: "set_codex_live", description: "完成邀请、真实成员回收与邮件验证后启用Codex正式办理；也可随时暂停。",
+    name: "set_codex_live", description: "完成真实邀请和成员回收验证后启用普通程序办理；网页提醒模式无需邮件通道，relay模式还须验证提醒投递。也可随时暂停。",
     inputSchema: { type: "object", properties: { enabled: { type: "boolean" } }, required: ["enabled"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
@@ -149,16 +150,16 @@ export async function POST(request: Request) {
           if (name === "record_codex_schedule") return recordSchedule(s, args.scheduleId, now);
           if (name === "set_test_deadline") return setTestDeadline(s, args.requestId, args.stage, now);
           if (name === "claim_seat_operation") {
-            if (args.kind === "mail" && env.REMINDER_DELIVERY_MODE === "relay") throw new Error("邮件由普通程序通道办理，禁止另行发送。");
+            if (args.kind === "mail") throw new Error(reminderMode(env.REMINDER_DELIVERY_MODE) === "in_app"
+              ? "当前仅在网页提醒，已禁用提醒邮件。官方邀请邮件不受影响。"
+              : "邮件由普通程序通道办理，禁止另行发送。");
             if (!["invite", "remove", "mail"].includes(args.kind) || typeof args.targetId !== "string") throw new Error("办理参数无效。");
             return claimOperation(s, args.kind, args.targetId, token, now);
           }
           if (name === "complete_seat_operation") return completeOperation(s, args, now);
           if (name === "set_codex_live") {
             if (typeof args.enabled !== "boolean") throw new Error("启用参数无效。");
-            return setBridgeMode(s, args.enabled, now, {
-              relayMail: env.REMINDER_DELIVERY_MODE === "relay",
-            });
+            return setBridgeMode(s, args.enabled, now);
           }
           if (name === "release_test_request") {
             const r = s.requests.find(r => r.id === args.requestId && r.isTest === true);

@@ -1,6 +1,6 @@
 {
-  "name": "site-creator-vinext-starter",
-  "version": "0.1.0",
+  "name": "numems-seat-portal-agentless",
+  "version": "1.0.0",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -12,11 +12,14 @@
     "start": "node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js dev --config dist/server/wrangler.json --local --persist-to .wrangler/state --ip 127.0.0.1 --inspector-port 0",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
-    "deploy:cloudflare": "node scripts/deploy-cloudflare.mjs",
-    "deploy:cloudflare:dry": "node scripts/deploy-cloudflare.mjs --dry-run",
-    "trae:check": "node scripts/trae/checker.mjs",
-    "trae:receipt": "node scripts/trae/receipt.mjs",
-    "trae:login": "node scripts/trae/login.mjs"
+    "agentless:init": "node scripts/agentless/main.mjs --init",
+    "agentless:check": "node scripts/agentless/main.mjs --config-check",
+    "agentless:login": "node scripts/agentless/login.mjs",
+    "agentless:probe": "node scripts/agentless/host.mjs probe",
+    "agentless:once": "node scripts/agentless/host.mjs once",
+    "agentless:run": "node scripts/agentless/host.mjs run",
+    "agentless:test": "node --test tests/*.test.mjs",
+    "agentless:admin": "node scripts/agentless/host.mjs admin"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

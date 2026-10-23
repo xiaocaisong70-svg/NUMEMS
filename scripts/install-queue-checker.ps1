@@ -2,6 +2,7 @@ param(
   [Parameter(Mandatory=$true)][string]$CodexCli,
   [string]$ThreadId = '01a1522f-edd9-7b01-9c10-70c0899e3ba8'
 )
+throw 'Legacy installer disabled in this independent copy. Use scripts/agentless/install-task.ps1.'
 $ErrorActionPreference = 'Stop'
 $projectPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $runtimePath = Join-Path $projectPath '.sites-runtime\queue-checker'

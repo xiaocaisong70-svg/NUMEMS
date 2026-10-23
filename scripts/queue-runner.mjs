@@ -1,3 +1,4 @@
+throw new Error('此独立副本已停用旧调度入口；请运行 scripts/agentless/main.mjs。');
 // Optional standalone scheduler. Secrets come from the process environment.
 const base = process.env.SEAT_PORTAL_URL;
 const token = process.env.PORTAL_WORKER_TOKEN;

@@ -1,0 +1,2 @@
+# Keep release hashes stable on Windows and Unix. Source files are stored as-is.
+* -text

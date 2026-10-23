@@ -1,5 +1,5 @@
 import { createState, viewState, PROTECTED_OWNER_EMAIL, type State } from "../lib/seat-engine";
-export type DemoMode = "queue" | "invite" | "timeout" | "active";
+export type DemoMode = "queue" | "invite" | "timeout" | "active" | "expiry";
 export const demoUser = { userId: "demo", email: "lin@example.com", displayName: "林知远", isAdmin: false };
 export const demoScheduler = { userId: "demo-scheduler", email: PROTECTED_OWNER_EMAIL, isAdmin: true };
 export function renderDemo(state: State, now = new Date().toISOString()) {
@@ -18,9 +18,9 @@ export function makeDemo(mode: DemoMode = "queue") {
   if (mode !== "queue") s.requests.pop();
   s.requests.push({ id: "DEMO_MINE", userId: demoUser.userId, email: demoUser.email,
     name: demoUser.displayName, reason: "整理产品调研资料与分析报告", hours: 1,
-    status: mode === "queue" ? "queued" : mode === "active" ? "active" : "invited",
+    status: mode === "queue" ? "queued" : ["active", "expiry"].includes(mode) ? "active" : "invited",
     createdAt: now, updatedAt: now,
-    ...(mode === "active" ? { expiresAt: new Date(instant + 3_600_000).toISOString() } : {}),
+    ...(["active", "expiry"].includes(mode) ? { expiresAt: new Date(instant + (mode === "expiry" ? 1_740_000 : 3_600_000)).toISOString() } : {}),
     ...(["invite", "timeout"].includes(mode) ? { invitedAt, joinDeadlineAt: new Date(Date.parse(invitedAt) + 300_000).toISOString() } : {}) });
   s.requests.push({ id: "DEMO_NEXT", userId: "next", email: "wu@example.com", name: "吴同事",
     reason: "下一位排队员工", hours: 1, status: "queued", createdAt: new Date(instant + 1).toISOString(), updatedAt: now });

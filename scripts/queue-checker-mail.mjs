@@ -19,7 +19,8 @@ export async function processDirectReminder({ client, session, plan, mailer }) {
   if (!Array.isArray(plan.reminders) || typeof plan.enabled !== "boolean" ||
       typeof plan.busy !== "boolean")
     throw new Error("Incomplete reminder plan.");
-  if (!plan.enabled || plan.testOnly || plan.busy || plan.lastError || plan.globalFailureCode ||
+  const browserOnly = plan.globalFailureCode === "browser_unavailable" && plan.browserRecovery?.eligible === true && !plan.lease;
+  if (!plan.enabled || plan.testOnly || plan.busy || (!browserOnly && (plan.lastError || plan.globalFailureCode)) ||
       plan.mailChannelError || !plan.reminders.length)
     return { kind: "skipped" };
   const notice = plan.reminders[0];

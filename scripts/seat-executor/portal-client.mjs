@@ -2,20 +2,52 @@
 // The Sites front door supplies the signed-in ChatGPT identity; this client
 // neither copies cookies nor accepts caller-supplied identity headers.
 export class PortalClient {
-  constructor(context, config) {
+  constructor(context, config, setupOperations = []) {
     this.context = context;
     this.config = config;
     this.sequence = 0;
+    this.setupOperations = setupOperations;
   }
 
   async open() {
     if (!this.page) this.page = await this.context.newPage();
     if (new URL(this.page.url()).origin !== new URL(this.config.siteUrl).origin)
       await this.page.goto(this.config.siteUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-    const identity = await this.page.evaluate(async () => {
-      const response = await fetch("/api/portal", { cache: "no-store", credentials: "same-origin" });
+    const readIdentity = () => this.page.evaluate(async () => {
+      const response = await fetch("/api/portal", { cache: "no-store", credentials: "same-origin",
+        signal:AbortSignal.timeout(20_000) });
       return { status: response.status, body: await response.json() };
     });
+    let identity = await readIdentity();
+    if (identity.status === 401 && identity.body.access === 'signin_required' &&
+        this.config.browserMode === 'isolated_desktop' && !this.sessionRestoreAttempted) {
+      // Normal Sites sign-in redirect may reuse the administrator's existing SSO session.
+      // One attempt only; never fill credentials, click consent, handle CAPTCHA or copy cookies.
+      this.sessionRestoreAttempted = true;
+      const site = new URL(this.config.siteUrl);
+      const isPortal = url=>url.origin===site.origin && url.pathname==='/';
+      const isAccountChoice = url=>url.origin==='https://auth.openai.com' && url.pathname==='/choose-an-account';
+      try {
+        await this.page.goto(new URL('/signin-with-chatgpt?return_to=%2F',site).href,
+          {waitUntil:'domcontentloaded',timeout:30_000});
+        await this.page.waitForURL(url=>isPortal(url)||isAccountChoice(url),{timeout:30_000});
+        if(isAccountChoice(new URL(this.page.url()))) {
+          // A normal existing-account selector is not a new consent or credential form.
+          // Select only the exact administrator address, never the first/default account.
+          const label=this.page.getByText(this.config.adminEmail,{exact:true}).filter({visible:true});
+          await label.waitFor({state:'visible',timeout:10_000});
+          if(await label.count()!==1)throw new Error('管理员账号选项不唯一。');
+          const choice=label.locator('xpath=ancestor-or-self::*[self::button or self::a or @role="button" or @role="link"][1]').filter({visible:true});
+          if(await choice.count()!==1 || !isAccountChoice(new URL(this.page.url())))
+            throw new Error('无法唯一识别已登录管理员账号选项。');
+          await choice.click({timeout:10_000});
+          await this.page.waitForURL(isPortal,{timeout:30_000});
+        }
+        identity = await readIdentity();
+      } catch {
+        throw new Error('门户既有登录无法自动续接；需要登录或安全验证，执行器保持停止且不弹窗。');
+      }
+    }
     if (identity.status !== 200 || identity.body.access !== "allowed" ||
         identity.body.user?.email?.toLowerCase() !== this.config.adminEmail)
       throw new Error("门户管理员登录失效或身份不符，执行器已停止。");
@@ -26,6 +58,7 @@ export class PortalClient {
     const allowed = new Set(["process_seat_queue", "seat_portal_status", "observe_workspace",
       "claim_seat_operation", "complete_seat_operation", "defer_seat_operation",
       "record_codex_schedule"]);
+    for (const operation of this.setupOperations) allowed.add(operation);
     if (!allowed.has(name)) throw new Error("执行器不允许调用该门户操作。");
     const page = await this.open();
     const body = { jsonrpc: "2.0", id: ++this.sequence,
@@ -33,6 +66,7 @@ export class PortalClient {
     const result = await page.evaluate(async requestBody => {
       const response = await fetch("/api/codex", {
         method: "POST", credentials: "same-origin", cache: "no-store",
+        signal:AbortSignal.timeout(30_000),
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody),
       });
       return { status: response.status, body: await response.json() };

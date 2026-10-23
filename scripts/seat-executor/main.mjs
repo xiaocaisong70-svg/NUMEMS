@@ -79,6 +79,7 @@ async function acquireLock() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.meta.filename)) {
+  throw new Error('此副本已停用旧执行入口；请使用 scripts/agentless/main.mjs。');
   const config = await loadConfig();
   await mkdir(runtimeDir, { recursive: true });
   const release = await acquireLock();

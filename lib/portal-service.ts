@@ -3,6 +3,7 @@ import { getChatGPTUser } from "@/app/chatgpt-auth";
 import { createState, upgradeState, transition, viewState, type Actor, type State } from "./seat-engine";
 import type { BridgeState } from "./codex-bridge";
 import { portalAccess, requirePortalAccess } from "./portal-access";
+import { applyReminderPolicy, reminderMode } from "./reminder-policy";
 
 export const ADMIN_EMAIL = "xiaocaisong70@gmail.com";
 export const ADMIN_CONTACT_EMAIL = "2712467009@qq.com";
@@ -30,14 +31,14 @@ export async function readState(): Promise<{ state: State; revision: number }> {
   const db = database();
   const row = await db.prepare("SELECT revision, document FROM portal_state WHERE id = ?")
     .bind("main").first<{ revision: number; document: string }>();
-  if (row) return { state: upgradeState(JSON.parse(row.document)), revision: row.revision };
+  if (row) return { state: applyReminderPolicy(upgradeState(JSON.parse(row.document)), reminderMode(env.REMINDER_DELIVERY_MODE)), revision: row.revision };
   const initial = createState(new Date().toISOString());
   await db.prepare("INSERT OR IGNORE INTO portal_state (id,revision,document) VALUES (?,?,?)")
     .bind("main", 0, JSON.stringify(initial)).run();
   const inserted = await db.prepare("SELECT revision,document FROM portal_state WHERE id = ?")
     .bind("main").first<{ revision: number; document: string }>();
   if (!inserted) throw new Error("初始化数据库失败。");
-  return { state: upgradeState(JSON.parse(inserted.document)), revision: inserted.revision };
+  return { state: applyReminderPolicy(upgradeState(JSON.parse(inserted.document)), reminderMode(env.REMINDER_DELIVERY_MODE)), revision: inserted.revision };
 }
 
 // Retrying pure transforms is safe. No email or member mutation belongs here.
@@ -85,8 +86,7 @@ export async function portalData() {
   const view = viewState(state, user, serverNow);
   const runtime = (state as State & { runtime?: { lastTickAt?: string; lastDeliveryError?: string } }).runtime;
   const codex = (state as BridgeState).codex;
-  const onDemand = (codex?.scheduleId?.startsWith("local:queue-checker:") ||
-    codex?.scheduleId?.startsWith("local:trae-cn:")) ?? false;
+  const onDemand = codex?.scheduleId?.startsWith("local:queue-checker:") ?? false;
   const deterministic = codex?.scheduleId?.startsWith("local:seat-executor:") ?? false;
   const checkerFresh = Boolean(runtime?.lastTickAt &&
     Date.now() - Date.parse(runtime.lastTickAt) < 3 * 60_000);
@@ -99,9 +99,12 @@ export async function portalData() {
       scheduler: onDemand || deterministic ? checkerFresh : Boolean(codex?.scheduleId) || env.PORTAL_SCHEDULE_ENABLED === "true",
       schedulerMode: deterministic ? "deterministic" : onDemand ? "on_demand" : "heartbeat",
       lastTickAt: runtime?.lastTickAt ?? null,
-      mail: Boolean(codex?.mailVerifiedAt || (env.REMINDER_WEBHOOK_URL && env.REMINDER_WEBHOOK_TOKEN)),
+      reminderMode: reminderMode(env.REMINDER_DELIVERY_MODE),
+      mail: reminderMode(env.REMINDER_DELIVERY_MODE) === "relay" && Boolean(codex?.mailVerifiedAt || (env.REMINDER_WEBHOOK_URL && env.REMINDER_WEBHOOK_TOKEN)),
       lastDeliveryError: user?.isAdmin ? codex?.lastError ?? codex?.mailChannelError ?? runtime?.lastDeliveryError ?? null : undefined,
       isolatedOperations: user?.isAdmin ? codex?.holds?.length ?? 0 : undefined,
+      memberPaused: Boolean(codex?.lastError || codex?.globalFailureCode),
+      browserRecovering: codex?.globalFailureCode === "browser_unavailable" && Boolean(codex?.browserUnavailableAt),
     },
     setup: !state.config.inventoryVerified
       ? "首次使用需由管理员核对工作空间、登记当前成员并设置员工白名单。"

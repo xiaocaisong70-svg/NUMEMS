@@ -4,10 +4,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { root, normalizeEmail } from "./config.mjs";
 import { validateObservation, presence, assertOrdinary } from "./inventory.mjs";
+import { OfficialPageError, waitForOfficialPage } from "./official-readiness.mjs";
 
 export const ui = {
-  members: /^(用户|活跃成员(?:\s+\d+)?|Users|Members(?:\s+\d+)?)$/,
-  invites: /^(待处理的邀请|待处理邀请|Pending invitations|Invites)(?:\s+\d+)?$/i,
+  members: /^(用户|活跃成员(?:\s*\d+)?|Users|Members(?:\s*\d+)?)$/,
+  invites: /^(待处理的邀请|待处理邀请|Pending invitations|Invites)(?:\s*\d+)?$/i,
   next: /^(下一页|下一頁|Next page|Next)$/i,
   previous: /^(上一页|上一頁|Previous page|Previous)$/i,
   invite: /^(邀请成员|Invite members)$/i,
@@ -15,7 +16,8 @@ export const ui = {
   removeMenu: /^(移除成员|Remove member)$/i,
   removeConfirm: /^(从工作空间中移除|Remove from workspace)$/i,
   revoke: /^(撤销邀请|取消邀请|Revoke invitation|Cancel invitation)$/i,
-  keepSeats: /^(保留付费席位|Keep paid seats)$/i
+  keepSeats: /^(保留付费席位|Keep paid seats)$/i,
+  empty: /^(无结果|未找到成员|没有待处理的邀请|No results|No pending invitations|No members found)[。.]*$/i
 };
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 export function parseCapacity(text, label) {
@@ -46,6 +48,12 @@ async function only(locator, label) {
   if (await visible.count() !== 1) throw new Error(`${label}不唯一或不存在；页面结构可能变化。`);
   return visible;
 }
+// Opening a modal/menu is asynchronous in the official UI. Wait for that new
+// surface, then retain the same strict uniqueness and visibility checks.
+async function readyOnly(locator, label) {
+  await locator.filter({ visible: true }).waitFor({ state: "visible", timeout: 20_000 });
+  return only(locator, label);
+}
 export class BrowserAdapter {
   constructor(config, { page, fixtureOrigin, onExternalAction = () => {} } = {}) {
     this.config = config;
@@ -60,7 +68,7 @@ export class BrowserAdapter {
     await fs.mkdir(this.config.profile, { recursive: true });
     this.context = await chromium.launchPersistentContext(this.config.profile, {
       headless: this.config.headless, viewport: { width: 1440, height: 1000 },
-      locale: "zh-CN", acceptDownloads: false,
+      locale: "zh-CN", acceptDownloads: false, chromiumSandbox: true,
       ...(this.config.browserChannel ? { channel: this.config.browserChannel } : {})
     });
     this.page = this.context.pages()[0] || await this.context.newPage();
@@ -75,19 +83,35 @@ export class BrowserAdapter {
   async guard() {
     const p = await this.open(), url = new URL(p.url()), expected = new URL(this.url());
     if (url.origin !== expected.origin || !url.pathname.startsWith(`/workspace/${this.config.workspaceId}/members`))
-      throw new Error("管理员登录失效或跳转到非目标工作空间，请手动重新登录。");
+      throw new OfficialPageError("管理员登录失效或跳转到非目标工作空间，请手动重新登录。",
+        /auth\.openai\.com|\/(log-in|login|sign-in)/.test(p.url()) ? "login_expired" : "workspace_mismatch");
     const body = await p.locator("body").innerText();
     if (/verify you are human|captcha|完成验证|验证您是真人|安全验证|sign in to continue|登录以继续/i.test(body))
-      throw new Error("出现登录或安全验证，程序停止，需管理员接管。");
+      throw new OfficialPageError("出现登录或安全验证，成员操作已停止。",
+        /sign in to continue|登录以继续/i.test(body) ? "login_expired" : "browser_unavailable");
     if (!body.includes(this.config.workspaceName)) throw new Error("目标工作空间名称不匹配。");
-    const switcher = p.getByRole("button", { name: new RegExp(`(?:当前选择[：:]|Current selection:).*${escape(this.config.workspaceName)}`) });
+    // Modal dialogs may hide the background from accessibility without hiding it in the DOM.
+    // Read its exact workspace identity; only() still requires a unique, visibly rendered button.
+    const workspace = escape(this.config.workspaceName);
+    const switcher = p.getByRole("button", { includeHidden: true,
+      name: new RegExp(`^(?:(?:当前选择[：:]|Current selection:)\\s*${workspace}|选择全局设置、ChatGPT 工作空间或 Ads 账户。当前选择[：:]\\s*${workspace}，ChatGPT 工作空间)$`) });
     await only(switcher, "工作空间选择器");
   }
   async load(tab = "members") {
+    this.listTab = tab;
     const p = await this.open();
-    await p.goto(this.url(tab), { waitUntil: "domcontentloaded", timeout: 30_000 });
+    try { await p.goto(this.url(tab), { waitUntil: "domcontentloaded", timeout: 30_000 }); }
+    catch (error) {
+      if (/Timeout|net::ERR_(TIMED_OUT|CONNECTION|NETWORK|INTERNET_DISCONNECTED|NAME_NOT_RESOLVED)/i.test(String(error)))
+        throw new OfficialPageError("官方后台暂时无法连接，未开始成员操作。", "browser_unavailable");
+      throw error;
+    }
     const selected = p.getByRole("tab", { name: tab === "members" ? ui.members : ui.invites });
-    await selected.waitFor({ state: "visible", timeout: 25_000 });
+    await waitForOfficialPage({
+      inspect: async () => ({ url: p.url(), expectedUrl: this.url(tab),
+        body: await p.locator("body").innerText(), ready: await selected.isVisible() }),
+      pause: ms => p.waitForTimeout(ms),
+    });
     await this.guard();
     const tabControl = await only(selected, "成员标签页");
     if (await tabControl.getAttribute("aria-selected") !== "true") {
@@ -102,34 +126,125 @@ export class BrowserAdapter {
     if (await filter.count() && !/^(角色|所有角色|全部|Role|All roles|All)$/i.test((await filter.innerText()).trim()))
       throw new Error("成员列表存在角色筛选，请清除后恢复。");
     await p.getByRole("table").filter({ visible: true }).waitFor({ state: "visible", timeout: 25_000 });
+    await this.waitForRows();
+  }
+  async waitForRows({requireOwner = false, ownerSeen = false} = {}) {
+    const p = await this.open();
+    const expectedTab = this.listTab ?? (new URL(p.url()).searchParams.get("tab") === "invites" ? "invites" : "members");
+    let expectedTotal = null;
+    // Table headers appear before the official data request has finished. A visible
+    // table is not evidence of an empty list, including after pagination/filtering.
+    await waitForOfficialPage({
+      inspect: async () => {
+        const selected = p.getByRole("tab", { name: expectedTab === "members" ? ui.members : ui.invites }).filter({ visible:true });
+        const selectedCount = await selected.count();
+        if (selectedCount > 1) throw new Error("目标成员标签页不唯一。");
+        const active = selectedCount === 1 && await selected.getAttribute("aria-selected") === "true";
+        const total = active ? (await selected.innerText()).trim().match(/(\d+)\s*$/) : null;
+        expectedTotal = total ? Number(total[1]) : null;
+        const tables = p.getByRole("table").filter({ visible: true });
+        const count = await tables.count();
+        if (count > 1) throw new Error("成员或邀请表不唯一；页面结构可能变化。");
+        let ready = false;
+        if (active && count === 1) {
+          const busy = await tables.evaluate(el => !!el.closest('[aria-busy="true"]')) ||
+            await tables.locator('[aria-busy="true"],[role="progressbar"]').filter({ visible: true }).count() > 0;
+          const rows = await tables.getByRole("row").all();
+          const cellRows = (await Promise.all(rows.map(row => row.getByRole("cell").allInnerTexts())))
+            .filter(row => row.length);
+          const cells = cellRows.map(row => row.join(" ").trim());
+          const headers = (await tables.getByRole("columnheader").allInnerTexts()).map(text => text.trim());
+          // The legacy invitation table has explicit Email / Invitation date columns.
+          // The newer generic table shares member headers, so also verify row state below.
+          const invitationHeaders = headers.some(text => /^(电子邮箱|邮箱|Email|Email address)$/i.test(text)) &&
+            headers.some(text => /^(邀请日期|Invitation date|Invited on|Date invited)$/i.test(text));
+          const invitedRows = cellRows.some(row => row.some(text => /^(已邀请|Invited|Pending invitation)$/i.test(text.trim())));
+          const rowCount = cells.filter(text => text.includes("@")).length;
+          const next = p.getByRole("button", { name:ui.next }).filter({ visible:true });
+          if (await next.count() > 1) throw new Error("分页控件不唯一。");
+          const hasNext = await next.count() === 1 && await next.isEnabled() && await next.getAttribute("aria-disabled") !== "true";
+          const empty = await p.getByText(ui.empty).filter({ visible: true }).count() > 0;
+          // Blank data rows are skeletons. Never ignore them beside already-loaded rows.
+          ready = !busy && !cells.some(text => !text) &&
+            (cells.some(text => text.includes("@")) || (empty && cells.every(text => ui.empty.test(text))));
+          if (expectedTab === "members" && (invitationHeaders || invitedRows)) ready = false;
+          if (expectedTotal !== null && (rowCount > expectedTotal || (rowCount === 0 && expectedTotal !== 0))) ready = false;
+          if (expectedTab === "members" && requireOwner && ready) {
+            const parsed = cellRows.filter(row => row.join(" ").includes("@")).map(row => parseRow(row, this.config.seatLabel));
+            const marked = parsed.filter(row => row.self);
+            const administrator = parsed.find(row => row.email === this.config.adminEmail);
+            if (marked.some(row => row.email !== this.config.adminEmail || row.role !== "owner") ||
+                (administrator && administrator.role !== "owner") || marked.length > 1)
+              throw new OfficialPageError("页面中的当前账号不是指定 Owner。", "role_mismatch");
+            // Do not substitute the first Owner. Wait for the exact configured account's own marker.
+            if (administrator && !administrator.self) ready = false;
+            if (!ownerSeen && !marked.length && !hasNext) ready = false;
+          }
+          if (expectedTab === "invites" && ready && cellRows.filter(row => row.join(" ").includes("@"))
+            .some(row => {const parsed=parseRow(row,this.config.seatLabel);return parsed.self || parsed.role !== "member";})) ready = false;
+        }
+        return { url:p.url(), expectedUrl:this.url(), body:await p.locator("body").innerText(), ready };
+      },
+      pause: ms => p.waitForTimeout(ms), timeoutMs:25_000,
+    });
+    await this.guard();
+    return {expectedTotal, expectedTab};
   }
   async capacity() {
     const p = await this.open(), label = `${this.config.seatLabel}席位`;
-    const texts = await p.getByText(new RegExp(`^${escape(this.config.seatLabel)}(?:席位| seats)$`, "i")).evaluateAll(nodes => nodes.map(node => {
-      let el = node;
-      for (let i = 0; i < 5 && el; i++, el = el.parentElement) {
-        if (el.querySelector("dl") && /已分配|Assigned/i.test(el.innerText) && /可用|Available/i.test(el.innerText)) return el.innerText;
-      }
-      return "";
-    }));
-    const candidates = [...new Set(texts.filter(Boolean))];
-    if (candidates.length !== 1) throw new Error(`无法唯一确定${label}容量卡。`);
+    let candidates = [];
+    await waitForOfficialPage({
+      inspect: async () => {
+        candidates = await p.getByText(new RegExp(`^${escape(this.config.seatLabel)}(?:席位| seats)$`, "i"))
+          .filter({ visible:true }).evaluateAll(nodes => {
+            const cards = new Set();
+            for (const node of nodes) {
+              for (let i = 0, el = node; i < 5 && el; i++, el = el.parentElement) {
+                if (el.querySelector("dl") && /已分配|Assigned/i.test(el.innerText) && /可用|Available/i.test(el.innerText)) {
+                  cards.add(el); break;
+                }
+              }
+            }
+            return [...cards].map(card => card.innerText);
+          });
+        if (candidates.length > 1) throw new Error(`无法唯一确定${label}容量卡。`);
+        const text = candidates[0] ?? "";
+        const total = new RegExp(`(?:^|\\n)\\s*\\d+\\s*(?:\\n|\\s)+${escape(this.config.seatLabel)}(?:席位|\\s+seats)|${escape(this.config.seatLabel)}(?:席位|\\s+seats)\\s*\\d+`, "i");
+        const ready = candidates.length === 1 && total.test(text) &&
+          /(?:已分配|Assigned)\s*\d+/i.test(text) && /(?:可用|Available)\s*\d+/i.test(text);
+        return { url:p.url(), expectedUrl:this.url(), body:await p.locator("body").innerText(), ready };
+      },
+      pause: ms => p.waitForTimeout(ms), timeoutMs:25_000,
+    });
+    await this.guard();
     return parseCapacity(candidates[0], this.config.seatLabel);
   }
-  async rows() {
+  async rows({requireOwner = false} = {}) {
     const p = await this.open(), result = [], fingerprints = new Set();
+    let expectedTotal = null;
     for (let index = 0; index < 100; index++) {
       await this.guard();
+      const evidence = await this.waitForRows({requireOwner,
+        ownerSeen:result.some(row => row.email === this.config.adminEmail && row.role === "owner" && row.self)});
+      if (evidence.expectedTotal !== null) {
+        if (expectedTotal !== null && expectedTotal !== evidence.expectedTotal)
+          throw new OfficialPageError("读取期间成员或邀请总数发生变化，未采纳不完整名单。", "browser_unavailable");
+        expectedTotal = evidence.expectedTotal;
+      }
       const table = await only(p.getByRole("table"), "成员或邀请表");
       const records = await table.getByRole("row").all();
       const pageRows = [];
       for (const row of records) {
         const cells = await row.getByRole("cell").allInnerTexts();
-        if (!cells.length || !cells.join(" ").includes("@")) continue; // Column header, never a user.
+        if (!cells.length) continue; // Column headers have no data cells.
+        if (!cells.join(" ").includes("@")) {
+          if (ui.empty.test(cells.join(" ").trim())) continue;
+          throw new Error("成员数据行尚未完整加载或无法确定邮箱，未采纳部分名单。");
+        }
         pageRows.push(parseRow(cells, this.config.seatLabel));
       }
       if (!pageRows.length) {
-        const empty = p.getByText(/^(无结果|未找到成员|没有待处理的邀请|No results|No pending invitations|No members found)[。.]*$/i);
+        const empty = p.getByText(ui.empty);
         if (!await empty.filter({ visible: true }).count()) throw new Error("空列表没有可信的加载完成状态。");
       }
       const fingerprint = JSON.stringify(pageRows);
@@ -137,7 +252,11 @@ export class BrowserAdapter {
       fingerprints.add(fingerprint); result.push(...pageRows);
       const next = p.getByRole("button", { name: ui.next }).filter({ visible: true });
       if (await next.count() > 1) throw new Error("分页控件不唯一。");
-      if (!await next.count() || !await next.isEnabled() || await next.getAttribute("aria-disabled") === "true") return result;
+      if (!await next.count() || !await next.isEnabled() || await next.getAttribute("aria-disabled") === "true") {
+        if (expectedTotal !== null && result.length !== expectedTotal)
+          throw new OfficialPageError("完整列表与标签页显示总数不一致，未采纳不完整名单。", "browser_unavailable");
+        return result;
+      }
       const oldText = await table.innerText();
       await next.click();
       // Bounded wait for the visible table to change; never an unbounded polling loop.
@@ -149,7 +268,7 @@ export class BrowserAdapter {
   }
   async snapshot() {
     await this.load("members");
-    const capacity = await this.capacity(), members = await this.rows();
+    const capacity = await this.capacity(), members = await this.rows({requireOwner:true});
     const me = members.filter(p => p.self);
     if (me.length !== 1 || me[0].email !== this.config.adminEmail || me[0].role !== "owner")
       throw new Error("页面中的当前账号不是指定 Owner。");
@@ -169,12 +288,16 @@ export class BrowserAdapter {
     };
   }
   async observe() {
-    const a = await this.snapshot(), b = await this.snapshot();
+    // Validate each reading before comparing. A normal join can change two safe
+    // snapshots; wrong identity, workspace or purchased capacity must still stop.
+    const a = validateObservation(await this.snapshot(), this.config);
+    const b = validateObservation(await this.snapshot(), this.config);
     const canonical = s => JSON.stringify({ totalSeats: s.totalSeats,
       members: s.members.slice().sort((x, y) => x.email.localeCompare(y.email)),
       invites: s.invites.slice().sort((x, y) => x.email.localeCompare(y.email)) });
-    if (canonical(a) !== canonical(b)) throw new Error("两次完整快照不一致，等待管理员核对，未执行写入。");
-    return validateObservation(b, this.config);
+    if (canonical(a) !== canonical(b))
+      throw new OfficialPageError("两次完整快照发生变化，未采纳不稳定名单，稍后只读复核。", "browser_unavailable");
+    return b;
   }
   permit(email, before) {
     if (!this.config.liveActions && !this.fixtureOrigin) throw new Error("LIVE_ACTIONS 未开启。");
@@ -190,25 +313,38 @@ export class BrowserAdapter {
     const current = await this.capacity();
     if (current.total !== this.config.totalSeats || current.available < 1) throw new Error("没有已购可用席位。");
     await (await only(p.getByRole("button", { name: ui.invite }), "邀请成员按钮")).click();
-    const dialog = await only(p.getByRole("dialog"), "邀请对话框");
-    if (!(await dialog.innerText()).includes(this.config.workspaceName)) throw new Error("邀请工作空间不匹配。");
+    // Seat pickers also use role=dialog and remain visible during close animation.
+    // Bind the invitation surface to its email field, not every dialog on the page.
+    const dialog = await readyOnly(p.getByRole("dialog").filter({
+      has: p.getByRole("textbox", { name: /电子邮箱|Email/i }) }), "邀请对话框");
+    const invitationText = await dialog.innerText();
+    // Current console uses the generic title "邀请团队成员". In that variant,
+    // the exact URL and global workspace selector provide workspace identity.
+    if (!invitationText.includes(this.config.workspaceName) &&
+        invitationText.split(/\r?\n/)[0].trim() !== "邀请团队成员") throw new Error("邀请工作空间不匹配。");
+    await this.guard();
     await (await only(dialog.getByRole("textbox", { name: /电子邮箱|Email/i }), "邀请邮箱")).fill(email);
     // Select the already-paid configured pool. Never change an existing member's seat.
-    const seats = dialog.getByRole("combobox", { name: /席位类型|Seat type/i });
+    const seats = dialog.getByRole("combobox", { name: /席位类型|Seat type/i })
+      .or(dialog.getByRole("button", { name: /席位类型|Seat type/i }));
     const seat = await only(seats, "席位类型选择器");
     if (!(await seat.innerText()).includes(this.config.seatLabel)) {
       await seat.click();
-      await (await only(p.getByRole("option", { name: new RegExp(`^${escape(this.config.seatLabel)}(?:\\s|$)`) }), "已购席位类型")).click();
+      await (await readyOnly(p.getByRole("option", { name: new RegExp(`^${escape(this.config.seatLabel)}(?:\\s|$)`) }), "已购席位类型")).click();
     }
-    const role = dialog.getByRole("combobox", { name: /角色|Role/i });
-    if (!/成员|Member/i.test(await (await only(role, "邀请角色")).innerText())) throw new Error("只允许邀请普通成员。");
+    const role = dialog.getByRole("combobox", { name: /角色|Role/i })
+      .or(dialog.getByRole("button", { name: /^(?:角色(?:类型)?|Role(?: type)?)(?:\s|$)/i }));
+    const roleText = (await (await only(role, "邀请角色")).innerText()).replace(/角色类型|角色|Role type|Role/gi, "").trim();
+    if (!/^(成员|Member)$/i.test(roleText)) throw new Error("只允许邀请普通成员。");
+    if ((await seat.innerText()).replace(/席位类型|Seat type/gi, "").trim() !== this.config.seatLabel)
+      throw new Error("最终席位类型未确认是已购席位，禁止发送。");
     const text = await dialog.innerText();
     if (/需要增加|需要购买|额外费用|add \d+ seats?|additional charge|purchase|buy seats/i.test(text))
       throw new Error("邀请将引起加购或费用变化，禁止继续。");
     if ((await dialog.getByRole("textbox", { name: /电子邮箱|Email/i }).inputValue()).trim().toLowerCase() !== email)
       throw new Error("邀请邮箱发生变化。");
     await this.guard();
-    this.onExternalAction("invite", email);
+    await this.onExternalAction("invite", email);
     await (await only(dialog.getByRole("button", { name: ui.send }), "发送邀请按钮")).click();
     // Capture the completed click before waiting for the dialog to disappear.
     // The UI exposes no authoritative server send timestamp.
@@ -220,6 +356,7 @@ export class BrowserAdapter {
   async locateRow(email) {
     const p = this.page;
     for (let i = 0; i < 100; i++) {
+      await this.waitForRows();
       const table = await only(p.getByRole("table"), "成员表");
       // DOM textContent does not preserve visual cell boundaries; parseRow below checks exact identity.
       const rows = table.getByRole("row").filter({ hasText: new RegExp(escape(email), "i") });
@@ -243,12 +380,14 @@ export class BrowserAdapter {
     // Some UI variants apply invite revocation directly from the menu. Mark the
     // outcome as potentially external before that click so an unexpected UI
     // transition cannot be recorded as an operation that never started.
-    const menuAction = await only(p.getByRole("menuitem", {
+    const menuAction = await readyOnly(p.getByRole("menuitem", {
       name: original === "member" ? ui.removeMenu : ui.revoke,
     }), "成员移除或撤销邀请菜单");
-    this.onExternalAction("remove", email);
+    await this.onExternalAction("remove", email);
     await menuAction.click();
-    const dialog = await only(p.getByRole("dialog"), "移除确认对话框");
+    const confirmName = original === "member" ? ui.removeConfirm : ui.revoke;
+    const dialog = await readyOnly(p.getByRole("dialog").filter({
+      has: p.getByRole("button", { name: confirmName }) }), "移除确认对话框");
     const dialogText = await dialog.innerText();
     // The official dialog may show display name rather than email; retain exact row identity and workspace.
     if (!dialogText.includes(this.config.workspaceName)) throw new Error("移除确认的工作空间不匹配。");
@@ -266,7 +405,8 @@ export class BrowserAdapter {
       }, null, { timeout: 25_000 });
       if (await keep.filter({ visible: true }).count()) await (await only(keep, "保留付费席位")).click();
     }
-    await p.getByRole("dialog").filter({ visible: true }).waitFor({ state: "hidden", timeout: 20_000 });
+    await p.waitForFunction(() => ![...document.querySelectorAll('dialog,[role="dialog"]')]
+      .some(e => e.getClientRects().length), null, { timeout: 20_000 });
   }
   async close() { if (this.context) await this.context.close(); this.context = null; this.page = null; }
 }
