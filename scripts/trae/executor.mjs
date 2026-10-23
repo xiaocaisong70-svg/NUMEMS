@@ -8,6 +8,8 @@ import { assertLegacyInactive } from "./legacy-guard.mjs";
 import { officialTools } from "./official-members.mjs";
 
 const MAX_ITEMS = 3;
+const EDGE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0";
 const statusPath = path.join(runtimeDir, "executor-status.json");
 
 const clean = ({ detail: _detail, ...rest }) => rest;
@@ -50,9 +52,11 @@ try {
     headless: config.headless,
     viewport: { width: 1440, height: 960 },
     locale: "zh-CN",
+    // 无头模式下换成真实 Edge UA，并去除自动化特征，避免被 Cloudflare 判定为机器人。
+    ...(config.headless ? { userAgent: EDGE_USER_AGENT } : {}),
     args: ["--no-first-run", "--no-default-browser-check", "--disable-gpu", "--no-sandbox",
-      // 窗口创建到屏幕外，避免无人值守运行时遮住正在使用电脑的人。
-      "--window-position=-32000,-32000"],
+      "--disable-blink-features=AutomationControlled",
+      ...(config.headless ? [] : ["--window-position=-32000,-32000"])],
   });
   const portal = context.pages()[0] ?? (await context.newPage());
   portal.setDefaultTimeout(20_000);
