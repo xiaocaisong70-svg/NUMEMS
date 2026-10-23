@@ -22,17 +22,38 @@ async function save(data) {
 const config = await loadConfig();
 await assertLegacyInactive(config);
 
-const context = await chromium.launchPersistentContext(config.profile, {
-  channel: config.browserChannel || undefined,
-  headless: config.headless,
-  viewport: { width: 1440, height: 960 },
-  locale: "zh-CN",
-  args: ["--no-first-run", "--no-default-browser-check"],
-});
+// 空闲时先不启动浏览器：用裸请求问门户有没有待办，避免每 5 分钟弹窗打扰。
+async function hasPendingWork() {
+  try {
+    const response = await fetch(new URL("/api/executor-hint", config.siteUrl), { cache: "no-store" });
+    if (!response.ok) return true;
+    const body = await response.json();
+    return Number(body?.pending ?? 0) > 0;
+  } catch {
+    // 探测失败时按「有待办」处理：宁可多跑一轮，也不漏办申请。
+    return true;
+  }
+}
+
+if (!(await hasPendingWork())) {
+  await save({ checkedAt: new Date().toISOString(), mode: "deterministic_executor",
+    state: "idle", skipped: "no_pending_work", actions: [] });
+  process.exit(0);
+}
 
 let exitCode = 0;
 const actions = [];
+let context;
 try {
+  context = await chromium.launchPersistentContext(config.profile, {
+    channel: config.browserChannel || undefined,
+    headless: config.headless,
+    viewport: { width: 1440, height: 960 },
+    locale: "zh-CN",
+    args: ["--no-first-run", "--no-default-browser-check", "--disable-gpu", "--no-sandbox",
+      // 窗口创建到屏幕外，避免无人值守运行时遮住正在使用电脑的人。
+      "--window-position=-32000,-32000"],
+  });
   const portal = context.pages()[0] ?? (await context.newPage());
   portal.setDefaultTimeout(20_000);
   await portal.goto(config.siteUrl, { waitUntil: "domcontentloaded", timeout: 45_000 });
@@ -42,7 +63,7 @@ try {
   });
   if (identity.status !== 200 || identity.body?.access !== "allowed" ||
       identity.body?.user?.email?.toLowerCase() !== ADMIN_EMAIL)
-    throw new Error("管理员身份校验失败，已停止本轮。");
+    throw new Error(`管理员身份校验失败，已停止本轮。status=${identity.status} access=${identity.body?.access ?? "unknown"} user=${identity.body?.user?.email ?? "none"}`);
 
   const call = async (name, args = {}) => {
     const result = await portal.evaluate(async ({ name, args }) => {
@@ -163,6 +184,6 @@ try {
   console.error(`确定性执行器：${error.message}`);
   exitCode = 1;
 } finally {
-  await context.close();
+  await context?.close();
 }
 process.exit(exitCode);
