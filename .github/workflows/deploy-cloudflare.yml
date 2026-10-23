@@ -1,8 +1,8 @@
 name: Deploy Cloudflare
 
+# 仅保留手动触发：本项目的线上部署由本地 npm run deploy:cloudflare 完成，
+# 仓库未配置 Cloudflare 密钥，push 自动运行只会失败。
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
