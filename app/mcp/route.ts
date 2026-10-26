@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { currentActor, readState, mutateState, schedulerActor } from "@/lib/portal-service";
-import { runJobs } from "@/lib/jobs";
+import { runJobs, refreshSeatQueue } from "@/lib/jobs";
 import { observeWorkspace, prepareTest, workPlan, claimOperation, completeOperation, deferOperation, reviewFailure, FAILURE_CODES, setBridgeMode,
   setTestDeadline, recordSchedule, type BridgeState, type Observation } from "@/lib/codex-bridge";
 import { transition } from "@/lib/seat-engine";
@@ -55,6 +55,12 @@ const tools = [
   {
     name: "process_seat_queue",
     description: "处理小时制排队、到期与30分钟提醒，返回Codex待办。实际邀请/移除由授权浏览器执行后回执。",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  },
+  {
+    name: "refresh_seat_queue",
+    description: "仅同步小时制队列、到期、网页提醒及后台心跳；不会发邮件或改变官方成员。可由普通程序在传输超时后安全重新核对。仅管理员可用。",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
   },
@@ -124,7 +130,14 @@ export async function POST(request: Request) {
     } else if (body.method === "tools/call") {
       const actor = await currentActor();
       if (!actor?.isAdmin) throw new Error("只有已登录的门户管理员可以运行此工具。");
-      if (body.params?.name === "process_seat_queue") {
+      if (body.params?.name === "refresh_seat_queue") {
+        const args = body.params?.arguments === undefined ? {} : body.params.arguments;
+        if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).length)
+          throw new Error("队列刷新不接受参数。");
+        const jobs = await refreshSeatQueue();
+        result = { content: [{ type: "text", text: JSON.stringify({ ...jobs,
+          plan: workPlan((await readState()).state as BridgeState, new Date().toISOString()) }) }] };
+      } else if (body.params?.name === "process_seat_queue") {
         const jobs = await runJobs();
         result = { content: [{ type: "text", text: JSON.stringify({ ...jobs,
           plan: workPlan((await readState()).state as BridgeState, new Date().toISOString()) }) }] };

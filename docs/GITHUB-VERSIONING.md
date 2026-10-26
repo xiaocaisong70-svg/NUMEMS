@@ -4,6 +4,7 @@
 
 - `main`：仓库已有的 TRAE 版本，本次不修改。
 - `agentless`：无 Agent 新站的维护分支。
+- `agentless-v6`：当前第六版，来源 `4f3a325fcde294aa8956a49108911510b0734e1f`，含已部署的纯队列刷新接口与本机网络恢复。
 - `agentless-v5`：本次经过整理的第 5 版固定标签。以后不覆盖、不强制移动该标签。
 - `agentless-v5-watchdog-20261025`：第 5 版本机执行器恢复修复，来源 `d6013c85ec821abfd83c5890c3a0e0f61833ab7a`。不改变 Sites 发布版本；恢复修复版请检出此标签。
 - 后续修改从 `agentless` 新建功能分支；检查通过后合入，增加新的版本说明、清单和标签，例如 `agentless-v6`。
@@ -60,3 +61,19 @@ npm run build
 当前执行器停机及证据保留步骤见 [修复说明](WATCHDOG-RECOVERY-20261025.md)。在独立目录检出 `agentless-v5` 可获得修复前代码和旧校验工具；固定标签内容保持不变。恢复修复版则将克隆命令的标签改为 `agentless-v5-watchdog-20261025`，再运行 `node scripts/verify-release.mjs`。
 
 源码标签不含这台电脑的计划任务 XML、浏览器会话或生产状态。回退时，须在执行器结束且完成对账后，用本机升级前导出的 XML 恢复原任务，防止看门狗动作仍指向旧代码。恢复原版仅登录启动的策略后，原有自动恢复不足也会重新存在。无需因本次本机脚本修复而回退云端网页或 D1 数据库。
+
+## 第六版的恢复与回退
+
+恢复当前版时在新目录执行：
+
+```powershell
+git clone --branch agentless-v6 https://github.com/xiaocaisong70-svg/NUMEMS.git NUMEMS-agentless-v6-restore
+cd NUMEMS-agentless-v6-restore
+node scripts/verify-release.mjs
+```
+
+初始化和启用仍遵循当前安装说明，不直接接管正在运行的生产实例。第六版本机程序依赖云端 `refresh_seat_queue`；必须先发布该接口，再启动对应本机版本。GitHub 推送不会自动发布或更改 Windows 任务。
+
+回退目标可选 `agentless-v5-watchdog-20261025`。先正常停机、核对当前租约和官方状态，保留生产配置/日志/数据库，再恢复旧本机源码；如需回退云端，可选 Sites 第 5 版。第六版保留旧 RPC，旧本机代码可兼容它；新本机程序不能在没有新接口的第五版云端上运行。不要把接口缺失当成临时网络错误或回退到可能投递邮件的轮询路径。
+
+第六版 Sites 版本：`appgprj_6adace8f4e7481919901f886e4a0a2f2~appgver_331f1c9c45388191b3c2e6debbf1f01a`；成功部署：`appgdep_6adf1d38180481918e40d80d265b4ebd`。验证恢复成功需新目录清单通过、259 项规则回归/类型检查/生产构建通过、权限及唯一执行器检查通过；浏览器夹具验证限制见版本说明。源码回退仍不撤销已发生的外部操作。

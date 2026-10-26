@@ -8,6 +8,7 @@ import { assertExclusive } from './guard.mjs';
 import { notifyFailure } from './alert.mjs';
 import { recoverBrowser } from './recovery.mjs';
 import { GracefulStopControl,runGracefulBatch } from './graceful-stop.mjs';
+import {recoverPortal,recoverablePortalError} from './portal-recovery.mjs';
 
 export async function main(args=process.argv.slice(2)) {
   const config=await loadConfig();
@@ -45,8 +46,22 @@ export async function main(args=process.argv.slice(2)) {
       if(await shouldStop())break;
       await assertExclusive(config);
       const batch=await runGracefulBatch(async()=>{
-        try {return await runBatch({portal,browser,config,journal});}
+        try {
+          const result=await runBatch({portal,browser,config,journal});
+          if(config.liveActions && !registered && ['idle','processed'].includes(result.mode) && !await shouldStop()) {
+            const p=(await portal.call('seat_portal_status')).plan;
+            if(p.enabled && !p.testOnly) {
+              await browser.observe();
+              await portal.call('record_codex_schedule',{scheduleId:`local:seat-executor:${TASK_NAME}`});
+              registered=true;
+            }
+          }
+          return result;
+        }
         catch(error) {
+          if(recoverablePortalError(error))return recoverPortal({error,portal,browser,config,
+            journalFile:path.join(runtimeDir,'operation.json'),shouldStop,
+            saveStatus:value=>atomicJson(path.join(runtimeDir,'status.json'),value)});
           if(error.failureCode!=='browser_unavailable' || !await recoverBrowser({portal,browser,
             journalFile:path.join(runtimeDir,'operation.json')})) throw error;
           return {mode:'browser_recovered',modelCalls:0};
@@ -54,15 +69,6 @@ export async function main(args=process.argv.slice(2)) {
       },shouldStop);
       if(!batch.ran)break;
       const result=batch.result;lastResult=result;
-      if(!batch.stopped && config.liveActions && !registered && ['idle','processed'].includes(result.mode)) {
-        // Test-only mode cannot register a production scheduler.
-        const p=(await portal.call('seat_portal_status')).plan;
-        if(p.enabled && !p.testOnly) {
-          await browser.observe();
-          await portal.call('record_codex_schedule',{scheduleId:`local:seat-executor:${TASK_NAME}`});
-          registered=true;
-        }
-      }
       await atomicJson(path.join(runtimeDir,'status.json'),{checkedAt:new Date().toISOString(),...result,
         liveActions:config.liveActions,ignoredStaleStopRequest:control.ignoredStaleRequest});
       if(result.mailChannelError || result.actions?.some(a=>a.outcome==='isolated'))
@@ -74,7 +80,8 @@ export async function main(args=process.argv.slice(2)) {
   } catch(error) {
     failed=true;
     await atomicJson(path.join(runtimeDir,'status.json'),{checkedAt:new Date().toISOString(),state:'blocked',
-      modelCalls:0,liveActions:config.liveActions,error:error.message,failureCode:error.failureCode || 'unknown'});
+      modelCalls:0,liveActions:config.liveActions,error:error.message,failureCode:error.failureCode || 'unknown',
+      ...(recoverablePortalError(error)?{readFailure:error.metadata}:{})});
     if(config.liveActions) await notifyFailure(path.join(runtimeDir,'alert.json'),{code:error.failureCode || 'unknown'});
     throw error;
   } finally {
@@ -89,7 +96,8 @@ export async function main(args=process.argv.slice(2)) {
 if(process.argv[1] && path.resolve(process.argv[1])===import.meta.filename)
   main().catch(async e=>{
     await atomicJson(path.join(runtimeDir,'status.json'),{checkedAt:new Date().toISOString(),state:'blocked',
-      modelCalls:0,error:e.message,failureCode:e.failureCode||'unknown'}).catch(()=>{});
+      modelCalls:0,error:e.message,failureCode:e.failureCode||'unknown',
+      ...(recoverablePortalError(e)?{readFailure:e.metadata}:{})}).catch(()=>{});
     // Also record setup/lock/conflict failures that happened before the browser opened.
     try {if((await loadConfig()).liveActions) await notifyFailure(path.join(runtimeDir,'alert.json'),{code:e.failureCode||'unknown'});} catch {}
     console.error(e.message);process.exitCode=1;

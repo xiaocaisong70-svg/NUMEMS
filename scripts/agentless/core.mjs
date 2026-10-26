@@ -1,5 +1,6 @@
 import { acceptanceDue } from '../seat-executor/core.mjs';
 import { bridgeObservation, presence, assertOrdinary } from '../seat-executor/inventory.mjs';
+import {recoverablePortalError} from './portal-recovery.mjs';
 
 const planOf = value => value.plan ?? value;
 const isolated = new Set(['member_action', 'approval_required', 'mail_delivery']);
@@ -36,7 +37,10 @@ export async function runBatch({ portal, browser, config, journal,
   const actions = [], seen = new Set();
   let jobs;
   for (let index = 0; index < maxItems; index++) {
-    jobs = await portal.call('process_seat_queue'); // Deterministic queue; no Agent/model path.
+    // Production uses the endpoint whose contract excludes mail and all external
+    // actions. Legacy/mock adapters retain their existing queue interface.
+    jobs = typeof portal.refreshQueue==='function' ? await portal.refreshQueue()
+      : await portal.call('process_seat_queue');
     if (!['in_app', 'relay'].includes(jobs.mailMode) || jobs.mailMode !== config.mailMode)
       throw new StopError('本机与云端提醒模式不一致，停止执行。');
     plan = planOf(await portal.call('seat_portal_status'));
@@ -55,6 +59,9 @@ export async function runBatch({ portal, browser, config, journal,
       before = await browser.observe();
       await portal.call('observe_workspace', {observation:bridgeObservation(before)});
     } catch (error) {
+      // The identity GET failed BEFORE observe_workspace was sent. Do not mark
+      // an untouched target unknown; main still requires a settled journal.
+      if(recoverablePortalError(error) && error.metadata.requestNotSent===true)throw error;
       await portal.call('defer_seat_operation', {kind:kind === 'acceptance' ? 'invite' : kind,
         targetId:item.id, failureCode:safeCode(error), detail:'官方完整名单核对失败；未开始成员写入。'});
       throw error;
@@ -66,7 +73,18 @@ export async function runBatch({ portal, browser, config, journal,
       .find(r => r.id === item.id && r.email === item.email && !held(plan,kind,r));
     if (!current) { actions.push({kind,targetId:item.id,outcome:'state_changed'}); continue; }
     await journal?.prepare({kind,targetId:item.id,email:item.email});
-    const lease = planOf(await portal.call('claim_seat_operation', {kind,targetId:item.id})).lease;
+    let claimed;
+    try {claimed=await portal.call('claim_seat_operation', {kind,targetId:item.id});}
+    catch(error) {
+      if(recoverablePortalError(error) && error.metadata.stage==='identity' &&
+        error.metadata.requestedOperation==='claim_seat_operation' && error.metadata.requestNotSent===true) {
+        // Identity check failed before the claim POST existed. Preserve that
+        // proof, not a fictitious lease; no sent/uncertain claim may use this path.
+        await journal?.settleUnsentClaim({kind,targetId:item.id,email:item.email},error.metadata);
+      }
+      throw error;
+    }
+    const lease = planOf(claimed).lease;
     if (!lease || lease.kind !== kind || lease.targetId !== item.id || lease.email !== item.email ||
         !lease.token || !lease.id) throw new StopError('领取结果与目标不符，禁止外部操作。');
     await journal?.claimed(lease);

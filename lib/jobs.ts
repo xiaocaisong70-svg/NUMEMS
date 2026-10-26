@@ -5,7 +5,9 @@ import type { BridgeState } from "./codex-bridge";
 import { deliverReminders, validateRelay } from "./reminder-relay";
 import { applyReminderPolicy, reminderMode } from "./reminder-policy";
 
-export async function runJobs() {
+// A pure, atomic queue transform and heartbeat. This helper never delivers
+// reminders, contacts a provider, or performs an official member operation.
+async function runQueueTick() {
   const now = new Date().toISOString();
   const mode = reminderMode(env.REMINDER_DELIVERY_MODE);
   await mutateState(current => {
@@ -15,6 +17,29 @@ export async function runJobs() {
     next.runtime = { ...next.runtime, lastTickAt: now };
     return next;
   });
+  return { now, mode };
+}
+
+function queueSummary(state: BridgeState, now: string, mode: ReturnType<typeof reminderMode>) {
+  return {
+    lastTickAt: now,
+    queued: state.requests.filter(r => r.status === "queued").length,
+    pendingInvites: state.requests.filter(r => r.status === "pending_invite").length,
+    pendingRemovals: state.requests.filter(r => r.status === "pending_removal").length,
+    pendingNotices: state.notices.filter(n => n.status === "pending").length,
+    emailConfigured: Boolean(state.codex?.mailVerifiedAt),
+    mailMode: mode,
+  };
+}
+
+/** Safe synchronization endpoint: even relay mode cannot send an email here. */
+export async function refreshSeatQueue() {
+  const { now, mode } = await runQueueTick();
+  return queueSummary((await readState()).state as BridgeState, now, mode);
+}
+
+export async function runJobs() {
+  const { now, mode } = await runQueueTick();
   // Configuration faults affect only the mail channel; never suppress expiry work.
   if (mode === "relay") {
     const config = { url: env.REMINDER_WEBHOOK_URL ?? "", token: env.REMINDER_WEBHOOK_TOKEN ?? "",
@@ -32,14 +57,5 @@ export async function runJobs() {
       mutate: change => mutateState(s => change(s as BridgeState)),
     }, config);
   }
-  const state = (await readState()).state as BridgeState;
-  return {
-    lastTickAt: now,
-    queued: state.requests.filter(r => r.status === "queued").length,
-    pendingInvites: state.requests.filter(r => r.status === "pending_invite").length,
-    pendingRemovals: state.requests.filter(r => r.status === "pending_removal").length,
-    pendingNotices: state.notices.filter(n => n.status === "pending").length,
-    emailConfigured: Boolean(state.codex?.mailVerifiedAt),
-    mailMode: mode,
-  };
+  return queueSummary((await readState()).state as BridgeState, now, mode);
 }

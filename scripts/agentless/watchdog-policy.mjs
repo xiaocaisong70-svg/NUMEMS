@@ -3,6 +3,7 @@
 // then recheck that proof under the native project mutex. The caller must also
 // prove exclusive ownership, desktop isolation and the current cloud plan.
 // Never clears a lock, settles a journal, resumes a lease or launches a browser.
+import {validPortalFailure} from './portal-recovery.mjs';
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value) &&
   (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
 const present = value => value !== undefined && value !== null;
@@ -61,8 +62,8 @@ export function restartDecision(input={}) {
   }
   if(status) {
     if(!stamp(status.checkedAt) || Date.parse(status.checkedAt)>current ||
-      (present(status.state) && !['blocked','stopped'].includes(status.state)) ||
-      (present(status.mode) && !['idle','processed','browser_recovered','disabled','dry_run'].includes(status.mode)) ||
+      (present(status.state) && !['blocked','stopped','recovering'].includes(status.state)) ||
+      (present(status.mode) && !['idle','processed','browser_recovered','disabled','dry_run','portal_recovery'].includes(status.mode)) ||
       (!present(status.state) && !present(status.mode)) ||
       (present(status.failureCode) && (typeof status.failureCode!=='string' || !status.failureCode.trim())) ||
       (present(status.error) && (typeof status.error!=='string' || !status.error.trim())) ||
@@ -82,6 +83,13 @@ export function restartDecision(input={}) {
   }
 
   if(status?.state==='stopped' || ['disabled','dry_run'].includes(status?.mode))return deny('explicit_stop_or_disabled');
+  if(['portal_read_unavailable','portal_queue_unavailable'].includes(status?.failureCode)) {
+    if(!validPortalFailure(status.failureCode,status.readFailure))return deny('invalid_portal_recovery_evidence');
+    if(journal?.phase!=='settled')return deny('portal_recovery_requires_settled_journal');
+    if(host?.mode!=='run' || !['blocked','running'].includes(host.state) || host.error || !isolatedAudit(host))
+      return deny('portal_recovery_host_unverified');
+    return allow('safe_portal_health_recovery_candidate');
+  }
   // A recent successful administrator-run probe/once can seed the first supervised
   // session after repair. The caller still enforces installation authorization,
   // process liveness and fresh cloud-plan gates; normal run exits never qualify.

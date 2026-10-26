@@ -25,6 +25,16 @@ export class Journal {
   async update(patch) {await atomicJson(this.file,{...await readJson(this.file),...patch,updatedAt:new Date().toISOString()});}
   async prepare(target) {await atomicJson(this.file,{phase:'claiming',target,createdAt:new Date().toISOString()});}
   async claimed(lease) {await this.update({phase:'claimed',lease});}
+  async settleUnsentClaim(target,proof) {
+    const j=await readJson(this.file);
+    if(j?.phase!=='claiming' || j.lease!=null || j.receipt!=null ||
+      !target || !['invite','remove'].includes(target.kind) ||
+      ['kind','targetId','email'].some(key=>j.target?.[key]!==target[key]) ||
+      proof?.stage!=='identity' || proof.requestedOperation!=='claim_seat_operation' ||
+      proof.requestNotSent!==true || proof.readOnly!==true || !['timeout','network'].includes(proof.reason))
+      throw new Error('Cannot settle a claim unless the matching RPC was proven not sent.');
+    await this.update({phase:'settled',claimNotSent:{proof,target,at:new Date().toISOString()}});
+  }
   async attempting() {await this.update({phase:'attempting'});}
   async evidence(receipt) {await this.update({phase:'completing',receipt});}
   async settled() {await this.update({phase:'settled',lease:undefined,receipt:undefined});}
