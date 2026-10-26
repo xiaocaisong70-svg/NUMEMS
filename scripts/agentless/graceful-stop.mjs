@@ -22,14 +22,20 @@ function request(value) {
 /** A request targets one exact lock incarnation. Startup never unlinks a stop file:
  * deleting a stale file could erase a new concurrent request. Old targets are ignored. */
 export class GracefulStopControl {
-  constructor(directory,lock) {
+  constructor(directory,lock,{watchdogStartedAt=null}={}) {
     this.file=path.join(directory,STOP_FILE);this.target=identity(lock);
+    if(watchdogStartedAt!==null && (typeof watchdogStartedAt!=='string' || !Number.isFinite(Date.parse(watchdogStartedAt))))
+      throw new Error('Watchdog startup timestamp invalid; stopped.');
+    this.watchdogStartedAt=watchdogStartedAt;
     this.ignoredStaleRequest=false;this.requestId=null;
   }
   async requested() {
     const value=await readJson(this.file);
     if(!value)return false;
     const stop=request(value);
+    if(this.watchdogStartedAt && Date.parse(stop.requestedAt)>=Date.parse(this.watchdogStartedAt)) {
+      this.requestId=stop.id;return true;
+    }
     if(!same(stop.target,this.target)){this.ignoredStaleRequest=true;return false;}
     this.requestId=stop.id;return true;
   }

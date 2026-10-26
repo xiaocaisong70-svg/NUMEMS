@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$NodeExe)
+param([Parameter(Mandatory=$true)][string]$NodeExe, [switch]$UpgradeWatchdog)
 $ErrorActionPreference='Stop'
 
 # PowerShell 7.5+ otherwise converts ISO JSON strings into DateTime values.
@@ -88,7 +88,8 @@ $config=Read-JsonStringDates -Path (Join-Path $runtimePath 'config.json')
 $probe=Read-JsonStringDates -Path (Join-Path $runtimePath 'isolated-probe.json')
 $hostReport=Read-JsonStringDates -Path (Join-Path $runtimePath 'host-desktop.json')
 Assert-IsolatedProbe -Config $config -Probe $probe -HostReport $hostReport
-$others=@(Get-ScheduledTask | Where-Object {$_.TaskName -like 'NUMEMS*' -and $_.State -ne 'Disabled'})
+$others=@(Get-ScheduledTask | Where-Object {$_.TaskName -like 'NUMEMS*' -and $_.State -ne 'Disabled' -and
+  (-not $UpgradeWatchdog -or $_.TaskName -ne 'NUMEMS-Agentless')})
 if($others.Count){throw 'Another NUMEMS task is enabled. Review cutover first.'}
 $nodePath=[IO.Path]::GetFullPath($NodeExe)
 if(-not [IO.Path]::IsPathRooted($NodeExe) -or [IO.Path]::GetFileName($nodePath) -ine 'node.exe' -or
@@ -96,13 +97,36 @@ if(-not [IO.Path]::IsPathRooted($NodeExe) -or [IO.Path]::GetFileName($nodePath) 
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent().Name
 if($identity -match 'CodexSandbox'){throw 'Install as the actual Windows user.'}
 $taskName='NUMEMS-Agentless'
-if(Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue){throw 'Task already exists; not overwritten.'}
+$existingTask=Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if($existingTask -and -not $UpgradeWatchdog){throw 'Task already exists; not overwritten.'}
+if($UpgradeWatchdog) {
+  if(-not $existingTask -or $existingTask.State -ne 'Ready') { throw 'Upgrade requires the existing stopped/Ready task.' }
+  $expectedArgument='//B //NoLogo "'+(Join-Path $PSScriptRoot 'run-hidden.vbs')+'" "'+$nodePath+'"'
+  if(@($existingTask.Actions).Count -ne 1 -or
+      $existingTask.Actions[0].Execute -ine (Join-Path $env:SystemRoot 'System32\wscript.exe') -or
+      $existingTask.Actions[0].Arguments -cne $expectedArgument -or
+      $existingTask.Actions[0].WorkingDirectory -ine $projectPath -or
+      $existingTask.Principal.LogonType -ne 'Interactive') { throw 'Existing task identity/action mismatch; not overwritten.' }
+  $principalId=$existingTask.Principal.UserId
+  $principalSid = if ($principalId -match '^S-1-') {
+    ([Security.Principal.SecurityIdentifier]::new($principalId)).Value
+  } else {
+    ([Security.Principal.NTAccount]::new($principalId)).Translate([Security.Principal.SecurityIdentifier]).Value
+  }
+  if($principalSid -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) {
+    throw 'Existing task belongs to another user; not overwritten.'
+  }
+  if(Test-Path -LiteralPath (Join-Path $runtimePath 'worker.lock')) { throw 'Worker lock still present; finish/reconcile first.' }
+  $backupPath=Join-Path $runtimePath ('task-before-watchdog-'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff')+'.xml')
+  Export-ScheduledTask -TaskName $taskName | Set-Content -LiteralPath $backupPath -Encoding UTF8
+}
 $hostPath=Join-Path $env:SystemRoot 'System32\wscript.exe'
-$launcher=Join-Path $PSScriptRoot 'run-hidden.vbs'
+$launcher=Join-Path $PSScriptRoot 'watchdog-hidden.vbs'
 $action=New-ScheduledTaskAction -Execute $hostPath -Argument ('//B //NoLogo "'+$launcher+'" "'+$nodePath+'"') -WorkingDirectory $projectPath
-$trigger=New-ScheduledTaskTrigger -AtLogOn -User $identity
+$trigger=@((New-ScheduledTaskTrigger -AtLogOn -User $identity),
+  (New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval ([TimeSpan]::FromMinutes(1))))
 $principal=New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
-# Deliberately no automatic restart on an unknown member operation.
+# Periodic checks run the classifier, never restart an uncertain member action.
 $settings=New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'NUMEMS deterministic executor. No Agent calls.' | Out-Null
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'NUMEMS deterministic executor with guarded local watchdog. No Agent calls.' -Force:$UpgradeWatchdog | Out-Null
 Start-ScheduledTask -TaskName $taskName

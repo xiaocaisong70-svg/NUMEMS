@@ -2,10 +2,12 @@
 
 Developed by xcsong.
 
-这是新站 **Sites 第 5 版**的源码归档与后续维护分支。网页托管在 Sites，Windows 上的普通程序负责工作空间成员操作，日常办理不调用模型，也不唤醒 Codex。
+这是新站 **Sites 第 5 版及 2026-10-25 本机执行器恢复修复**的源码与维护分支。网页托管在 Sites，Windows 上的普通程序负责工作空间成员操作，日常办理不调用模型，也不唤醒 Codex。
 
 - [线上新站](https://numems-seat-portal-agentless.workspace-026021.chatgpt.site/)
-- 维护分支：`agentless`；固定版本：`agentless-v5`
+- 维护分支：`agentless`；当前固定版本：`agentless-v5-watchdog-20261025`；原第五版：`agentless-v5`
+- [当前修复版说明与校验清单](releases/agentless-v5-watchdog-20261025/README.md)
+- [回收中断原因、看门狗与升级/回退](docs/WATCHDOG-RECOVERY-20261025.md)
 - [第 5 版发布与验收说明](releases/agentless-v5/README.md)
 - [版本管理与回退指南](docs/GITHUB-VERSIONING.md)
 - [安装和运行配置](docs/AGENTLESS-IMPLEMENTATION.md)
@@ -39,9 +41,9 @@ node node_modules/typescript/bin/tsc --noEmit
 npm run build
 ```
 
-`verify-release.mjs` 用于核对第 5 版归档文件。修改代码后出现差异是预期行为；发布新版本时应保留旧清单并增加新版本记录。
+`verify-release.mjs` 默认核对当前修复版归档；也可显式指定版本名。旧版应先检出 `agentless-v5` 标签，再运行该标签自带的校验脚本。修改代码后出现差异是预期行为；新版本保留旧清单并增加新的版本记录。
 
-本轮已通过 228 项回归测试、TypeScript 检查和生产构建；真实收件人完成了邀请、加入、网页提醒、续期与测试到期后的实际移除。多人转派、提前释放和撤邀等其他分支的验证范围见验收说明。
+原第五版通过 228 项回归、TypeScript 和生产构建，并完成真实收件人闭环。当前恢复修复通过 **224 项规则及非浏览器回归**和其中 **42 项定向检查**（有重叠）；两名到期员工已真实回收，后续新申请邀请也有官方核实回执。两个离线浏览器夹具卡住后已停止，本次不宣称全量浏览器回归通过；未重新构建或发布 Sites 网页。具体范围见当前版本说明。
 
 ## 部署与运行
 
@@ -55,7 +57,9 @@ GitHub 保存源码和版本，**不会因推送而自动部署站点或启用�
 
 ## 版本与隐私
 
-此快照对应 Sites 源提交 `bee319c270dc845aa0748b7a8bfc26c8ab17696f`。GitHub 归档额外整理了说明、忽略规则和校验工具；业务源码、测试及依赖锁文件保持一致，逐文件差异可查 [manifest.json](releases/agentless-v5/manifest.json)。`package.json` 的 `1.0.0` 是包版本，不等同于 Sites 发布序号。
+原第五版快照对应 Sites 源提交 `bee319c270dc845aa0748b7a8bfc26c8ab17696f`，原始清单保存在 [manifest.json](releases/agentless-v5/manifest.json)。GitHub 归档额外整理了说明、忽略规则和校验工具。`package.json` 的 `1.0.0` 是包版本，不等同于 Sites 发布序号。
+
+当前本机修复来源提交为 `d6013c85ec821abfd83c5890c3a0e0f61833ab7a`，完整性以[修复版清单](releases/agentless-v5-watchdog-20261025/manifest.json)为准；线上网页仍是 Sites 第 5 版。看门狗每分钟检查本机状态，常驻任务健康时阻止重复启动。仅已证明未留下未完成操作的临时故障可恢复；登录、角色、容量或未知结果异常仍安全暂停。
 
 上传范围包括源码、依赖锁文件、数据库迁移、测试和说明。浏览器档案、密码、Cookie、令牌、生产数据库、运行配置和日志不在上传范围内。代码中保留必要的站点、工作空间和管理员/测试邮箱配置，这些是非秘密标识。
 

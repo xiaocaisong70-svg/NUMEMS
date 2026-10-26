@@ -1,12 +1,18 @@
-// Read-only verification of the fixed agentless-v5 export; no runtime or network calls.
+// Read-only release verification; no runtime or network calls.
 import {readFile, lstat} from 'node:fs/promises';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 
 const root = path.resolve(import.meta.dirname, '..');
-const manifest = JSON.parse(await readFile(path.join(root, 'releases/agentless-v5/manifest.json'), 'utf8'));
-if (manifest.schemaVersion !== 1 || manifest.release !== 'agentless-v5' ||
-    manifest.source?.commit !== 'bee319c270dc845aa0748b7a8bfc26c8ab17696f' || !Array.isArray(manifest.files)) {
+const releases = new Map([
+  ['agentless-v5','bee319c270dc845aa0748b7a8bfc26c8ab17696f'],
+  ['agentless-v5-watchdog-20261025','d6013c85ec821abfd83c5890c3a0e0f61833ab7a'],
+]);
+const requested=process.argv[2]??'agentless-v5-watchdog-20261025';
+if(process.argv.length>3 || !releases.has(requested))throw new Error('Unknown release; use a documented fixed release tag.');
+const manifest = JSON.parse(await readFile(path.join(root, `releases/${requested}/manifest.json`), 'utf8'));
+if (manifest.schemaVersion !== 1 || manifest.release !== requested ||
+    manifest.source?.commit !== releases.get(requested) || !Array.isArray(manifest.files) || !manifest.files.length) {
   throw new Error('Unsupported or invalid release manifest');
 }
 const failures = [];

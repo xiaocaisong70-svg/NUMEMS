@@ -2,7 +2,8 @@ param(
   [Parameter(Mandatory=$true)][string]$NodeExe,
   [ValidateSet('probe','once','run','admin')][string]$Mode = 'probe',
   [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace')][string]$AdminCommand,
-  [string]$RequestId
+  [string]$RequestId,
+  [switch]$RecoverSettledLock
 )
 $ErrorActionPreference = 'Stop'
 $projectPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
@@ -30,6 +31,63 @@ function Assert-DesktopAudit {
   $report.checkedAt = [DateTime]::UtcNow.ToString('o')
   if (-not $audit.isolated) { throw 'Desktop isolation audit failed; stopping only this worker and its descendants.' }
 }
+function Restore-SettledWorkerLock {
+  # Caller owns the project host mutex. Preserve the journal and every old lock.
+  # This only allows the worker to reach its existing fresh-cloud preflight;
+  # it does not clear a cloud fault, resume a claim or repeat an external action.
+  $lockPath = Join-Path $runtimePath 'worker.lock'
+  if (-not [IO.File]::Exists($lockPath)) { return }
+  $original = [IO.File]::ReadAllText($lockPath)
+  $lock = $original | ConvertFrom-Json
+  if ($lock.pid -isnot [int] -and $lock.pid -isnot [long]) { throw 'Invalid worker lock identity; retained.' }
+  if ($lock.pid -le 0 -or $lock.pid -gt [int]::MaxValue -or -not $lock.at) { throw 'Invalid worker lock identity; retained.' }
+  try {
+    $existing = [Diagnostics.Process]::GetProcessById([int]$lock.pid)
+    $existing.Dispose()
+    throw 'Worker PID is still alive or reused; retained lock and stopped.'
+  } catch [ArgumentException] {
+    # Only PID-not-found proves death. Access failures remain fatal.
+  }
+  $journalPath = Join-Path $runtimePath 'operation.json'
+  if ([IO.File]::Exists($journalPath)) {
+    $journal = [IO.File]::ReadAllText($journalPath) | ConvertFrom-Json
+    if ($journal.phase -cne 'settled' -or $null -ne $journal.lease -or $null -ne $journal.receipt) {
+      throw 'Unfinished journal; no automatic lock recovery or member action.'
+    }
+  }
+  if ([IO.File]::ReadAllText($lockPath) -cne $original) { throw 'Lock changed; stopped recovery.' }
+  $archivePath = Join-Path $runtimePath ('worker.lock.archived-' + [Guid]::NewGuid().ToString('N') + '.json')
+  [IO.File]::Move($lockPath, $archivePath)
+  $report['lockRecovery'] = @{ archivedPid=$lock.pid; journalPreserved=$true; cloudPreflightRequired=$true }
+}
+function Assert-WatchdogStart {
+  $ticket = [IO.File]::ReadAllText((Join-Path $runtimePath 'watchdog-start.json')) | ConvertFrom-Json
+  $startedAt = [DateTimeOffset]::Parse($ticket.at)
+  if ($ticket.version -ne 1 -or $ticket.pid -isnot [int] -or $ticket.pid -le 0 -or
+      $startedAt -gt [DateTimeOffset]::UtcNow -or ([DateTimeOffset]::UtcNow - $startedAt).TotalSeconds -gt 60) {
+    throw 'Watchdog startup evidence is invalid or stale.'
+  }
+  $supervisor = [Diagnostics.Process]::GetProcessById($ticket.pid)
+  $supervisor.Dispose()
+  if ($null -ne $ticket.expectedHostPid) {
+    try {
+      $oldHost = [Diagnostics.Process]::GetProcessById([int]$ticket.expectedHostPid)
+      $oldHost.Dispose()
+      throw 'Previous host PID is alive or reused; stopped.'
+    } catch [ArgumentException] { }
+  }
+  $stopPath = Join-Path $runtimePath 'stop-request.json'
+  $digest = 'absent'
+  if ([IO.File]::Exists($stopPath)) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $digest = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($stopPath)))).Replace('-','').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+  }
+  if ($digest -cne $ticket.stopDigest) { throw 'Stop request changed after watchdog decision; stopped before launch.' }
+  # Worker also treats any newer stop request as stopping this supervised start,
+  # even if that request targeted the dead lock incarnation being recovered.
+  $env:NUMEMS_WATCHDOG_START_AT = $ticket.at
+}
 try {
   if ([Security.Principal.WindowsIdentity]::GetCurrent().Name -match 'CodexSandbox') {
     throw 'Use the actual Windows user; the sandbox identity cannot own this browser profile.'
@@ -45,6 +103,7 @@ try {
   } elseif ($PSBoundParameters.ContainsKey('AdminCommand') -or $PSBoundParameters.ContainsKey('RequestId')) {
     throw 'Admin arguments are allowed only in admin mode.'
   }
+  if ($RecoverSettledLock -and $Mode -ne 'run') { throw 'Verified dead-lock recovery is allowed only for the guarded watchdog run.' }
   $entryName = if ($Mode -eq 'admin') { 'admin.mjs' } elseif ($Mode -eq 'probe') { 'probe.mjs' } else { 'main.mjs' }
   $entryPath = Join-Path $PSScriptRoot $entryName
   if (-not (Test-Path -LiteralPath $entryPath -PathType Leaf)) { throw 'Worker entry point is unavailable.' }
@@ -54,7 +113,9 @@ try {
   $mutex = [Threading.Mutex]::new($false, ('Local\NUMEMS-Agentless-Host-' + $suffix))
   try { $hasMutex = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $hasMutex = $true }
   if (-not $hasMutex) { throw 'An isolated host is already running for this project.' }
+  if ($RecoverSettledLock) { Assert-WatchdogStart; Restore-SettledWorkerLock }
   Add-Type -LiteralPath (Join-Path $PSScriptRoot 'desktop-native.cs')
+  if ($RecoverSettledLock) { Assert-WatchdogStart }
   $session = [NumemsDesktop.Native]::Start($nodePath, $projectPath, $Mode, $AdminCommand, $RequestId)
   $report.state = 'running'
   $report.desktop = $session.desktopName

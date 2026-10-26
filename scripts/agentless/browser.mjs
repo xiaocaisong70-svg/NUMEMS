@@ -21,9 +21,19 @@ export async function assertDesktop(config, {env=process.env, platform=process.p
   if (!/^NUMEMS-Agentless-[a-zA-Z0-9-]+$/.test(env.NUMEMS_DESKTOP_NAME ?? ''))
     throw new Error('缺少有效的隔离桌面宿主；禁止在普通桌面启动浏览器。');
   const powershell = path.join(env.SystemRoot || 'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
-  const {stdout} = await run(powershell, ['-NoProfile','-NonInteractive','-File',
-    path.join(import.meta.dirname,'desktop-probe.ps1')],
-    {windowsHide:true, timeout:20_000, env});
+  let stdout;
+  try {
+    ({stdout} = await run(powershell, ['-NoProfile','-NonInteractive','-File',
+      path.join(import.meta.dirname,'desktop-probe.ps1')],
+      {windowsHide:true, timeout:20_000, env}));
+  } catch (error) {
+    let proof;try{proof=JSON.parse(error.stdout?.trim().replace(/^\uFEFF/,''));}catch{}
+    // Only the exact native input-desktop failure is transient. An invalid
+    // isolation proof, command timeout or other failure remains unclassified.
+    if(proof?.error==='desktop_isolation_unverified' && proof.reason==='input_desktop_unavailable')
+      error.failureCode='browser_unavailable';
+    throw error;
+  }
   return validateDesktopProof(JSON.parse(stdout.trim().replace(/^\uFEFF/,'')),env.NUMEMS_DESKTOP_NAME);
 }
 

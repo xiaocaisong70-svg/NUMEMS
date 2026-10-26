@@ -34,7 +34,8 @@ export async function main(args=process.argv.slice(2)) {
   };
   process.on('SIGINT',halt);process.on('SIGTERM',halt);
   try {
-    control=new GracefulStopControl(runtimeDir,await readJson(path.join(runtimeDir,'worker.lock')));
+    control=new GracefulStopControl(runtimeDir,await readJson(path.join(runtimeDir,'worker.lock')),
+      {watchdogStartedAt:process.env.NUMEMS_WATCHDOG_START_AT??null});
     if(await shouldStop())return;
     await browser.open();
     const portal=new PortalClient(browser.context,config,['review_seat_failure']);
