@@ -18,14 +18,28 @@ export async function readStopSnapshot(directory=runtimeDir) {
   } catch(error) {if(error.code==='ENOENT')return {value:null,digest:'absent'};throw error;}
 }
 
-export function processGate({host,lock},signal=pid=>process.kill(pid,0)) {
+export function verifiedReusedIdentity(identity,pid,evidenceAt,now=Date.now()) {
+  const stamp=value=>typeof value==='string' && /(Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value));
+  return !!identity && identity.pid===pid && typeof identity.imageName==='string' &&
+    /^[a-zA-Z0-9_.-]+\.exe$/.test(identity.imageName) && identity.imageName.toLowerCase()!=='node.exe' &&
+    stamp(identity.createdAt) && stamp(evidenceAt) && Number.isFinite(now) &&
+    Date.parse(identity.createdAt)>Date.parse(evidenceAt)+2000 && Date.parse(identity.createdAt)<=now;
+}
+
+export async function processGate({host,lock},signal=pid=>process.kill(pid,0),inspect=async()=>null) {
   if(lock && (!Number.isSafeInteger(lock.pid) || lock.pid<=0 || typeof lock.at!=='string' ||
       !Number.isFinite(Date.parse(lock.at))))return {clear:false,reason:'invalid_worker_lock'};
-  const pids=new Set([host?.processId,lock?.pid].filter(pid=>pid!==undefined&&pid!==null));
-  for(const pid of pids) {
+  const checks=[{pid:host?.processId,at:host?.checkedAt},{pid:lock?.pid,at:lock?.at}]
+    .filter(({pid})=>pid!==undefined&&pid!==null);
+  for(const {pid,at} of checks) {
     if(!Number.isSafeInteger(pid)||pid<=0)return {clear:false,reason:'invalid_worker_pid'};
-    try {signal(pid);return {clear:false,reason:'existing_or_reused_worker_pid'};}
-    catch(error) {if(error.code!=='ESRCH')return {clear:false,reason:'worker_death_unverified'};}
+    let unavailable=false;
+    try {signal(pid);}
+    catch(error) {if(error.code==='ESRCH')continue;unavailable=true;}
+    let identity;
+    try {identity=await inspect(pid);} catch {identity=null;}
+    if(!verifiedReusedIdentity(identity,pid,at))
+      return {clear:false,reason:unavailable?'worker_death_unverified':'existing_or_reused_worker_pid'};
   }
   return {clear:true};
 }
@@ -69,18 +83,23 @@ export async function main() {
     ...['host-desktop.json','status.json','operation.json','worker.lock'].map(name=>readJson(path.join(runtimeDir,name))),
     readStopSnapshot()]);
   const stopRequest=stopSnapshot.value;
-  const gate=processGate({host,lock});
+  const powershell=path.join(process.env.SystemRoot||'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
+  const gate=await processGate({host,lock},undefined,async pid=>{
+    const result=await execute(powershell,['-NoProfile','-NonInteractive','-WindowStyle','Hidden','-File',
+      path.join(import.meta.dirname,'pid-identity.ps1'),'-ProcessId',String(pid)],
+      {windowsHide:true,timeout:10_000,maxBuffer:16_384});
+    return JSON.parse(result.stdout.trim().replace(/^\uFEFF/,''));
+  });
   if(!gate.clear) {
     const result={checkedAt:new Date().toISOString(),state:'held',...gate,modelCalls:0};
     await atomicJson(file,result);return result;
   }
-  const powershell=path.join(process.env.SystemRoot||'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
   return supervise({config,host,status,journal,stopRequest,
     save:report=>atomicJson(file,report),
     run:async kind=>{
       if(kind==='worker')await atomicJson(path.join(runtimeDir,'watchdog-start.json'),{
         version:1,pid:process.pid,at:new Date().toISOString(),stopDigest:stopSnapshot.digest,
-        expectedHostPid:host?.processId??null});
+        expectedHostPid:host?.processId??null,expectedHostCheckedAt:host?.checkedAt??null});
       const args=['-NoProfile','-NonInteractive','-WindowStyle','Hidden','-File',
         path.join(import.meta.dirname,kind==='desktop'?'desktop-probe.ps1':'isolated-desktop.ps1'),
         ...(kind==='worker'?['-NodeExe',process.execPath,'-Mode','run','-RecoverSettledLock']:[])];

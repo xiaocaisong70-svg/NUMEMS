@@ -5,7 +5,7 @@ import {mkdtemp,rm} from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import {createState,transition} from '../lib/seat-engine.ts';
-import {observeWorkspace,claimOperation,completeOperation,deferOperation,workPlan} from '../lib/codex-bridge.ts';
+import {observeWorkspace,claimOperation,completeOperation,deferOperation,reviewFailure,workPlan} from '../lib/codex-bridge.ts';
 import {deliverReminders} from '../lib/reminder-relay.ts';
 import {runBatch} from '../scripts/agentless/core.mjs';
 import {validateConfig,ADMIN,WORKSPACE} from '../scripts/agentless/config.mjs';
@@ -13,6 +13,8 @@ import {Journal,acquireLock,readJson} from '../scripts/agentless/journal.mjs';
 import {assertExclusive} from '../scripts/agentless/guard.mjs';
 import {notifyFailure} from '../scripts/agentless/alert.mjs';
 import {recoverBrowser} from '../scripts/agentless/recovery.mjs';
+import {InventoryMismatchError} from '../scripts/seat-executor/browser.mjs';
+import {recoverBatchError} from '../scripts/agentless/main.mjs';
 
 const owner={userId:'owner',email:ADMIN,isAdmin:true};
 const staff=i=>({userId:`u${i}`,email:`staff${i}@example.com`,isAdmin:false});
@@ -35,6 +37,7 @@ function fixture(mode = 'relay') {
     if(name==='claim_seat_operation') s=claimOperation(s,args.kind,args.targetId,randomUUID(),at());
     if(name==='complete_seat_operation') s=completeOperation(s,args,at());
     if(name==='defer_seat_operation') s=deferOperation(s,args,at());
+    if(name==='review_seat_failure') s=reviewFailure(s,args,at());
     return {plan:workPlan(s,at())};
   }};
   const browser={observe:async()=>snapshot(),async invite(email){await this.onExternalAction();clicks.push(['invite',email]);invites.push(email);return at();},
@@ -48,6 +51,84 @@ function fixture(mode = 'relay') {
     apply(i,hours=1){s=transition(s,staff(i),{type:'apply',name:`Staff ${i}`,reason:'automated test',hours},at());},
     run(extra={}){return runBatch({portal,browser,config,clock:()=>now,...extra});}};
 }
+const inconsistentInventory=()=>new InventoryMismatchError({total:4,assigned:3,available:1},2,0);
+
+test('a pre-claim transitional count mismatch is re-read once before making any external action',async()=>{
+  const f=fixture();f.apply(0);const original=f.browser.observe;let reads=0;
+  f.browser.observe=async()=>{if(++reads===1)throw inconsistentInventory();return original();};
+  const result=await f.run();assert.equal(reads>=3,true);assert.equal(result.actions[0].kind,'invite');
+  assert.deepEqual(f.clicks.map(x=>x[0]),['invite']);
+  assert.equal(f.calls.some(c=>c.name==='defer_seat_operation'),false);
+});
+
+test('persistent pre-claim count mismatch only allows future read-only recovery',async()=>{
+  const f=fixture();f.apply(0);let reads=0;
+  f.browser.observe=async()=>{reads++;throw inconsistentInventory();};
+  await assert.rejects(f.run(),error=>error.failureCode==='browser_unavailable' && error.cause instanceof InventoryMismatchError);
+  assert.equal(reads,2);assert.deepEqual(f.clicks,[]);
+  assert.equal(f.state.codex.globalFailureCode,'browser_unavailable');assert.equal(f.state.codex.lease,undefined);
+  const deferred=f.calls.find(c=>c.name==='defer_seat_operation');
+  assert.match(deferred.args.detail,/已分配 3.*成员 2.*邀请 0/);
+  assert.doesNotMatch(deferred.args.detail,/@/);
+});
+
+test('main error policy resumes only after an actual read-only browser recovery and confirmed defer',async()=>{
+  const f=fixture();f.apply(0);const original=f.browser.observe;let reads=0;
+  f.browser.observe=async()=>{if(++reads<=2)throw inconsistentInventory();return original();};
+  let blocked;try{await f.run();}catch(error){blocked=error;}
+  assert.equal(blocked?.failureCode,'browser_unavailable');
+  const dir=await mkdtemp(path.join(os.tmpdir(),'numems-mismatch-recovery-'));
+  try {
+    const outcome=await recoverBatchError({error:blocked,portal:f.portal,browser:f.browser,config:f.config,
+      journalFile:path.join(dir,'op.json'),recoverBrowserFn:options=>recoverBrowser({...options,pause:async()=>{}})});
+    assert.equal(outcome.mode,'browser_recovered');assert.equal(f.state.codex.globalFailureCode,undefined);
+    assert.deepEqual(f.clicks,[]);
+    assert.equal(f.calls.filter(c=>c.name==='review_seat_failure').length,1);
+    await f.run();assert.deepEqual(f.clicks.map(x=>x[0]),['invite']);
+  } finally {assert.ok(path.resolve(dir).startsWith(path.resolve(os.tmpdir())+path.sep));await rm(dir,{recursive:true,force:true});}
+});
+
+test('defer rejection, uncertain result or malformed acknowledgement cannot trigger browser recovery',async()=>{
+  for(const variant of ['throw','unknown_result','bad_ack']) {
+    const f=fixture();f.apply(0);f.browser.observe=async()=>{throw inconsistentInventory();};
+    const call=f.portal.call;
+    f.portal.call=async function(name,args){
+      if(name==='defer_seat_operation') {
+        if(variant==='throw')throw new Error('rejected');
+        if(variant==='unknown_result')throw new Error('timeout after dispatch');
+        return {plan:{workspaceId:f.config.workspaceId,administrator:f.config.adminEmail,
+          globalFailureCode:'unknown',busy:false,lease:null}};
+      }
+      return call.call(this,name,args);
+    };
+    let blocked;try{await f.run();}catch(error){blocked=error;}
+    assert.equal(blocked?.failureCode,'unknown');assert.deepEqual(f.clicks,[]);
+    let recoveries=0;
+    await assert.rejects(recoverBatchError({error:blocked,portal:f.portal,browser:f.browser,config:f.config,
+      recoverBrowserFn:async()=>{recoveries++;return true;}}),error=>error===blocked);
+    assert.equal(recoveries,0);
+  }
+});
+
+test('a count mismatch after a claim never becomes an automatically recoverable browser failure',async()=>{
+  const f=fixture();f.apply(0);const original=f.browser.observe;let reads=0;
+  f.browser.observe=async()=>{if(++reads>2)throw inconsistentInventory();return original();};
+  await assert.rejects(f.run(),InventoryMismatchError);
+  assert.deepEqual(f.clicks.map(x=>x[0]),['invite']);
+  assert.equal(f.state.codex.globalFailureCode,'unknown');assert.ok(f.state.codex.lease);
+  const finish=f.calls.find(c=>c.name==='complete_seat_operation');
+  assert.equal(finish.args.outcome,'uncertain');assert.equal(finish.args.failureCode,'unknown');
+  assert.equal(f.calls.some(c=>c.name==='defer_seat_operation'),false);
+});
+
+test('unrelated identity or purchased-capacity errors are never retried as transient inventory counts',async()=>{
+  for(const failureCode of ['role_mismatch','workspace_mismatch','capacity_mismatch']){
+    const f=fixture();f.apply(0);let reads=0;
+    f.browser.observe=async()=>{reads++;throw Object.assign(new Error('unsafe official evidence'),{failureCode});};
+    await assert.rejects(f.run(),/unsafe official evidence/);assert.equal(reads,1);
+    assert.equal(f.state.codex.globalFailureCode,failureCode);assert.deepEqual(f.clicks,[]);
+  }
+});
 test('FIFO three slots, no duplicate invites, acceptance, expiry and next FIFO in same batch',async()=>{
   const f=fixture();for(let i=0;i<4;i++)f.apply(i);
   await f.run();assert.deepEqual(f.clicks.map(x=>x[1]),[0,1,2].map(i=>staff(i).email));

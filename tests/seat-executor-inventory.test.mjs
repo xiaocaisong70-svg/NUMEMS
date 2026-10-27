@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { BrowserAdapter, parseCapacity, parseRow } from "../scripts/seat-executor/browser.mjs";
+import { BrowserAdapter, InventoryMismatchError, parseCapacity, parseRow } from "../scripts/seat-executor/browser.mjs";
 import { validateConfig } from "../scripts/seat-executor/config.mjs";
 import { validateObservation, presence, assertOrdinary } from "../scripts/seat-executor/inventory.mjs";
 import { reminderText } from "../scripts/seat-executor/gmail-mailer.mjs";
+import { observeBeforeClaim } from "../scripts/agentless/core.mjs";
 
 const config = validateConfig({});
 const officialUrl = `https://admin.openai.com/workspace/${config.workspaceId}/members?workspace=my-workspace&tab=invites`;
@@ -42,7 +43,24 @@ test("snapshot accepts either possible assigned-seat count for pending invitatio
   adapter.rows = async () => adapter.currentTab === "members"
     ? [{ ...owner, self: true }, { ...member, self: false }]
     : [{ ...invitation, self: false }];
-  await assert.rejects(adapter.snapshot(), /席位已分配数不一致/);
+  await assert.rejects(adapter.snapshot(), error => error instanceof InventoryMismatchError &&
+    /已分配 4.*成员 2.*邀请 1/.test(error.message) && !error.failureCode);
+  adapter.capacity = async () => ({ total: 5, assigned: 4, available: 1 });
+  await assert.rejects(adapter.snapshot(), error => error.failureCode === 'capacity_mismatch');
+});
+
+test("an invitation accepted between page reads is reconciled only after two new matching full snapshots", async () => {
+  const adapter = new BrowserAdapter(config, { page: { url: () => officialUrl } });
+  let rounds = 0, pauses = 0;
+  adapter.load = async tab => { adapter.currentTab = tab; if (tab === 'members') rounds++; };
+  adapter.capacity = async () => ({ total: 4, assigned: 2, available: 2 });
+  adapter.rows = async () => adapter.currentTab === 'members'
+    ? rounds === 1 ? [{ ...owner, self: true }] : [{ ...owner, self: true }, { ...member, self: false }]
+    : [];
+  const current = await observeBeforeClaim(adapter, { pause: async ms => { assert.equal(ms,1000); pauses++; } });
+  assert.equal(rounds,3); assert.equal(pauses,1);
+  assert.deepEqual(current.members.map(p=>p.email),[owner.email,member.email]);
+  assert.deepEqual(current.invites,[]);
 });
 
 test("workspace evidence protects identity, roles, seat count and recency", () => {

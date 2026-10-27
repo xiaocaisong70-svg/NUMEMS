@@ -27,10 +27,10 @@ const tools = [
   },
   {
     name: "review_seat_failure",
-    description: "retry_not_started仅重排明确未开始的隔离项；resume_workspace需管理员核查；recover_browser仅允许程序对未开始操作的browser_unavailable故障提交最新完整官方证据后恢复。所有恢复均禁止有未完成租约，保留目标隔离及审计。",
+    description: "retry_not_started仅重排明确未开始的隔离项；resume_workspace需管理员核查；recover_browser仅允许程序对未开始操作的browser_unavailable故障恢复；resume_preclaim_inventory需提供预期故障ID与完整官方证据并原子核查特定未开始成员写入故障。所有恢复均禁止有未完成租约。",
     inputSchema: { type: "object", properties: {
-      decision: { type: "string", enum: ["retry_not_started", "resume_workspace", "recover_browser"] },
-      operationId: { type: "string" }, observation: observationSchema,
+      decision: { type: "string", enum: ["retry_not_started", "resume_workspace", "recover_browser", "resume_preclaim_inventory"] },
+      operationId: { type: "string" }, expectedFailureId: { type: "string" }, observation: observationSchema,
     }, required: ["decision"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   },

@@ -8,6 +8,7 @@ import {bridgeObservation,presence,assertOrdinary} from '../seat-executor/invent
 import {Journal,readJson,acquireLock,atomicJson} from './journal.mjs';
 import {resumeTestInvite} from './resume-test-invite.mjs';
 import {reviewTestWorkspace} from './review-test-workspace.mjs';
+import {reviewLiveWorkspace} from './review-live-workspace.mjs';
 const TEST_EMAIL='hit_wangning@outlook.com';
 
 export function assertObservationSetup(plan,config,{prepareTest=false,journalState=null}={}) {
@@ -103,7 +104,7 @@ const commands={status:['seat_portal_status',{}], 'prepare-test':['prepare_test_
   'test-expire':['set_test_deadline',{requestId:id,stage:'expire'}],
   'enable-live':['set_codex_live',{enabled:true}], 'disable':['set_codex_live',{enabled:false}]};
 const withId=['release-test','test-reminder','test-expire'];
-if((!commands[command] && !['observe','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace'].includes(command)) || extra.length ||
+if((!commands[command] && !['observe','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace'].includes(command)) || extra.length ||
     (!withId.includes(command) && id!==undefined))
   throw new Error('用法：admin.mjs status|observe|prepare-test|release-test ID|test-reminder ID|test-expire ID|enable-live|disable|reconcile|recover-browser|resolve-alert|resume-test-invite|review-test-workspace');
 if(withId.includes(command) && !/^req_[a-zA-Z0-9_]+$/.test(id??''))
@@ -118,7 +119,11 @@ try {
   await browser.open();
   const portal=new PortalClient(browser.context,config,['prepare_test_request','release_test_request',
     'set_test_deadline','set_codex_live','review_seat_failure']);
-  if(command==='review-test-workspace') {
+  if(command==='review-live-workspace') {
+    report.result=await reviewLiveWorkspace({portal,browser,config,
+      journalFile:path.join(runtimeDir,'operation.json'),statusFile:path.join(runtimeDir,'status.json')});
+    console.log(JSON.stringify(report.result,null,2));
+  } else if(command==='review-test-workspace') {
     report.result=await reviewTestWorkspace({portal,browser,config:browserConfig,
       journalFile:path.join(runtimeDir,'operation.json')});
     Object.assign(report.result,await readTestSummary(portal,config));

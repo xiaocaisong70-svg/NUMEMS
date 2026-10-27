@@ -1,7 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$NodeExe,
   [ValidateSet('probe','once','run','admin')][string]$Mode = 'probe',
-  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace')][string]$AdminCommand,
+  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace')][string]$AdminCommand,
   [string]$RequestId,
   [switch]$RecoverSettledLock
 )
@@ -15,6 +15,19 @@ $mutex = $null
 $hasMutex = $false
 $resultCode = 1
 $report = [ordered]@{ checkedAt=[DateTime]::UtcNow.ToString('o'); mode=$Mode; state='starting'; modelCalls=0; desktop=$null; inputDesktop=$null; processId=$null; audits=0; maxOwnedWindowsOnInputDesktop=0; maxOwnedWindowsOnIsolatedDesktop=0 }
+. (Join-Path $PSScriptRoot 'pid-identity.ps1')
+function Assert-OldPidGoneOrReused([int]$TargetProcessId, $EvidenceAt) {
+  try {
+    $existing = [Diagnostics.Process]::GetProcessById($TargetProcessId)
+    $existing.Dispose()
+  } catch [ArgumentException] { return }
+  # A current unrelated process is left untouched. Both its image and creation
+  # time must prove it cannot be the original Node worker, otherwise hold.
+  $identity = Get-NumemsPidIdentity $TargetProcessId
+  if (-not (Test-NumemsReusedIdentity $identity $TargetProcessId $EvidenceAt)) {
+    throw 'Worker PID is alive or its identity cannot be safely verified; stopped.'
+  }
+}
 function Save-HostReport {
   [IO.Directory]::CreateDirectory($runtimePath) | Out-Null
   $temporaryPath = $reportPath + '.' + $PID + '.tmp'
@@ -41,13 +54,7 @@ function Restore-SettledWorkerLock {
   $lock = $original | ConvertFrom-Json
   if ($lock.pid -isnot [int] -and $lock.pid -isnot [long]) { throw 'Invalid worker lock identity; retained.' }
   if ($lock.pid -le 0 -or $lock.pid -gt [int]::MaxValue -or -not $lock.at) { throw 'Invalid worker lock identity; retained.' }
-  try {
-    $existing = [Diagnostics.Process]::GetProcessById([int]$lock.pid)
-    $existing.Dispose()
-    throw 'Worker PID is still alive or reused; retained lock and stopped.'
-  } catch [ArgumentException] {
-    # Only PID-not-found proves death. Access failures remain fatal.
-  }
+  Assert-OldPidGoneOrReused ([int]$lock.pid) $lock.at
   $journalPath = Join-Path $runtimePath 'operation.json'
   if ([IO.File]::Exists($journalPath)) {
     $journal = [IO.File]::ReadAllText($journalPath) | ConvertFrom-Json
@@ -70,11 +77,12 @@ function Assert-WatchdogStart {
   $supervisor = [Diagnostics.Process]::GetProcessById($ticket.pid)
   $supervisor.Dispose()
   if ($null -ne $ticket.expectedHostPid) {
-    try {
-      $oldHost = [Diagnostics.Process]::GetProcessById([int]$ticket.expectedHostPid)
-      $oldHost.Dispose()
-      throw 'Previous host PID is alive or reused; stopped.'
-    } catch [ArgumentException] { }
+    $previousHost = [IO.File]::ReadAllText($reportPath) | ConvertFrom-Json
+    if ($previousHost.processId -ne $ticket.expectedHostPid -or
+        $previousHost.checkedAt -cne $ticket.expectedHostCheckedAt) {
+      throw 'Previous host evidence changed after watchdog decision; stopped.'
+    }
+    Assert-OldPidGoneOrReused ([int]$ticket.expectedHostPid) $ticket.expectedHostCheckedAt
   }
   $stopPath = Join-Path $runtimePath 'stop-request.json'
   $digest = 'absent'

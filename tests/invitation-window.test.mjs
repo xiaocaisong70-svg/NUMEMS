@@ -201,3 +201,14 @@ test("verified invitation receipt honors exact send time and rejects impossible 
   s=completeOperation(s,{...args,invitationSentAt:at(7)},at(20));
   assert.equal(s.requests[0].joinDeadlineAt,at(307));
 });
+test("an invite receipt can confirm a member seen after send before the receipt transaction commits", () => {
+  let s=observeWorkspace(tick(apply(setup())),observation(1),at(1));
+  s=claimOperation(s,"invite",s.requests[0].id,"receipt-race",at(1));
+  const args={operationId:s.codex.lease.id,token:"receipt-race",outcome:"verified",
+    observation:observation(20,[staff(0).email]),invitationSentAt:at(7)};
+  // confirm_invited's updatedAt is t=21, but the member was validly observed
+  // at t=20 after the claim/send. This is not a stale passive observation.
+  s=completeOperation(s,args,at(21));
+  assert.equal(s.requests[0].status,'active');assert.equal(s.requests[0].expiresAt,at(3620));
+  assert.equal(s.codex.lease,undefined);
+});

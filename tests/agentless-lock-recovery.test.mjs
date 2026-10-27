@@ -4,11 +4,14 @@ import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 test('native host dead-lock recovery preserves evidence and refuses live or unfinished workers', {skip:process.platform!=='win32'},()=>{
   const launcher=path.resolve(import.meta.dirname,'../scripts/agentless/isolated-desktop.ps1').replaceAll("'","''");
+  const identity=path.resolve(import.meta.dirname,'../scripts/agentless/pid-identity.ps1').replaceAll("'","''");
   const script=`$ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 $errors=$null; $tokens=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile('${launcher}',[ref]$tokens,[ref]$errors)
 if($errors){throw 'Launcher syntax failed.'}
+. '${identity}'
+Invoke-Expression ($ast.Find({param($item) $item -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $item.Name -eq 'Assert-OldPidGoneOrReused'},$true).Extent.Text)
 $recover=$ast.Find({param($item) $item -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $item.Name -eq 'Restore-SettledWorkerLock'},$true).Body.GetScriptBlock()
 $runtimePath=Join-Path ([IO.Path]::GetTempPath()) ('numems-dead-lock-test-'+[Guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($runtimePath)

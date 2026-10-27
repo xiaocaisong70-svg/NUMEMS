@@ -1,6 +1,7 @@
 import { acceptanceDue } from '../seat-executor/core.mjs';
 import { bridgeObservation, presence, assertOrdinary } from '../seat-executor/inventory.mjs';
 import {recoverablePortalError} from './portal-recovery.mjs';
+import {InventoryMismatchError} from '../seat-executor/browser.mjs';
 
 const planOf = value => value.plan ?? value;
 const isolated = new Set(['member_action', 'approval_required', 'mail_delivery']);
@@ -22,6 +23,18 @@ function guard(plan, config) {
 }
 const safeCode = error => ['member_action','approval_required','login_expired','workspace_mismatch',
   'capacity_mismatch','role_mismatch','browser_unavailable'].includes(error.failureCode) ? error.failureCode : 'unknown';
+
+// Called only after the cloud plan and local journal confirm no outstanding
+// lease and strictly before claim_seat_operation. Never use in post-claim
+// reconciliation: a prior external result could be uncertain there.
+export async function observeBeforeClaim(browser, {pause=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}) {
+  try { return await browser.observe(); }
+  catch (error) {
+    if (!(error instanceof InventoryMismatchError)) throw error;
+    await pause(1000);
+    return browser.observe(); // One bounded re-read; preserve the same complete-evidence checks.
+  }
+}
 
 /** Fresh plan for every item. No API for starting or messaging an Agent exists here. */
 export async function runBatch({ portal, browser, config, journal,
@@ -56,12 +69,35 @@ export async function runBatch({ portal, browser, config, journal,
     seen.add(`${kind}:${item.id}`);
     let before;
     try {
-      before = await browser.observe();
+      before = await observeBeforeClaim(browser);
       await portal.call('observe_workspace', {observation:bridgeObservation(before)});
     } catch (error) {
       // The identity GET failed BEFORE observe_workspace was sent. Do not mark
       // an untouched target unknown; main still requires a settled journal.
       if(recoverablePortalError(error) && error.metadata.requestNotSent===true)throw error;
+      if (error instanceof InventoryMismatchError) {
+        const detail = `${error.message} 未开始成员写入；等待完整官方名单只读复核。`;
+        let deferred;
+        try {
+          deferred = planOf(await portal.call('defer_seat_operation', {
+            kind:kind === 'acceptance' ? 'invite' : kind,
+            targetId:item.id, failureCode:'browser_unavailable', detail,
+          }));
+        } catch (deferError) {
+          // The defer write may have reached the server. Never reclassify an
+          // unconfirmed RPC as safely recoverable, even after a transport error.
+          const blocked = new StopError('名单不一致的暂停登记未确认，保持停止并核对。');
+          blocked.cause = deferError; throw blocked;
+        }
+        if (deferred?.workspaceId !== config.workspaceId || deferred?.administrator !== config.adminEmail ||
+            deferred.globalFailureCode !== 'browser_unavailable' || deferred.lastError !== detail ||
+            deferred.busy !== false || deferred.lease != null || deferred.browserRecovery?.eligible !== true) {
+          throw new StopError('名单不一致的暂停回执不完整或已变化，保持停止并核对。');
+        }
+        // Only now can main perform its guarded, read-only browser recovery.
+        const unavailable = new StopError(error.message, 'browser_unavailable');
+        unavailable.cause = error; throw unavailable;
+      }
       await portal.call('defer_seat_operation', {kind:kind === 'acceptance' ? 'invite' : kind,
         targetId:item.id, failureCode:safeCode(error), detail:'官方完整名单核对失败；未开始成员写入。'});
       throw error;

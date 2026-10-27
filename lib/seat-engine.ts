@@ -25,7 +25,7 @@ export type State = { config: Config; requests: RequestRecord[]; audit: AuditRec
 export type Command =
   | { type: "apply"; reason: string; name: string; hours: number; requestKey?: string }
   | { type: "renew"; id: string; hours: number; requestKey?: string }
-  | { type: "cancel" | "release" | "request_acceptance_check" | "confirm_active" | "confirm_joined_after_timeout" | "confirm_removed"; id: string }
+  | { type: "cancel" | "release" | "request_acceptance_check" | "confirm_active" | "confirm_joined_after_timeout" | "confirm_removed" | "confirm_external_join" | "confirm_external_absence"; id: string }
   | { type: "confirm_invited"; id: string; sentAt?: string }
   | { type: "configure"; config: Partial<Config> }
   | { type: "tick" }
@@ -240,6 +240,23 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
       delete r.removalReason;
       r.expiresAt = new Date(instant + r.hours * HOUR).toISOString();
       notice(r, "active", "已核实加入，席位开始使用", `撤回前已在官方列表确认加入；官方页面不提供精确接受时间。到期时间：${r.expiresAt}。`); break;
+    }
+    case "confirm_external_join": {
+      if (actor.userId !== "system:codex" || !actor.isAdmin) throw new Error("只能由官方名单对账确认外部加入。");
+      const r = get(command.id, true);
+      if (!["queued", "pending_invite"].includes(r.status)) throw new Error("该申请状态不能确认外部加入。");
+      update(r, "active", "official_external_join_confirmed");
+      r.expiresAt = new Date(instant + r.hours * HOUR).toISOString();
+      notice(r, "active", "官方名单已确认加入", `系统核对到你已加入；官方页面不提供精确接受时间，使用期限从核对时计算，到期时间：${r.expiresAt}。`); break;
+    }
+    case "confirm_external_absence": {
+      if (actor.userId !== "system:codex" || !actor.isAdmin) throw new Error("只能由官方名单对账确认外部移除。");
+      const r = get(command.id, true);
+      if (r.status !== "active") throw new Error("该申请不在使用中，不能确认外部移除。");
+      update(r, "completed", "official_external_absence_confirmed");
+      for (const item of next.notices)
+        if (item.requestId === r.id && item.type === "expiry_30m" && item.status === "pending") item.status = "cancelled";
+      notice(r, "completed", "席位已回收", "官方完整名单未发现该成员或待接受邀请，访问已结束；需要时可重新申请。"); break;
     }
     case "confirm_removed": {
       const r = get(command.id, true); if (r.status === "completed") break;

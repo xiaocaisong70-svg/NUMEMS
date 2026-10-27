@@ -152,7 +152,7 @@ namespace NumemsDesktop {
     }
     static readonly HashSet<string> AdminCommands = new HashSet<string>(StringComparer.Ordinal) {
       "status", "observe", "prepare-test", "release-test", "test-reminder", "test-expire", "enable-live", "disable",
-      "reconcile", "recover-browser", "resolve-alert", "resume-test-invite", "review-test-workspace"
+      "reconcile", "recover-browser", "resolve-alert", "resume-test-invite", "review-test-workspace", "review-live-workspace"
     };
     static readonly HashSet<string> TestIdCommands = new HashSet<string>(StringComparer.Ordinal) {
       "release-test", "test-reminder", "test-expire"

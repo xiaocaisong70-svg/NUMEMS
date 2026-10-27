@@ -34,6 +34,10 @@ export type BridgeState = State & {
 const systemActor: Actor = { userId: "system:codex", email: PROTECTED_OWNER_EMAIL, isAdmin: true };
 const norm = (value: string) => value.trim().toLowerCase();
 const minute = 60_000;
+const PRECLAIM_INVENTORY_ERROR = "官方完整名单核对失败；未开始成员写入。";
+function latestWorkspaceFailureId(state: BridgeState) {
+  return [...state.audit].reverse().find(a => a.action === "codex_workspace_blocked")?.id ?? null;
+}
 function time(value: string) { const n = Date.parse(value); if (!Number.isFinite(n)) throw new Error("时间无效。"); return n; }
 function bridge(state: BridgeState) {
   state.codex ??= { enabled: false, testOnly: true, mailEnabled: true, receipts: [] };
@@ -83,7 +87,7 @@ export function validateObservation(snapshot: Observation, now: string) {
     throw new Error("目标管理员未显示为 Owner，已停止办理。");
   return structuredClone(snapshot);
 }
-export function observeWorkspace(input: BridgeState, snapshot: Observation, now: string): BridgeState {
+export function observeWorkspace(input: BridgeState, snapshot: Observation, now: string, verifiedOperationId?: string): BridgeState {
   const checked = validateObservation(snapshot, now);
   if (input.codex?.observation && time(checked.observedAt) < time(input.codex.observation.observedAt))
     throw new Error("不能用较旧的成员证据覆盖更新的核对结果。");
@@ -132,7 +136,13 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
   // A complete membership snapshot taken before the deadline is positive
   // evidence even if this transaction is processed a little later.
   for (const request of next.requests.filter(r => r.status === "invited")) {
-    if (invitationDeadline(request) && time(checked.observedAt) < time(invitationDeadline(request)!) &&
+    const original = input.requests.find(r => r.id === request.id);
+    const verified = Boolean(verifiedOperationId && [next.codex?.lease, ...(next.codex?.holds ?? []).map(h => h.operation)]
+      .some(op => op?.id === verifiedOperationId && op.kind === "invite" && op.email === request.email));
+    if ((!targetHeld(next, "acceptance", request.id, request.email) &&
+         !(next.codex?.lease && next.codex.lease.email === request.email) || verified) &&
+        original && (time(checked.observedAt) >= time(original.updatedAt) || verified) &&
+        invitationDeadline(request) && time(checked.observedAt) < time(invitationDeadline(request)!) &&
         checked.members.some(p => norm(p.email) === request.email && p.role === "member"))
       next = transition(next, systemActor, { type: "confirm_active", id: request.id }, checked.observedAt) as BridgeState;
   }
@@ -142,24 +152,49 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
   for (const old of [...next.requests]) {
     const member = checked.members.find(p => norm(p.email) === old.email);
     const invited = checked.invites.some(p => norm(p.email) === old.email);
+    const original = input.requests.find(r => r.id === old.id);
+    // A snapshot obtained before the last user/administrator update cannot
+    // resolve that update. A held or claimed target is reconciled only by its
+    // original operation receipt, never by this passive observation.
+    const freshForRequest = Boolean(original && time(checked.observedAt) >= time(original.updatedAt));
+    const safelyUnclaimed = !targetHeld(next, "acceptance", old.id, old.email) &&
+      !(next.codex?.lease && next.codex.lease.email === old.email);
+    const verifiedInvite = Boolean(verifiedOperationId && [next.codex?.lease, ...(next.codex?.holds ?? []).map(h => h.operation)]
+      .some(op => op?.id === verifiedOperationId && op.kind === "invite" && op.email === old.email));
+    const verifiedRemoval = Boolean(verifiedOperationId && [next.codex?.lease, ...(next.codex?.holds ?? []).map(h => h.operation)]
+      .some(op => op?.id === verifiedOperationId && op.kind === "remove" && op.email === old.email));
     if (member && member.role !== "member" &&
         ["pending_invite", "invited", "pending_removal"].includes(old.status)) {
       bridge(next).lastError = "目标用户具有管理角色，已停止自动办理。";
       bridge(next).enabled = false;
       continue;
     }
-    if (old.status === "pending_invite" && (member || invited)) {
+    if (["queued", "pending_invite"].includes(old.status) && member?.role === "member" &&
+        !invited && freshForRequest && safelyUnclaimed) {
+      next = transition(next, systemActor, { type: "confirm_external_join", id: old.id }, now) as BridgeState;
+      const occupied = next.config.reservedSeats + next.requests.filter(r =>
+        ["pending_invite", "invited", "active", "pending_removal"].includes(r.status)).length;
+      if (occupied > next.config.totalSeats) {
+        bridge(next).lastError = "官方已有成员使门户占用超过席位容量，请核对后恢复。";
+        bridge(next).globalFailureCode = "capacity_mismatch";
+      }
+    } else if (old.status === "pending_invite" && (member || invited) &&
+        (safelyUnclaimed || verifiedInvite) && freshForRequest) {
       next = transition(next, systemActor, { type: "confirm_invited", id: old.id }, now) as BridgeState;
     }
     const current = next.requests.find(r => r.id === old.id)!;
+    if (current.status === "active" && original?.status === "active" && !member && !invited &&
+        freshForRequest && safelyUnclaimed) {
+      next = transition(next, systemActor, { type: "confirm_external_absence", id: current.id }, now) as BridgeState;
+    }
     if (current.status === "invited") current.acceptanceCheckedAt = checked.observedAt;
-    if (current.status === "invited" && member && current.invitedAt &&
+    if (current.status === "invited" && member && current.invitedAt && (freshForRequest || verifiedInvite) && (safelyUnclaimed || verifiedInvite) &&
         time(invitationDeadline(current)!) > time(now)) {
       next = transition(next, systemActor, { type: "confirm_active", id: old.id }, now) as BridgeState;
     }
     if (current.status === "pending_removal" && current.removalReason === "invitation_expired" &&
-        member?.role === "member" && !targetHeld(next, "remove", current.id, current.email) &&
-        !(next.codex?.lease?.kind === "remove" && next.codex.lease.requestId === current.id)) {
+        member?.role === "member" && freshForRequest && !targetHeld(next, "remove", current.id, current.email) &&
+        !(next.codex?.lease && next.codex.lease.email === current.email)) {
       // Preserve a joined member until the pending invitation is actually revoked.
       // The official snapshot does not establish the exact acceptance time.
       if (!current.joinTimingEvidence) current.joinTimingEvidence = {
@@ -169,7 +204,8 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
       };
       next = transition(next, systemActor, { type: "confirm_joined_after_timeout", id: current.id }, now) as BridgeState;
     }
-    if (current.status === "pending_removal" && !member && !invited) {
+    if (current.status === "pending_removal" && !member && !invited && freshForRequest &&
+        (safelyUnclaimed || verifiedRemoval)) {
       next = transition(next, systemActor, { type: "confirm_removed", id: old.id }, now) as BridgeState;
     }
   }
@@ -232,6 +268,7 @@ export function workPlan(input: BridgeState, now: string) {
     enabled: b?.enabled ?? false, testOnly: b?.testOnly ?? true,
     lastError: b?.lastError ?? null, busy: Boolean(b?.lease), lease: b?.lease ?? null,
     faultIsolationVersion: 1, globalFailureCode: b?.globalFailureCode ?? null,
+    globalFailureId: b?.globalFailureCode ? latestWorkspaceFailureId(input) : null,
     workspaceReviewedAt: b?.workspaceReviewedAt ?? null,
     browserRecovery: b?.globalFailureCode === "browser_unavailable" && b.browserUnavailableAt && !b.lease
       ? { eligible: true, blockedAt: b.browserUnavailableAt } : null,
@@ -381,7 +418,7 @@ export function completeOperation(input: BridgeState, args: {
       if (r?.status === "pending_invite")
         next = transition(next, systemActor, { type: "confirm_invited", id: r.id, sentAt: args.invitationSentAt }, now) as BridgeState;
     }
-    next = observeWorkspace(next, s, now); b = bridge(next);
+    next = observeWorkspace(next, s, now, op.id); b = bridge(next);
     if (op.kind === "invite") b.inviteVerifiedAt = now;
     else if (op.originalPresence === "member") b.removalVerifiedAt = now;
     else b.invitationRevokedAt = now;
@@ -439,7 +476,8 @@ export function deferOperation(input: BridgeState, args: {
 }
 
 export function reviewFailure(input: BridgeState, args: {
-  decision: "retry_not_started" | "resume_workspace" | "recover_browser"; operationId?: string; observation?: Observation;
+  decision: "retry_not_started" | "resume_workspace" | "recover_browser" | "resume_preclaim_inventory";
+  operationId?: string; expectedFailureId?: string; observation?: Observation;
 }, now: string): BridgeState {
   let next = structuredClone(input), b = bridge(next);
   if (b.lease) throw new Error("仍有未完成操作，必须先提交真实核实回执。");
@@ -452,7 +490,12 @@ export function reviewFailure(input: BridgeState, args: {
     }
     b.holds = b.holds?.filter(h => h.operation.id !== args.operationId);
     record(next, "codex_review_unstarted", now, hold.operation.requestId);
-  } else if (args.decision === "resume_workspace" || args.decision === "recover_browser") {
+  } else if (args.decision === "resume_workspace" || args.decision === "recover_browser" || args.decision === "resume_preclaim_inventory") {
+    if (args.decision === "resume_preclaim_inventory" &&
+        (b.enabled !== true || b.testOnly !== false || b.globalFailureCode !== "unknown" ||
+         b.lastError !== PRECLAIM_INVENTORY_ERROR || (b.holds?.length ?? 0) !== 0 || b.mailChannelError ||
+         !args.expectedFailureId || args.expectedFailureId !== latestWorkspaceFailureId(next)))
+      throw new Error("未开始成员写入的故障已变化或存在其他未结案事项；不得恢复。");
     if (args.decision === "recover_browser" &&
         (b.globalFailureCode !== "browser_unavailable" || !b.browserUnavailableAt))
       throw new Error("自动恢复仅适用于未开始外部操作的浏览器暂不可用故障。");
@@ -462,7 +505,8 @@ export function reviewFailure(input: BridgeState, args: {
     if (b.lastError) throw new Error("最新官方证据仍有工作空间异常。");
     b.workspaceReviewedAt = now;
     delete b.browserUnavailableAt;
-    record(next, args.decision === "recover_browser" ? "codex_browser_recovered" : "codex_review_workspace", now);
+    record(next, args.decision === "recover_browser" ? "codex_browser_recovered" :
+      args.decision === "resume_preclaim_inventory" ? "codex_review_preclaim_inventory" : "codex_review_workspace", now);
   } else throw new Error("核查决定无效。");
   return next;
 }

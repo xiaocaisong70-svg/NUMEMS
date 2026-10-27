@@ -1,6 +1,7 @@
 // Pure restart eligibility only. Before using ANY allowed result, a caller must
-// prove host AND lock PID death (reject live/reused PIDs and inaccessible processes),
-// then recheck that proof under the native project mutex. The caller must also
+// prove host AND lock PID death, or prove that the PID now belongs to a different,
+// later-created non-Node process; unknown process identities remain held. Then
+// recheck that proof under the native project mutex. The caller must also
 // prove exclusive ownership, desktop isolation and the current cloud plan.
 // Never clears a lock, settles a journal, resumes a lease or launches a browser.
 import {validPortalFailure} from './portal-recovery.mjs';

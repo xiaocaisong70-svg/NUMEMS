@@ -47,14 +47,14 @@ test('disabled config and invalid availability do not open browser',async()=>{
     calls.push(kind);return {error:'desktop_isolation_unverified'};}});
   assert.equal(unavailable.state,'waiting_desktop');assert.deepEqual(calls,['desktop']);
 });
-test('PID checks reject live/reused or inaccessible processes, only ESRCH proves death',()=>{
+test('PID checks reject live or inaccessible processes without identity proof',async()=>{
   const lock={pid:123,at:'2026-10-26T01:59:00Z'};
-  assert.equal(processGate({host,lock},()=>{}).clear,false);
-  assert.equal(processGate({host,lock},()=>{throw Object.assign(new Error(),{code:'EPERM'});}).clear,false);
-  assert.equal(processGate({host,lock},()=>{throw Object.assign(new Error(),{code:'ESRCH'});}).clear,true);
-  assert.equal(processGate({host,lock:{pid:'123'}}).clear,false);
+  assert.equal((await processGate({host,lock},()=>{})).clear,false);
+  assert.equal((await processGate({host,lock},()=>{throw Object.assign(new Error(),{code:'EPERM'});})).clear,false);
+  assert.equal((await processGate({host,lock},()=>{throw Object.assign(new Error(),{code:'ESRCH'});})).clear,true);
+  assert.equal((await processGate({host,lock:{pid:'123'}})).clear,false);
   let checks=0;
-  assert.equal(processGate({host:{processId:5},lock},()=>{checks++;throw Object.assign(new Error(),{code:'ESRCH'});}).clear,true);
+  assert.equal((await processGate({host:{processId:5},lock},()=>{checks++;throw Object.assign(new Error(),{code:'ESRCH'});})).clear,true);
   assert.equal(checks,2);
 });
 test('stop submitted during supervised restart stops the new incarnation too',async()=>{

@@ -10,6 +10,16 @@ import { recoverBrowser } from './recovery.mjs';
 import { GracefulStopControl,runGracefulBatch } from './graceful-stop.mjs';
 import {recoverPortal,recoverablePortalError} from './portal-recovery.mjs';
 
+// The production error policy is independently testable without starting a
+// browser, scheduler, or live member operation.
+export async function recoverBatchError({error,portal,browser,config,journalFile,shouldStop,saveStatus,
+  recoverPortalFn=recoverPortal,recoverBrowserFn=recoverBrowser}) {
+  if(recoverablePortalError(error))return recoverPortalFn({error,portal,browser,config,
+    journalFile,shouldStop,saveStatus});
+  if(error.failureCode!=='browser_unavailable' || !await recoverBrowserFn({portal,browser,journalFile})) throw error;
+  return {mode:'browser_recovered',modelCalls:0};
+}
+
 export async function main(args=process.argv.slice(2)) {
   const config=await loadConfig();
   if(args.includes('--init')) {
@@ -59,12 +69,9 @@ export async function main(args=process.argv.slice(2)) {
           return result;
         }
         catch(error) {
-          if(recoverablePortalError(error))return recoverPortal({error,portal,browser,config,
+          return recoverBatchError({error,portal,browser,config,
             journalFile:path.join(runtimeDir,'operation.json'),shouldStop,
             saveStatus:value=>atomicJson(path.join(runtimeDir,'status.json'),value)});
-          if(error.failureCode!=='browser_unavailable' || !await recoverBrowser({portal,browser,
-            journalFile:path.join(runtimeDir,'operation.json')})) throw error;
-          return {mode:'browser_recovered',modelCalls:0};
         }
       },shouldStop);
       if(!batch.ran)break;

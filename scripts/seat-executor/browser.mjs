@@ -20,6 +20,15 @@ export const ui = {
   empty: /^(无结果|未找到成员|没有待处理的邀请|No results|No pending invitations|No members found)[。.]*$/i
 };
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// A capacity/list mismatch can arise while an invitation is being accepted
+// between the sequential page reads. The evidence is incomplete, never a
+// snapshot; only a caller before a claim may classify it for read-only retry.
+export class InventoryMismatchError extends Error {
+  constructor(capacity, members, invites) {
+    super(`读取成员及邀请数与席位已分配数不一致（已购 ${capacity.total}，已分配 ${capacity.assigned}，可用 ${capacity.available}，成员 ${members}，邀请 ${invites}）。`);
+    this.name = "InventoryMismatchError";
+  }
+}
 export function parseCapacity(text, label) {
   const clean = text.replace(/\u00a0/g, " ").trim();
   const total = clean.match(new RegExp(`(?:^|\\n)\\s*(\\d+)\\s*(?:\\n|\\s)+${escape(label)}(?:席位|\\s+seats)`, "i")) ||
@@ -269,6 +278,8 @@ export class BrowserAdapter {
   async snapshot() {
     await this.load("members");
     const capacity = await this.capacity(), members = await this.rows({requireOwner:true});
+    if (capacity.total !== this.config.totalSeats)
+      throw new OfficialPageError("官方已购席位数量与配置不一致。", "capacity_mismatch");
     const me = members.filter(p => p.self);
     if (me.length !== 1 || me[0].email !== this.config.adminEmail || me[0].role !== "owner")
       throw new Error("页面中的当前账号不是指定 Owner。");
@@ -278,7 +289,7 @@ export class BrowserAdapter {
     // Verify only the two unambiguous interpretations; never infer a free seat
     // from a partial list or an unexplained count.
     if (![members.length, members.length + invites.length].includes(capacity.assigned))
-      throw new Error("读取成员及邀请数与席位已分配数不一致，可能存在分页或加载变化。");
+      throw new InventoryMismatchError(capacity, members.length, invites.length);
     return {
       complete: true, workspaceId: this.config.workspaceId, workspaceName: this.config.workspaceName,
       accountEmail: me[0].email, totalSeats: capacity.total, seatLabel: this.config.seatLabel,
