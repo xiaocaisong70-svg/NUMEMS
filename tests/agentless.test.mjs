@@ -272,7 +272,7 @@ test('browser recovery is bounded and only uses fresh read-only evidence',async(
       assert.equal(name,'review_seat_failure');assert.equal(args.decision,'recover_browser');reviews++;return {plan:{}};}};
     const f=fixture();const browser={async observe(){if(++reads<3)throw Object.assign(new Error('still loading'),{failureCode:'browser_unavailable'});return f.snapshot();}};
     assert.equal(await recoverBrowser({portal,browser,journalFile:path.join(dir,'op.json'),pause:async ms=>delays.push(ms)}),true);
-    assert.equal(delays.reduce((a,b)=>a+b,0),105000);assert.ok(delays.every(ms=>ms<=1000));assert.equal(reviews,1);
+    assert.equal(delays.reduce((a,b)=>a+b,0),8000);assert.ok(delays.every(ms=>ms<=1000));assert.equal(reviews,1);
   } finally {assert.ok(path.resolve(dir).startsWith(path.resolve(os.tmpdir())+path.sep));await rm(dir,{recursive:true,force:true});}
 });
 test('browser recovery cannot downgrade a claimed or unknown operation',async()=>{

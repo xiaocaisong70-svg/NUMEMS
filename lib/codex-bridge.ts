@@ -1,5 +1,6 @@
 import { PROTECTED_OWNER_EMAIL, AUTHORIZED_TEST_EMAIL, transition, type State, type Actor } from "./seat-engine.ts";
 import { invitationDeadline } from "./queue-estimate.ts";
+import { publicFaultRescue, publicRecoveryProgress, rescueBlocksClaims, type FaultRescueTicket, type RecoveryProgress } from './recovery-control.ts';
 
 export const TARGET_WORKSPACE_ID = "cd01c344-8ff9-41fd-a750-f7b30af9a7c9";
 export const TEST_EMAIL = AUTHORIZED_TEST_EMAIL;
@@ -33,6 +34,7 @@ export type BridgeState = State & {
     holds?: OperationHold[]; globalFailureCode?: FailureCode; mailChannelError?: string;
     browserUnavailableAt?: string; workspaceReviewedAt?: string;
     operationFailureOrigin?: OperationFailureOrigin;
+    recoveryProgress?: RecoveryProgress; faultRescue?: FaultRescueTicket;
     receipts: { id: string; kind: string; email: string; at: string; evidence: string }[];
     reviewReceipts?: { failureId: string; targetId: string; operationId: string; workspaceId: string; observedAt: string; reviewedAt: string }[];
   };
@@ -312,6 +314,7 @@ export function workPlan(input: BridgeState, now: string) {
     globalFailureId: b?.globalFailureCode ? latestWorkspaceFailureId(input) : null,
     workspaceReviewedAt: b?.workspaceReviewedAt ?? null,
     officialObservedAt: b?.observation?.observedAt ?? null,
+    recoveryProgress: publicRecoveryProgress(input), faultRescue: publicFaultRescue(input),
     browserRecovery: b?.globalFailureCode === "browser_unavailable" && b.browserUnavailableAt && !b.lease
       ? { eligible: true, blockedAt: b.browserUnavailableAt } : null,
     blockedOperations: b?.holds ?? [],
@@ -335,6 +338,7 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     token: string, now: string): BridgeState {
   const next = structuredClone(input); const b = bridge(next);
   if (!b.enabled) throw new Error("Codex 执行器尚未启用。");
+  if (rescueBlocksClaims(next)) throw new Error("故障诊断尚未交还执行权，禁止新的成员或邮件操作。");
   if ((b.lastError || b.globalFailureCode) && !b.lease &&
       !(kind === "mail" && b.globalFailureCode === "browser_unavailable" && b.browserUnavailableAt))
     throw new Error("执行器有未解决错误，请先核实。");
@@ -538,7 +542,7 @@ export function deferOperation(input: BridgeState, args: {
 }
 
 export function reviewFailure(input: BridgeState, args: {
-  decision: "retry_not_started" | "resume_workspace" | "recover_browser" | "resume_preclaim_inventory" | "resume_verified_operation";
+  decision: "retry_not_started" | "resume_workspace" | "recover_browser" | "recover_login" | "resume_preclaim_inventory" | "resume_verified_operation";
   operationId?: string; expectedFailureId?: string; expectedTargetId?: string; observation?: Observation;
 }, now: string): BridgeState {
   let next = structuredClone(input), b = bridge(next);
@@ -552,7 +556,21 @@ export function reviewFailure(input: BridgeState, args: {
     }
     b.holds = b.holds?.filter(h => h.operation.id !== args.operationId);
     record(next, "codex_review_unstarted", now, hold.operation.requestId);
-  } else if (args.decision === "resume_workspace" || args.decision === "recover_browser" || args.decision === "resume_preclaim_inventory" || args.decision === "resume_verified_operation") {
+  } else if (args.decision === "resume_workspace" || args.decision === "recover_browser" || args.decision === "recover_login" || args.decision === "resume_preclaim_inventory" || args.decision === "resume_verified_operation") {
+    if(args.decision==='recover_login') {
+      const failure=[...next.audit].reverse().find(a=>a.action==='codex_workspace_blocked');
+      if(b.enabled!==true || b.testOnly!==false || b.globalFailureCode!=='login_expired' || !b.lastError ||
+        (b.holds?.length??0)!==0 || b.operationFailureOrigin || b.mailChannelError ||
+        !args.expectedFailureId || args.expectedFailureId!==failure?.id ||
+        !next.config.inventoryVerified || next.config.workspaceId!==TARGET_WORKSPACE_ID)
+        throw new Error('登录故障已变化或尚有未结案记录，禁止自动恢复。');
+      const checked=validateObservation(args.observation!,now),entries=[...checked.members,...checked.invites];
+      if(time(checked.observedAt)<time(failure.at) || checked.totalSeats!==next.config.totalSeats || entries.length>checked.totalSeats ||
+        new Set(entries.map(p=>norm(p.email))).size!==entries.length ||
+        checked.members.some(p=>norm(p.email)===PROTECTED_OWNER_EMAIL?p.role!=='owner':p.role!=='member') ||
+        checked.invites.some(p=>p.role!=='member'||norm(p.email)===PROTECTED_OWNER_EMAIL))
+        throw new Error('登录恢复缺少同一故障后的完整官方安全证据。');
+    }
     if (args.decision === "resume_preclaim_inventory" &&
         (b.enabled !== true || b.testOnly !== false || b.globalFailureCode !== "unknown" ||
          b.lastError !== PRECLAIM_INVENTORY_ERROR || (b.holds?.length ?? 0) !== 0 || b.mailChannelError ||
@@ -612,7 +630,7 @@ export function reviewFailure(input: BridgeState, args: {
         workspaceId: TARGET_WORKSPACE_ID, observedAt: args.observation!.observedAt, reviewedAt: now}].slice(-1000);
     }
     delete b.browserUnavailableAt;
-    record(next, args.decision === "recover_browser" ? "codex_browser_recovered" :
+    record(next, args.decision === "recover_browser" ? "codex_browser_recovered" : args.decision === "recover_login" ? "codex_login_recovered" :
       args.decision === "resume_preclaim_inventory" ? "codex_review_preclaim_inventory" :
       args.decision === "resume_verified_operation" ? "codex_review_verified_operation" : "codex_review_workspace", now);
   } else throw new Error("核查决定无效。");

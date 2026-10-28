@@ -9,6 +9,8 @@ export async function restoreV11History(db: D1Database, expectedRevision: number
     .first<{ revision: number; document: string }>();
   if (!old || old.revision !== expectedRevision) throw new Error("状态已变化，未执行回退；请重新读取当前版本。");
   const current = JSON.parse(old.document) as BridgeState;
+  if(current.codex?.faultRescue && ['pending','uncertain'].includes(current.codex.faultRescue.phase))
+    throw new Error('故障诊断尚未交还执行权，禁止版本回退。');
   if (current.config.automationEnabled || current.codex?.enabled || current.codex?.lease || current.codex?.holds?.length || current.codex?.operationFailureOrigin)
     throw new Error("请先停用执行器和云端调度，并结清全部租约与隔离任务后再回退。");
   const archived = await db.prepare("SELECT kind,id,email,user_id,sort_at,payload FROM portal_history ORDER BY sort_at,id").all<{

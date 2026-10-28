@@ -13,7 +13,7 @@ export class OfficialReadCancelled extends Error {
 }
 
 const stages = new Set(['page','members_navigation','invites_navigation','members_rows','invites_rows','capacity','snapshot']);
-const states = new Set(['loading','challenge','login','workspace_mismatch','network','capacity_unavailable']);
+const states = new Set(['loading','challenge','interaction_required','login','workspace_mismatch','network','capacity_unavailable']);
 // Never retain body text, actual redirect URLs, query strings or authentication
 // material. The expected route is already fixed by the adapter configuration.
 export function officialDiagnostic({stage='page',state,expectedUrl,at=Date.now()}) {
@@ -43,22 +43,32 @@ export function officialPageState({ url, expectedUrl, body, ready }) {
 }
 
 export async function waitForOfficialPage({ inspect, pause, now = Date.now, timeoutMs = 45_000,
-  challengeTimeoutMs=timeoutMs,stage='page',shouldStop=async()=>false,onProgress=async()=>{} }) {
+  challengeTimeoutMs=timeoutMs,deadlineAt,interactionGraceMs=15000,
+  stage='page',shouldStop=async()=>false,onProgress=async()=>{} }) {
   if (!Number.isInteger(timeoutMs) || timeoutMs<1 || timeoutMs>300_000 ||
-      !Number.isInteger(challengeTimeoutMs) || challengeTimeoutMs<1 || challengeTimeoutMs>300_000 || !stages.has(stage))
+      !Number.isInteger(challengeTimeoutMs) || challengeTimeoutMs<1 || challengeTimeoutMs>300_000 ||
+      (deadlineAt!==undefined && !Number.isFinite(deadlineAt)) ||
+      !Number.isInteger(interactionGraceMs) || interactionGraceMs<1000 || interactionGraceMs>30000 || !stages.has(stage))
     throw new Error('Invalid read-only readiness budget.');
-  const started=now(),hardDeadline=started+Math.min(300_000,timeoutMs+challengeTimeoutMs);
-  let loadingDeadline=started+timeoutMs,challengeSeen=false,postChallengeLoading=false;
+  const started=now(),hardDeadline=Math.min(deadlineAt??Infinity,started+Math.min(300_000,timeoutMs+challengeTimeoutMs));
+  let loadingDeadline=started+timeoutMs,challengeSeen=false,postChallengeLoading=false,interactionSeenAt=null;
   while (true) {
     if (await shouldStop()) throw new OfficialReadCancelled();
     const inspected=await inspect(), state = officialPageState(inspected),instant=now();
-    const diagnostic=officialDiagnostic({stage,state:state==='browser_unavailable'?'challenge':
+    // Text such as "Checking your browser" says nothing about a manual action.
+    // Only a separately observed, visible verification control which remains
+    // present after the passive grace period can establish interaction_required.
+    if(state==='browser_unavailable' && inspected.interactionRequired===true)interactionSeenAt??=instant;
+    else interactionSeenAt=null;
+    const interactionRequired=interactionSeenAt!==null && instant-interactionSeenAt>=interactionGraceMs;
+    const diagnostic=officialDiagnostic({stage,state:state==='browser_unavailable'?(interactionRequired?'interaction_required':'challenge'):
       state==='login_expired'?'login':state,expectedUrl:inspected.expectedUrl,at:instant});
     if (await shouldStop()) throw new OfficialReadCancelled();
     if (diagnostic) await onProgress(diagnostic);
-    if (state === "ready") return;
+    if (state === "ready" && instant<=hardDeadline) return;
     if (state === "login_expired") throw new OfficialPageError("官方后台登录已失效，需管理员重新登录。", state,diagnostic);
     if (state === "workspace_mismatch") throw new OfficialPageError("官方后台跳转到非目标工作空间，已停止。", state,diagnostic);
+    if(interactionRequired)throw new OfficialPageError('官方安全检查页持续显示需要本人操作的验证控件；程序未点击任何验证。','browser_unavailable',diagnostic);
     if (state==='browser_unavailable') challengeSeen=true;
     else if (state==='loading' && challengeSeen && !postChallengeLoading) {
       // Once the same-page challenge naturally ends, allow the normal loading

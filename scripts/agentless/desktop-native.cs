@@ -152,7 +152,7 @@ namespace NumemsDesktop {
     }
     static readonly HashSet<string> AdminCommands = new HashSet<string>(StringComparer.Ordinal) {
       "status", "observe", "prepare-test", "release-test", "test-reminder", "test-expire", "enable-live", "disable",
-      "reconcile", "recover-browser", "resolve-alert", "resume-test-invite", "review-test-workspace", "review-live-workspace", "review-verified-operation", "rollback-status", "prepare-v11-rollback"
+      "reconcile", "recover-browser", "resolve-alert", "resume-test-invite", "review-test-workspace", "review-live-workspace", "review-verified-operation", "rollback-status", "prepare-v11-rollback", "prepare-fault-rescue", "finish-fault-rescue"
     };
     static readonly HashSet<string> TestIdCommands = new HashSet<string>(StringComparer.Ordinal) {
       "release-test", "test-reminder", "test-expire"
@@ -170,8 +170,9 @@ namespace NumemsDesktop {
         if (String.IsNullOrEmpty(adminCommand) || !AdminCommands.Contains(adminCommand))
           throw new ArgumentException("An allowed admin command is required");
         bool rollback = adminCommand == "prepare-v11-rollback";
-        bool needsId = TestIdCommands.Contains(adminCommand) || rollback;
-        if (needsId && (requestId == null || !Regex.IsMatch(requestId, rollback ? @"\A\d{1,15}\z" : @"\Areq_[a-zA-Z0-9_]+\z")))
+        bool rescue = adminCommand == "finish-fault-rescue";
+        bool needsId = TestIdCommands.Contains(adminCommand) || rollback || rescue;
+        if (needsId && (requestId == null || !Regex.IsMatch(requestId, rollback ? @"\A\d{1,15}\z" : rescue ? @"\Arescue_[a-zA-Z0-9_-]{16,100}\z" : @"\Areq_[a-zA-Z0-9_]+\z")))
           throw new ArgumentException("This test command requires a registered req_ ID");
         if (!needsId && !String.IsNullOrEmpty(requestId))
           throw new ArgumentException("RequestId is allowed only for test commands that require an ID");

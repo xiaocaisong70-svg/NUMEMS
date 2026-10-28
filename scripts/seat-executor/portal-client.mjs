@@ -32,6 +32,25 @@ export class PortalQueueUnavailable extends Error {
   }
 }
 
+// Optional deadlines are for recovery reads only. Mutation transport and
+// ambiguous-result handling retain their original single-attempt semantics.
+function normalizeReadControls(controls,operation) {
+  if(!controls || !Object.keys(controls).length)return undefined;
+  if(!['seat_portal_status','portal_identity'].includes(operation) ||
+      (controls.deadlineAt!==undefined&&!Number.isFinite(controls.deadlineAt)) ||
+      (controls.budgetMs!==undefined&&(!Number.isInteger(controls.budgetMs)||controls.budgetMs<1||controls.budgetMs>120000)) ||
+      (controls.now!==undefined&&typeof controls.now!=='function') ||
+      (controls.deadlineAt===undefined&&controls.budgetMs===undefined))throw new Error('Invalid portal read deadline.');
+  const now=controls.now??Date.now;
+  return {now,deadlineAt:Math.min(controls.deadlineAt??Infinity,now()+(controls.budgetMs??120000))};
+}
+function readTimeout(controls,cap,requestedOperation,stage='identity') {
+  if(!controls)return cap;
+  const remaining=controls.deadlineAt-controls.now();
+  if(remaining<=0)throw new PortalReadUnavailable({stage,requestedOperation,requestNotSent:stage==='identity',readOnly:true,reason:'timeout'});
+  return Math.max(1,Math.min(cap,Math.floor(remaining)));
+}
+
 export class PortalClient {
   constructor(context, config, setupOperations = []) {
     this.context = context;
@@ -40,11 +59,20 @@ export class PortalClient {
     this.setupOperations = setupOperations;
   }
 
-  async open(requestedOperation='portal_identity') {
+  // Only the guarded pre-claim recovery controller may replace a closed
+  // browser context. Identity is read again; no cookies or credentials move.
+  rebindContext(context) {
+    if(!context || typeof context.newPage!=='function')throw new Error('Invalid recovered browser context.');
+    this.context=context;this.page=undefined;this.sessionRestoreAttempted=false;
+  }
+
+  async open(requestedOperation='portal_identity',readOptions) {
+    const controls=normalizeReadControls(readOptions,requestedOperation);
+    readTimeout(controls,30000,requestedOperation);
     if (!this.page) this.page = await this.context.newPage();
     if (new URL(this.page.url()).origin !== new URL(this.config.siteUrl).origin) {
       try {
-        await this.page.goto(this.config.siteUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
+        await this.page.goto(this.config.siteUrl, { waitUntil: "domcontentloaded", timeout: readTimeout(controls,30000,requestedOperation) });
       } catch(error) {
         // This navigation precedes any RPC. Only an explicit navigation timeout
         // or a narrow transport code qualifies; auth, certificate and closed-page
@@ -57,11 +85,12 @@ export class PortalClient {
       }
     }
     const readIdentity = async () => {
-      const result=await this.page.evaluate(async () => {
+      const timeoutMs=readTimeout(controls,20000,requestedOperation);
+      const result=await this.page.evaluate(async ({timeoutMs=20000}={}) => {
         let response;
         try {
           response = await fetch("/api/portal", { cache: "no-store", credentials: "same-origin",
-            signal:AbortSignal.timeout(20_000) });
+            signal:AbortSignal.timeout(timeoutMs) });
           return { status: response.status, body: await response.json() };
         } catch(error) {
           // JSON syntax/protocol errors and known HTTP auth errors remain fatal.
@@ -74,7 +103,8 @@ export class PortalClient {
           }
           throw error;
         }
-      });
+      },controls?{timeoutMs}:undefined);
+      readTimeout(controls,20000,requestedOperation);
       if(result?.transportFailure)throw new PortalReadUnavailable({stage:'identity',requestedOperation,
         requestNotSent:true,readOnly:true,reason:result.transportFailure.reason});
       return result;
@@ -90,19 +120,19 @@ export class PortalClient {
       const isAccountChoice = url=>url.origin==='https://auth.openai.com' && url.pathname==='/choose-an-account';
       try {
         await this.page.goto(new URL('/signin-with-chatgpt?return_to=%2F',site).href,
-          {waitUntil:'domcontentloaded',timeout:30_000});
-        await this.page.waitForURL(url=>isPortal(url)||isAccountChoice(url),{timeout:30_000});
+          {waitUntil:'domcontentloaded',timeout:readTimeout(controls,30000,requestedOperation)});
+        await this.page.waitForURL(url=>isPortal(url)||isAccountChoice(url),{timeout:readTimeout(controls,30000,requestedOperation)});
         if(isAccountChoice(new URL(this.page.url()))) {
           // A normal existing-account selector is not a new consent or credential form.
           // Select only the exact administrator address, never the first/default account.
           const label=this.page.getByText(this.config.adminEmail,{exact:true}).filter({visible:true});
-          await label.waitFor({state:'visible',timeout:10_000});
+          await label.waitFor({state:'visible',timeout:readTimeout(controls,10000,requestedOperation)});
           if(await label.count()!==1)throw new Error('管理员账号选项不唯一。');
           const choice=label.locator('xpath=ancestor-or-self::*[self::button or self::a or @role="button" or @role="link"][1]').filter({visible:true});
           if(await choice.count()!==1 || !isAccountChoice(new URL(this.page.url())))
             throw new Error('无法唯一识别已登录管理员账号选项。');
-          await choice.click({timeout:10_000});
-          await this.page.waitForURL(isPortal,{timeout:30_000});
+          await choice.click({timeout:readTimeout(controls,10000,requestedOperation)});
+          await this.page.waitForURL(isPortal,{timeout:readTimeout(controls,30000,requestedOperation)});
         }
         identity = await readIdentity();
       } catch(error) {
@@ -116,22 +146,25 @@ export class PortalClient {
     return this.page;
   }
 
-  async call(name, args = {}) {
+  async call(name, args = {},readOptions) {
     const allowed = new Set(["process_seat_queue", "refresh_seat_queue", "seat_portal_status", "observe_workspace",
       "claim_seat_operation", "complete_seat_operation", "defer_seat_operation",
       "record_codex_schedule", "record_idle_observation_failure", "observe_idle_workspace"]);
     for (const operation of this.setupOperations) allowed.add(operation);
     if (!allowed.has(name)) throw new Error("执行器不允许调用该门户操作。");
-    const page = await this.open(name);
+    const controls=normalizeReadControls(readOptions,name);
+    const page = await this.open(name,controls);
     const body = { jsonrpc: "2.0", id: ++this.sequence,
       method: "tools/call", params: { name, arguments: args } };
+    const timeoutMs=readTimeout(controls,30000,name);
     const result = await page.evaluate(async requestBody => {
+      const {_readTimeoutMs=30000,...rpcBody}=requestBody;
       let response;
       try {
         response = await fetch("/api/codex", {
           method: "POST", credentials: "same-origin", cache: "no-store",
-          signal:AbortSignal.timeout(30_000),
-          headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody),
+          signal:AbortSignal.timeout(_readTimeoutMs),
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify(rpcBody),
         });
         return { status: response.status, body: await response.json() };
       } catch(error) {
@@ -143,7 +176,8 @@ export class PortalClient {
         }
         throw error;
       }
-    }, body);
+    }, controls?{...body,_readTimeoutMs:timeoutMs}:body);
+    if(controls)readTimeout(controls,30000,name,'status');
     if(result?.transportFailure && name==='seat_portal_status')
       throw new PortalReadUnavailable({stage:'status',requestedOperation:name,
         requestNotSent:false,readOnly:true,reason:result.transportFailure.reason});

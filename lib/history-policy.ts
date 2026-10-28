@@ -28,6 +28,9 @@ export function compactHistory(previous: State, input: State) {
     else protectedRequests.add(operation.targetId);
   }
   if (bridge?.operationFailureOrigin?.requestId) protectedRequests.add(bridge.operationFailureOrigin.requestId);
+  const activeRescue=bridge?.faultRescue && ['pending','uncertain'].includes(bridge.faultRescue.phase)?bridge.faultRescue:null;
+  const rescueFailure=activeRescue?state.audit.find(a=>a.id===activeRescue.failureId):undefined;
+  if(rescueFailure?.requestId)protectedRequests.add(rescueFailure.requestId);
   const latestFailure = [...state.audit].reverse().find(a => a.action === "codex_workspace_blocked");
   if ((bridge?.globalFailureCode || bridge?.lastError) && latestFailure?.requestId)
     protectedRequests.add(latestFailure.requestId);
@@ -56,6 +59,7 @@ export function compactHistory(previous: State, input: State) {
   const keep = new Set(state.audit.slice(-HISTORY_LIMITS.audit).map(a => a.id));
   if ((bridge?.globalFailureCode || bridge?.lastError) && latestFailure) keep.add(latestFailure.id);
   if (bridge?.operationFailureOrigin?.failureId) keep.add(bridge.operationFailureOrigin.failureId);
+  if(activeRescue)keep.add(activeRescue.failureId);
   for (const item of state.audit) if (item.requestId && protectedRequests.has(item.requestId)) keep.add(item.id);
   for (const item of state.audit) if (!keep.has(item.id)) rows.push(row("audit", item));
   state.audit = state.audit.filter(a => keep.has(a.id));
@@ -74,6 +78,8 @@ export function canReadHistory(item: { email?: string; userId?: string }, actor:
  * snapshot. The caller must stop all executors and CAS this result at revision. */
 export function rehydrateHistory(input: State, rows: HistoryRow[]) {
   const state = structuredClone(input) as BridgeState;
+  if(state.codex?.faultRescue && ['pending','uncertain'].includes(state.codex.faultRescue.phase))
+    throw new Error('故障诊断仍持有执行权，禁止回退或覆盖当前状态。');
   if (state.codex?.lease || state.codex?.holds?.length || state.codex?.operationFailureOrigin)
     throw new Error("存在未结案操作，禁止恢复历史；请先按原租约核对结案。");
   if (state.requests.some(r => r.status === "pending_removal" && (r.removalReason as string) === "whitelist_revoked"))

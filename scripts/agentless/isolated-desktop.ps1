@@ -1,7 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$NodeExe,
   [ValidateSet('probe','once','run','admin')][string]$Mode = 'probe',
-  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','rollback-status','prepare-v11-rollback')][string]$AdminCommand,
+  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','rollback-status','prepare-v11-rollback','prepare-fault-rescue','finish-fault-rescue')][string]$AdminCommand,
   [string]$RequestId,
   [switch]$RecoverSettledLock,
   [switch]$ReviewRetry
@@ -113,6 +113,45 @@ function Assert-WatchdogStart {
       if ($actual -cne $expected) { throw 'Review proof changed after watchdog decision; stopped before launch.' }
     }
   }
+  if ($ticket.reason -ceq 'fault_rescue_verified_start_candidate') {
+    $expectedRescue = $ticket.faultRescueExpected
+    if ($Mode -cne 'run' -or $null -eq $ticket.expectedHostPid -or $null -eq $expectedRescue -or
+        $expectedRescue.rescueId -cnotmatch '\Arescue_[a-zA-Z0-9_-]{16,100}\z' -or
+        $expectedRescue.failureId -cnotmatch '\A[a-zA-Z0-9:_-]{1,240}\z') {
+      throw 'Fault rescue start requires the exact previous isolated host and ticket.'
+    }
+    $entries = @(@{key='rescue'; name='fault-rescue.json'}, @{key='status'; name='status.json'},
+      @{key='journal'; name='operation.json'}, @{key='admin'; name='admin-result.json'})
+    foreach ($entry in $entries) {
+      $expected = $ticket.faultRescueProofDigests.($entry.key)
+      $file = Join-Path $runtimePath $entry.name
+      if ($expected -isnot [string] -or $expected -cnotmatch '\A[0-9a-f]{64}\z' -or -not [IO.File]::Exists($file)) {
+        throw 'Fault rescue proof missing; stopped before launch.'
+      }
+      $sha = [Security.Cryptography.SHA256]::Create()
+      try { $actual = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($file)))).Replace('-','').ToLowerInvariant() }
+      finally { $sha.Dispose() }
+      if ($actual -cne $expected) { throw 'Fault rescue proof changed; stopped before launch.' }
+    }
+    $rescue = [IO.File]::ReadAllText((Join-Path $runtimePath 'fault-rescue.json')) | ConvertFrom-Json
+    $status = [IO.File]::ReadAllText((Join-Path $runtimePath 'status.json')) | ConvertFrom-Json
+    $journal = [IO.File]::ReadAllText((Join-Path $runtimePath 'operation.json')) | ConvertFrom-Json
+    $admin = [IO.File]::ReadAllText((Join-Path $runtimePath 'admin-result.json')) | ConvertFrom-Json
+    if ($rescue.phase -cne 'finished' -or $rescue.outcome -cne 'recovered' -or $rescue.agentStopped -ne $true -or
+        $rescue.ticket.id -cne $expectedRescue.rescueId -or $rescue.failureId -cne $expectedRescue.failureId -or
+        $rescue.agentProof.source -cne 'app_server_thread_read' -or $rescue.agentProof.confirmed -ne $true -or
+        $rescue.agentProof.stopped -ne $true -or $rescue.agentProof.threadId -cne $rescue.threadId -or
+        $rescue.agentProof.clientUserMessageId -cne $rescue.clientId -or
+        $journal.phase -cne 'settled' -or $null -ne $journal.lease -or $null -ne $journal.receipt -or
+        $admin.command -cne 'finish-fault-rescue' -or $admin.requestId -cne $expectedRescue.rescueId -or $admin.success -ne $true -or
+        $status.faultRescueEvidence.rescueId -cne $expectedRescue.rescueId -or
+        $status.faultRescueEvidence.failureId -cne $expectedRescue.failureId -or $status.mode -cne 'idle' -or
+        $status.state -ceq 'blocked' -or $status.error -or $status.failureCode) {
+      throw 'Fault rescue result does not authorize a worker restart.'
+    }
+  } elseif ($null -ne $ticket.faultRescueProofDigests -or $null -ne $ticket.faultRescueExpected) {
+    throw 'Fault rescue proof cannot be used for another startup reason.'
+  }
   if ($ReviewRetry) {
     $expectedReview = $ticket.reviewExpected
     $retryState = [IO.File]::ReadAllText((Join-Path $runtimePath 'review-retry.json')) | ConvertFrom-Json
@@ -138,9 +177,11 @@ try {
       -not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'An absolute installed node.exe path is required.' }
   if ($Mode -eq 'admin') {
     if (-not $AdminCommand) { throw 'AdminCommand is required in admin mode.' }
-    $requiresRequestId = $AdminCommand -cin @('release-test','test-reminder','test-expire','prepare-v11-rollback')
+    $requiresRequestId = $AdminCommand -cin @('release-test','test-reminder','test-expire','prepare-v11-rollback','finish-fault-rescue')
     if ($AdminCommand -ceq 'prepare-v11-rollback') {
       if ($RequestId -cnotmatch '\A\d{1,15}\z') { throw 'Rollback requires a current numeric D1 revision.' }
+    } elseif ($AdminCommand -ceq 'finish-fault-rescue') {
+      if ($RequestId -cnotmatch '\Arescue_[a-zA-Z0-9_-]{16,100}\z') { throw 'An existing rescue ticket ID is required.' }
     } elseif ($requiresRequestId -and $RequestId -cnotmatch '\Areq_[a-zA-Z0-9_]+\z') { throw 'This test command requires a registered req_ ID.' }
     if (-not $requiresRequestId -and $PSBoundParameters.ContainsKey('RequestId')) { throw 'RequestId is allowed only for test commands that require an ID.' }
     $report['adminCommand'] = $AdminCommand

@@ -14,6 +14,7 @@ import * as reminder from '../lib/reminder-policy.ts';
 import * as access from '../lib/portal-access.ts';
 import * as historyStore from '../lib/history-store.ts';
 import * as ratePolicy from '../lib/request-rate-policy.ts';
+import * as recoveryControl from '../lib/recovery-control.ts';
 
 const at='2026-10-28T00:00:00.000Z';
 const owner={userId:'owner',email:PROTECTED_OWNER_EMAIL,isAdmin:true};
@@ -46,7 +47,7 @@ async function serviceModule(db,actor=alice){
   const ctx=vm.createContext({Request,Response,URL,TextEncoder,Date,structuredClone,console});
   const dependencies={'cloudflare:workers':{env:{DB:db.api,REMINDER_DELIVERY_MODE:'in_app'}},
     '@/app/chatgpt-auth':{getChatGPTUser:async()=>actor},'./seat-engine':engine,'./portal-access':access,
-    './reminder-policy':reminder,'./history-store':historyStore,'./request-rate-policy':ratePolicy};
+    './reminder-policy':reminder,'./history-store':historyStore,'./recovery-control':recoveryControl,'./request-rate-policy':ratePolicy};
   const module=new vm.SourceTextModule(ts.transpileModule(readFileSync(new URL('../lib/portal-service.ts',import.meta.url),'utf8'),
     {compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText,{context:ctx});
   await module.link(name=>new vm.SyntheticModule(Object.keys(dependencies[name]),function(){

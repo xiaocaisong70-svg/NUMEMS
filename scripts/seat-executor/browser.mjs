@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { root, normalizeEmail } from "./config.mjs";
 import { validateObservation, presence, assertOrdinary } from "./inventory.mjs";
-import { OfficialPageError, officialPageState, officialDiagnostic, waitForOfficialPage } from "./official-readiness.mjs";
+import { OfficialPageError, OfficialReadCancelled, officialPageState, officialDiagnostic, waitForOfficialPage } from "./official-readiness.mjs";
 
 export const ui = {
   members: /^(用户|活跃成员(?:\s*\d+)?|Users|Members(?:\s*\d+)?)$/,
@@ -79,13 +79,15 @@ export class BrowserAdapter {
     this.page = page; this.fixtureOrigin = fixtureOrigin;
     this.onExternalAction = onExternalAction;
   }
-  async open() {
+  async open({timeoutMs=30000}={}) {
     if (this.page) return this.page;
+    if(!Number.isInteger(timeoutMs)||timeoutMs<1||timeoutMs>30000)throw new Error('Invalid standard browser startup budget.');
+    timeoutMs=Math.max(1,Math.min(timeoutMs,await this.beforeOfficialRead('page')));
     const chromium = await chromiumRuntime();
     await fs.mkdir(this.config.profile, { recursive: true });
     this.context = await chromium.launchPersistentContext(this.config.profile, {
       headless: this.config.headless, viewport: { width: 1440, height: 1000 },
-      locale: "zh-CN", acceptDownloads: false, chromiumSandbox: true,
+      locale: "zh-CN", acceptDownloads: false, chromiumSandbox: true,timeout:timeoutMs,
       ...(this.config.browserChannel ? { channel: this.config.browserChannel } : {})
     });
     this.page = this.context.pages()[0] || await this.context.newPage();
@@ -96,6 +98,41 @@ export class BrowserAdapter {
   url(tab = "members") {
     const base = this.fixtureOrigin || "https://admin.openai.com";
     return `${base}/workspace/${encodeURIComponent(this.config.workspaceId)}/members?workspace=${encodeURIComponent(this.config.workspaceSlug)}${tab === "invites" ? "&tab=invites" : ""}`;
+  }
+  async beforeOfficialRead(stage='page') {
+    const controls=this.readOnlyWaitControls;
+    if(await controls?.shouldStop?.())throw new OfficialReadCancelled();
+    if(controls?.deadlineAt!==undefined) {
+      const remaining=controls.deadlineAt-(controls.now??Date.now)();
+      if(remaining<=0)throw new OfficialPageError('官方完整核对已达到本次只读时间预算；未采纳部分名单。','browser_unavailable',
+        officialDiagnostic({stage,state:'loading',expectedUrl:this.url()}));
+      if(this.context)this.page?.setDefaultTimeout?.(Math.max(1,Math.min(12000,remaining)));
+      return remaining;
+    }
+    return 30000;
+  }
+  async challengeInteraction(body) {
+    const p=this.page;
+    if(!p || officialPageState({url:p.url(),expectedUrl:this.url(),body,ready:false})!=='browser_unavailable')return false;
+    // Read only explicit, visible verification controls. A challenge iframe or
+    // challenge text alone never proves a human is needed; no control is clicked.
+    const frames=typeof p.frames==='function'?p.frames():[p];
+    for(const frame of frames) {
+      const address=typeof frame.url==='function'?frame.url():p.url();
+      const trusted=frame===p || frame===p.mainFrame?.() ||
+        /^https:\/\/challenges\.cloudflare\.com\//i.test(address);
+      if(!trusted)continue;
+      const controls=frame.getByRole('checkbox',{name:/^(?:verify (?:that )?you are (?:a )?human|确认您是真人|验证您是真人|验证您不是自动程序)$/i}).filter({visible:true});
+      if(await controls.count()!==1)continue;
+      const control=controls.first();
+      const ariaChecked=await control.getAttribute('aria-checked');
+      if(ariaChecked==='true')continue;
+      if(ariaChecked==='false')return true;
+      // A detached or unreadable element is not evidence that a person must act.
+      // Native checkboxes can omit aria-checked; ARIA controls must expose it.
+      try {if(!await control.isChecked())return true;} catch {continue;}
+    }
+    return false;
   }
   async guard() {
     const p = await this.open(), url = new URL(p.url()), expected = new URL(this.url());
@@ -117,7 +154,8 @@ export class BrowserAdapter {
   async load(tab = "members") {
     this.listTab = tab;
     const p = await this.open();
-    try { await p.goto(this.url(tab), { waitUntil: "domcontentloaded", timeout: 30_000 }); }
+    const remaining=await this.beforeOfficialRead(tab==='members'?'members_navigation':'invites_navigation');
+    try { await p.goto(this.url(tab), { waitUntil: "domcontentloaded", timeout: Math.max(1,Math.min(30000,remaining)) }); }
     catch (error) {
       if (/Timeout|net::ERR_(TIMED_OUT|CONNECTION|NETWORK|INTERNET_DISCONNECTED|NAME_NOT_RESOLVED)/i.test(String(error)))
         throw new OfficialPageError("官方后台暂时无法连接，未开始成员操作。", "browser_unavailable",
@@ -126,10 +164,10 @@ export class BrowserAdapter {
     }
     const selected = p.getByRole("tab", { name: tab === "members" ? ui.members : ui.invites });
     await waitForOfficialPage({
-      ...this.readOnlyWaitControls,
-      stage:tab==='members'?'members_navigation':'invites_navigation',challengeTimeoutMs:180_000,
-      inspect: async () => ({ url: p.url(), expectedUrl: this.url(tab),
-        body: await p.locator("body").innerText(), ready: await selected.isVisible() }),
+      challengeTimeoutMs:20000,...this.readOnlyWaitControls,
+      stage:tab==='members'?'members_navigation':'invites_navigation',
+      inspect: async () => {const body=await p.locator('body').innerText();return { url: p.url(), expectedUrl: this.url(tab),
+        body, interactionRequired:await this.challengeInteraction(body),ready: await selected.isVisible() };},
       pause: ms => p.waitForTimeout(ms),
     });
     await this.guard();
@@ -145,18 +183,20 @@ export class BrowserAdapter {
     const filter = p.getByRole("combobox", { name: /^(角色|Role)$/i }).filter({ visible: true });
     if (await filter.count() && !/^(角色|所有角色|全部|Role|All roles|All)$/i.test((await filter.innerText()).trim()))
       throw new Error("成员列表存在角色筛选，请清除后恢复。");
-    await p.getByRole("table").filter({ visible: true }).waitFor({ state: "visible", timeout: 25_000 });
+    const tableRemaining=await this.beforeOfficialRead(tab==='members'?'members_rows':'invites_rows');
+    await p.getByRole("table").filter({ visible: true }).waitFor({ state: "visible", timeout: Math.max(1,Math.min(25000,tableRemaining)) });
     await this.waitForRows();
   }
   async waitForRows({requireOwner = false, ownerSeen = false} = {}) {
     const p = await this.open();
+    await this.beforeOfficialRead(this.listTab==='invites'?'invites_rows':'members_rows');
     const expectedTab = this.listTab ?? (new URL(p.url()).searchParams.get("tab") === "invites" ? "invites" : "members");
     let expectedTotal = null;
     // Table headers appear before the official data request has finished. A visible
     // table is not evidence of an empty list, including after pagination/filtering.
     await waitForOfficialPage({
-      ...this.readOnlyWaitControls,
-      stage:expectedTab==='members'?'members_rows':'invites_rows',challengeTimeoutMs:180_000,
+      challengeTimeoutMs:20000,...this.readOnlyWaitControls,
+      stage:expectedTab==='members'?'members_rows':'invites_rows',
       inspect: async () => {
         const selected = p.getByRole("tab", { name: expectedTab === "members" ? ui.members : ui.invites }).filter({ visible:true });
         const selectedCount = await selected.count();
@@ -205,7 +245,8 @@ export class BrowserAdapter {
           if (expectedTab === "invites" && ready && cellRows.filter(row => row.join(" ").includes("@"))
             .some(row => {const parsed=parseRow(row,this.config.seatLabel);return parsed.self || parsed.role !== "member";})) ready = false;
         }
-        return { url:p.url(), expectedUrl:this.url(), body:await p.locator("body").innerText(), ready };
+        const body=await p.locator('body').innerText();
+        return { url:p.url(), expectedUrl:this.url(), body,interactionRequired:await this.challengeInteraction(body), ready };
       },
       pause: ms => p.waitForTimeout(ms), timeoutMs:25_000,
     });
@@ -226,10 +267,11 @@ export class BrowserAdapter {
   }
   async capacityOnce() {
     const p = await this.open(), label = `${this.config.seatLabel}席位`;
+    await this.beforeOfficialRead('capacity');
     let candidates = [];
     await waitForOfficialPage({
-      ...this.readOnlyWaitControls,
-      stage:'capacity',challengeTimeoutMs:180_000,
+      challengeTimeoutMs:20000,...this.readOnlyWaitControls,
+      stage:'capacity',
       inspect: async () => {
         candidates = await p.getByText(new RegExp(`^${escape(this.config.seatLabel)}(?:席位| seats)$`, "i"))
           .filter({ visible:true }).evaluateAll(nodes => {
@@ -266,7 +308,7 @@ export class BrowserAdapter {
               officialDiagnostic({stage:'capacity',state:'capacity_unavailable',expectedUrl:this.url()})); }
           }
         }
-        return { url:p.url(), expectedUrl:this.url(), body, ready };
+        return { url:p.url(), expectedUrl:this.url(), body, interactionRequired:await this.challengeInteraction(body),ready };
       },
       pause: ms => p.waitForTimeout(ms), timeoutMs:25_000,
     });
@@ -277,6 +319,7 @@ export class BrowserAdapter {
     const p = await this.open(), result = [], fingerprints = new Set();
     let expectedTotal = null;
     for (let index = 0; index < 100; index++) {
+      await this.beforeOfficialRead(this.listTab==='invites'?'invites_rows':'members_rows');
       await this.guard();
       const evidence = await this.waitForRows({requireOwner,
         ownerSeen:result.some(row => row.email === this.config.adminEmail && row.role === "owner" && row.self)});
@@ -312,11 +355,12 @@ export class BrowserAdapter {
         return result;
       }
       const oldText = await table.innerText();
+      const remaining=await this.beforeOfficialRead(this.listTab==='invites'?'invites_rows':'members_rows');
       await next.click();
       // Bounded wait for the visible table to change; never an unbounded polling loop.
       await p.waitForFunction(({ selector, old }) => {
         const t = document.querySelector(selector); return t && t.innerText !== old;
-      }, { selector: 'table,[role="table"]', old: oldText }, { timeout: 12_000 });
+      }, { selector: 'table,[role="table"]', old: oldText }, { timeout: Math.max(1,Math.min(12000,remaining)) });
     }
     throw new Error("分页超过上限，未执行外部操作。");
   }
@@ -343,16 +387,26 @@ export class BrowserAdapter {
       observedAt: new Date().toISOString(), pageUrl: this.page.url()
     };
   }
-  async observe({shouldStop,onProgress}={}) {
+  async observe({shouldStop,onProgress,budgetMs=60000,challengeTimeoutMs=20000,deadlineAt,now=Date.now}={}) {
+    if(!Number.isInteger(budgetMs)||budgetMs<1||budgetMs>300000||
+       !Number.isInteger(challengeTimeoutMs)||challengeTimeoutMs<1||challengeTimeoutMs>30000||
+       (deadlineAt!==undefined&&!Number.isFinite(deadlineAt)))throw new Error('Invalid official observation budget.');
     const previous=this.readOnlyWaitControls;
-    this.readOnlyWaitControls={shouldStop,onProgress};
-    try { return await this.observeStable(); }
-    finally { this.readOnlyWaitControls=previous; }
+    this.readOnlyWaitControls={shouldStop,onProgress,now,challengeTimeoutMs,deadlineAt:Math.min(deadlineAt??Infinity,now()+budgetMs)};
+    try {await this.beforeOfficialRead('snapshot');const value=await this.observeStable();await this.beforeOfficialRead('snapshot');return value;}
+    catch(error) {
+      if(error.name==='TimeoutError' && now()>=this.readOnlyWaitControls.deadlineAt)
+        throw new OfficialPageError('官方完整核对达到本次只读时间预算，未采纳部分名单。','browser_unavailable',
+          officialDiagnostic({stage:'snapshot',state:'loading',expectedUrl:this.url()}));
+      throw error;
+    }
+    finally { this.readOnlyWaitControls=previous;if(this.context)this.page?.setDefaultTimeout?.(12000); }
   }
   async observeStable() {
     // Validate each reading before comparing. A normal join can change two safe
     // snapshots; wrong identity, workspace or purchased capacity must still stop.
     const a = validateObservation(await this.snapshot(), this.config);
+    await this.beforeOfficialRead('snapshot');
     const b = validateObservation(await this.snapshot(), this.config);
     const canonical = s => JSON.stringify({ totalSeats: s.totalSeats,
       members: s.members.slice().sort((x, y) => x.email.localeCompare(y.email)),

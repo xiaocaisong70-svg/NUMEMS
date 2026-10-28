@@ -2,6 +2,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { BrowserAdapter } from '../seat-executor/browser.mjs';
+import { OfficialPageError,officialDiagnostic } from '../seat-executor/official-readiness.mjs';
 const execute = promisify(execFile);
 
 export function validateDesktopProof(proof, expected) {
@@ -13,7 +14,8 @@ export function validateDesktopProof(proof, expected) {
   return proof;
 }
 
-export async function assertDesktop(config, {env=process.env, platform=process.platform, run=execute}={}) {
+export async function assertDesktop(config, {env=process.env, platform=process.platform, run=execute,timeoutMs=20000}={}) {
+  if(!Number.isInteger(timeoutMs)||timeoutMs<1||timeoutMs>20000)throw new Error('Invalid desktop verification budget.');
   if (config.browserMode === 'headless' && config.headless === true)
     return {mode:'headless',isolated:false};
   if (platform !== 'win32' || config.browserMode !== 'isolated_desktop' || config.headless !== false)
@@ -25,7 +27,7 @@ export async function assertDesktop(config, {env=process.env, platform=process.p
   try {
     ({stdout} = await run(powershell, ['-NoProfile','-NonInteractive','-File',
       path.join(import.meta.dirname,'desktop-probe.ps1')],
-      {windowsHide:true, timeout:20_000, env}));
+      {windowsHide:true, timeout:timeoutMs, env}));
   } catch (error) {
     let proof;try{proof=JSON.parse(error.stdout?.trim().replace(/^\uFEFF/,''));}catch{}
     // Only the exact native input-desktop failure is transient. An invalid
@@ -39,9 +41,22 @@ export async function assertDesktop(config, {env=process.env, platform=process.p
 
 /** Keeps normal browser rendering while refusing any launch on the user's desktop. */
 export class AgentlessBrowser extends BrowserAdapter {
-  async open() {
-    if (!this.context && !this.page) this.desktopProof = await assertDesktop(this.config);
-    return super.open();
+  async desktopProofForLaunch(options) {return assertDesktop(this.config,options);}
+  async open({timeoutMs=30000}={}) {
+    if(!Number.isInteger(timeoutMs)||timeoutMs<1||timeoutMs>30000)throw new Error('Invalid standard browser startup budget.');
+    if(this.context || this.page)return super.open({timeoutMs});
+    const now=this.readOnlyWaitControls?.now??Date.now;
+    const deadline=Math.min(this.readOnlyWaitControls?.deadlineAt??Infinity,now()+timeoutMs);
+    const remaining=()=>Math.max(0,Math.floor(deadline-now()));
+    const guard=async()=>{
+      await this.beforeOfficialRead('page');
+      if(remaining()<=0)throw new OfficialPageError('隔离桌面核验已达到本次启动预算，未启动浏览器。','browser_unavailable',
+        officialDiagnostic({stage:'page',state:'loading',expectedUrl:this.url()}));
+    };
+    await guard();
+    this.desktopProof=await this.desktopProofForLaunch({timeoutMs:Math.min(20000,remaining())});
+    await guard();
+    return super.open({timeoutMs:Math.min(30000,remaining())});
   }
   set onExternalAction(handler) {this.actionHandler = handler;}
   get onExternalAction() {

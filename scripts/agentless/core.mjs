@@ -3,6 +3,7 @@ import { bridgeObservation, presence, assertOrdinary } from '../seat-executor/in
 import {recoverablePortalError} from './portal-recovery.mjs';
 import {InventoryMismatchError} from '../seat-executor/browser.mjs';
 import {safeOperationDiagnostic} from './operation-diagnostic.mjs';
+import {cloudRecoveryOwned} from './recovery-fence.mjs';
 
 const planOf = value => value.plan ?? value;
 const isolated = new Set(['member_action', 'approval_required', 'mail_delivery']);
@@ -50,6 +51,7 @@ export async function runBatch({ portal, browser, config, journal,
   if (!config.legacyCheckerDisabled) throw new StopError('旧执行器尚未确认停用。');
   // Journal reconciliation is read-only. Never discard a claim or uncertain send.
   await journal?.reconcile(plan);
+  if(cloudRecoveryOwned(plan))return {mode:'fault_rescue_pending',actions:[],modelCalls:0};
   if (!guard(plan, config)) return { mode: 'disabled', actions: [], modelCalls: 0 };
   const actions = [], seen = new Set();
   let jobs;
@@ -61,6 +63,7 @@ export async function runBatch({ portal, browser, config, journal,
     if (!['in_app', 'relay'].includes(jobs.mailMode) || jobs.mailMode !== config.mailMode)
       throw new StopError('本机与云端提醒模式不一致，停止执行。');
     plan = planOf(await portal.call('seat_portal_status'));
+    if(cloudRecoveryOwned(plan))return {mode:'fault_rescue_pending',actions,modelCalls:0};
     if (!guard(plan, config)) break;
     const next = ['remove', 'invite'].flatMap(kind =>
       (plan[kind === 'remove' ? 'removals' : 'invites'] ?? []).map(item => ({kind,item})))
@@ -108,6 +111,7 @@ export async function runBatch({ portal, browser, config, journal,
     }
     if (kind === 'acceptance') { actions.push({kind,targetId:item.id,outcome:'checked'}); continue; }
     plan = planOf(await portal.call('seat_portal_status'));
+    if(cloudRecoveryOwned(plan))return {mode:'fault_rescue_pending',actions,modelCalls:0};
     if (!guard(plan,config)) break;
     const current = (kind === 'remove' ? plan.removals : plan.invites)
       .find(r => r.id === item.id && r.email === item.email && !held(plan,kind,r));

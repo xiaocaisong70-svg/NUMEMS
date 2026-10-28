@@ -47,9 +47,9 @@ test('recovery publishes fresh bounded-stage heartbeats and forwards safe read c
     return f.snapshot();
   };
   assert.equal(await recoverBrowser(f.args),true);assert.equal(observations,1);
-  assert.ok(f.sleeps.every(ms=>ms<=1000));assert.equal(f.sleeps.reduce((a,b)=>a+b),15000);
+  assert.ok(f.sleeps.every(ms=>ms<=1000));assert.equal(f.sleeps.reduce((a,b)=>a+b),1000);
   assert.equal(f.reports[0].checkedAt,'2026-10-28T04:00:00.000Z');
-  assert.equal(f.reports.at(-1).checkedAt,'2026-10-28T04:00:15.000Z');
+  assert.equal(f.reports.at(-1).checkedAt,'2026-10-28T04:00:01.000Z');
   assert.ok(f.reports.every(r=>r.state==='recovering'&&r.failureCode==='browser_unavailable'&&r.modelCalls===0));
   const diagnostic=f.reports.find(r=>r.officialDiagnostic).officialDiagnostic;
   assert.equal(diagnostic.expectedUrl,'https://admin.openai.com/workspace/workspace/members');
@@ -61,7 +61,7 @@ test('only browser_unavailable observation errors retry and attempts remain boun
   const f=await fixture(t);let observations=0;
   f.args.browser.observe=async()=>{observations++;throw Object.assign(new Error('unavailable'),{failureCode:'browser_unavailable'});};
   assert.equal(await recoverBrowser(f.args),false);assert.equal(observations,3);
-  assert.equal(f.sleeps.reduce((a,b)=>a+b),105000);
+  assert.equal(f.sleeps.reduce((a,b)=>a+b),8000);
   assert.deepEqual(f.reports.filter(r=>r.phase==='unavailable').map(r=>r.attempt),[1,2,3]);
   assert.ok(f.calls.every(c=>c.name==='seat_portal_status'));
 });

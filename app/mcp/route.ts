@@ -7,6 +7,7 @@ import { transition } from "@/lib/seat-engine";
 import { reminderMode } from "@/lib/reminder-policy";
 import { recordIdleFailure, applyIdleObservation } from "@/lib/official-idle-state";
 import { restoreV11History } from "@/lib/history-rollback";
+import { beginFaultRescue, finishFaultRescue, publicFaultRescue, recordRecoveryProgress, rescueBlocksClaims } from '@/lib/recovery-control';
 export const dynamic = "force-dynamic";
 
 const personSchema = { type: "object", properties: {
@@ -18,6 +19,25 @@ const observationSchema = { type: "object", properties: {
   members: { type: "array", items: personSchema }, invites: { type: "array", items: personSchema },
 }, required: ["workspaceId", "accountEmail", "pageUrl", "observedAt", "complete", "totalSeats", "members", "invites"], additionalProperties: false };
 const tools = [
+  {
+    name:'record_recovery_progress', description:'记录恢复阶段，不改变故障、成员、租约或容量。普通安全检查不能被声明为人工认证；明确交互或登录提示须有新鲜官方诊断。',
+    inputSchema:{type:'object',properties:{expectedFailureId:{type:'string'},phase:{type:'string',enum:['auto_recovery','security_check','interaction_required','login_required','waiting_codex','review_required']},diagnostic:{type:'object',properties:{version:{type:'integer',enum:[1]},stage:{type:'string'},state:{type:'string'},expectedUrl:{type:'string'},observedAt:{type:'string'}},required:['version','stage','state','expectedUrl','observedAt'],additionalProperties:false}},required:['expectedFailureId','phase'],additionalProperties:false},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true},
+  },
+  {
+    name:'begin_fault_rescue',description:'仅管理员在确认本机执行器已正常停止后交接只读故障诊断权。保留原租约，阻止新的邀请、移除和邮件领取；同一故障幂等返回原票据。',
+    inputSchema:{type:'object',properties:{expectedFailureId:{type:'string'}},required:['expectedFailureId'],additionalProperties:false},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true},
+  },
+  {
+    name:'fault_rescue_status',description:'只读查询故障诊断票据与当前计划，返回值不含处置凭证。',
+    inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true},
+  },
+  {
+    name:'finish_fault_rescue',description:'原故障会话已确认结束后归还执行权。recovered须原通道新鲜官方证据且无故障或未结案租约；普通challenge不能作为needs_human证据；结果不明保持独占。',
+    inputSchema:{type:'object',properties:{rescueId:{type:'string'},token:{type:'string'},expectedFailureId:{type:'string'},outcome:{type:'string',enum:['recovered','needs_human','unresolved','uncertain']},agentStopped:{type:'boolean'},diagnostic:{type:'object'}},required:['rescueId','token','expectedFailureId','outcome','agentStopped'],additionalProperties:false},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true},
+  },
   {
     name:"version_rollback_status",description:"仅读取当前 D1 修订与 V11 回退前提，不修改数据或成员。",
     inputSchema:{type:"object",properties:{},additionalProperties:false},annotations:{readOnlyHint:true},
@@ -50,7 +70,7 @@ const tools = [
     name: "review_seat_failure",
     description: "retry_not_started仅重排明确未开始的隔离项；resume_workspace需管理员核查；recover_browser仅允许程序对未开始操作的browser_unavailable故障恢复；resume_preclaim_inventory限定未开始名单故障；resume_verified_operation仅允许已完成原操作回执且审计、目标、故障ID和新鲜完整证据一致时恢复。所有恢复均禁止有未完成租约。",
     inputSchema: { type: "object", properties: {
-      decision: { type: "string", enum: ["retry_not_started", "resume_workspace", "recover_browser", "resume_preclaim_inventory", "resume_verified_operation"] },
+      decision: { type: "string", enum: ["retry_not_started", "resume_workspace", "recover_browser", "recover_login", "resume_preclaim_inventory", "resume_verified_operation"] },
       operationId: { type: "string" }, expectedFailureId: { type: "string" }, expectedTargetId: { type: "string" }, observation: observationSchema,
     }, required: ["decision"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
@@ -157,12 +177,28 @@ export async function POST(request: Request) {
     } else if (body.method === "tools/call") {
       const actor = await currentActor();
       if (!actor?.isAdmin) throw new Error("只有已登录的门户管理员可以运行此工具。");
+      if(body.params?.name==='fault_rescue_status') {
+        const args=body.params?.arguments??{};
+        if(!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).length)throw new Error('处置状态不接受参数。');
+        const {state}=await readState();
+        return Response.json({jsonrpc:'2.0',id,result:{content:[{type:'text',text:JSON.stringify({ticket:publicFaultRescue(state as BridgeState),plan:workPlan(state as BridgeState,new Date().toISOString())})}]}},{headers:{'Cache-Control':'no-store'}});
+      }
+      if(['record_recovery_progress','begin_fault_rescue','finish_fault_rescue'].includes(body.params?.name)) {
+        const name=body.params.name,args=body.params.arguments;
+        const ticketCredential={id:'rescue_'+crypto.randomUUID(),token:crypto.randomUUID()};
+        const state=await mutateState(current=>name==='record_recovery_progress'
+          ? recordRecoveryProgress(current as BridgeState,args,new Date().toISOString())
+          : name==='begin_fault_rescue'?beginFaultRescue(current as BridgeState,args,ticketCredential,new Date().toISOString())
+          : finishFaultRescue(current as BridgeState,args,new Date().toISOString()));
+        const ticket=name==='begin_fault_rescue'?(state as BridgeState).codex?.faultRescue??null:publicFaultRescue(state as BridgeState);
+        return Response.json({jsonrpc:'2.0',id,result:{content:[{type:'text',text:JSON.stringify({ticket,plan:workPlan(state as BridgeState,new Date().toISOString())})}]}},{headers:{'Cache-Control':'no-store'}});
+      }
       if (body.params?.name === "version_rollback_status") {
         if(Object.keys(body.params?.arguments??{}).length)throw new Error("回退状态不接受参数。");
         const {state,revision}=await readState();const b=(state as BridgeState).codex;
         return Response.json({jsonrpc:"2.0",id,result:{content:[{type:"text",text:JSON.stringify({revision,
           schedulerEnabled:state.config.automationEnabled,memberEnabled:b?.enabled??false,
-          busy:!!b?.lease,holds:b?.holds?.length??0,
+          busy:!!b?.lease||rescueBlocksClaims(state as BridgeState),faultRescue:publicFaultRescue(state as BridgeState),holds:b?.holds?.length??0,
           incompatiblePending:state.requests.filter(r=>r.status==="pending_removal"&&r.removalReason==="whitelist_revoked").length})}]}},{headers:{"Cache-Control":"no-store"}});
       }
       if(body.params?.name === "prepare_v11_rollback") {

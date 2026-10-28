@@ -8,6 +8,7 @@ import * as history from '../lib/history-store.ts';
 import * as rate from '../lib/request-rate-policy.ts';
 import * as officialIdle from '../lib/official-idle-state.ts';
 import * as historyRollback from '../lib/history-rollback.ts';
+import * as recoveryControl from '../lib/recovery-control.ts';
 const require=createRequire(import.meta.url),ts=require('typescript');
 const compile=async p=>ts.transpileModule(await readFile(new URL(p,import.meta.url),'utf8'),
   {compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
@@ -38,7 +39,7 @@ test('slow CAS retry cannot clear an operation fault using the now-expired compl
   const base={'cloudflare:workers':{env:{DB,REMINDER_DELIVERY_MODE:'in_app'}},'@/app/chatgpt-auth':{getChatGPTUser:async()=>owner},
     '@/lib/seat-engine':engine,'@/lib/codex-bridge':bridge,'@/lib/reminder-policy':policy,'@/lib/portal-access':access,
     './seat-engine':engine,'./reminder-policy':policy,'./portal-access':access,
-    './history-store':history,'./request-rate-policy':rate,'@/lib/history-rollback':historyRollback,'@/lib/official-idle-state':officialIdle,'@/lib/jobs':{runJobs:async()=>({}),refreshSeatQueue:async()=>({})}};
+    './recovery-control':recoveryControl,'./history-store':history,'./request-rate-policy':rate,'@/lib/recovery-control':recoveryControl,'@/lib/history-rollback':historyRollback,'@/lib/official-idle-state':officialIdle,'@/lib/jobs':{runJobs:async()=>({}),refreshSeatQueue:async()=>({})}};
   const service=new vm.SourceTextModule(await compile('../lib/portal-service.ts'),{context:ctx});
   await service.link(s=>make(base[s]));await service.evaluate();
   const route=new vm.SourceTextModule(await compile('../app/mcp/route.ts'),{context:ctx});

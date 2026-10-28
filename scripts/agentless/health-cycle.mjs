@@ -2,6 +2,7 @@ import path from 'node:path';
 import {validateObservation} from '../seat-executor/inventory.mjs';
 import {readJson,atomicJson} from './journal.mjs';
 import {resolveFailureAlerts} from './alert.mjs';
+import {cloudRecoveryOwned} from './recovery-fence.mjs';
 
 const stamp=value=>typeof value==='string' && /(Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value));
 export const HEALTH_CLOCK_SKEW_MS=5000;
@@ -20,6 +21,7 @@ export function diagnoseHealthEvidence({config,plan,snapshot,journalState,checke
   if(plan.workspaceId!==config.workspaceId)return fail('workspace_identity_mismatch');
   if(plan.administrator!==config.adminEmail)return fail('administrator_identity_mismatch');
   if(plan.busy!==false||plan.lease!=null)return fail('cloud_operation_unsettled');
+  if(cloudRecoveryOwned(plan))return fail('fault_rescue_unsettled');
   if(plan.lastError||plan.globalFailureCode)return fail('cloud_failure_present');
   if(!Array.isArray(plan.blockedOperations))return fail('cloud_holds_missing');
   if(plan.blockedOperations.length)return fail('cloud_holds_present');
@@ -56,6 +58,29 @@ export function verifiedHealthEvidence(input) {
     workspaceId:config.workspaceId,administrator:config.adminEmail,healthDiagnostic:diagnostic};
 }
 
+// Fault supervision can consume an incident without ever replacing the v2
+// marker with a retry counter. A later, independently verified full healthy
+// round trip may then close that incident exactly once. A ticket alone cannot
+// mint health, and an unrelated/mismatched or still-running rescue cannot reset
+// throttling or re-arm the fault-only model channel.
+async function newerClosedRescueEpoch(directory,plan,previous,evidence) {
+  if(previous?.state!=='healthy')return null;
+  const local=await readJson(path.join(directory,'fault-rescue.json')),cloud=plan.faultRescue;
+  if(local?.version!==1 || local.phase!=='finished' || local.agentStopped!==true ||
+      !['recovered','unresolved','needs_human'].includes(local.outcome) || cloud?.phase!=='finished' ||
+      cloud.outcome!==local.outcome || cloud.id!==local.ticket?.id || cloud.failureId!==local.failureId ||
+      local.ticket?.failureId!==local.failureId || cloud.scope!=='read_only_reconcile' || local.ticket?.scope!==cloud.scope ||
+      !/^rescue_[a-zA-Z0-9_-]{16,100}$/.test(cloud.id??'') ||
+      !/^[a-zA-Z0-9:_-]{1,240}$/.test(cloud.failureId??'') ||
+      ![local.createdAt,local.updatedAt,cloud.createdAt,cloud.updatedAt].every(stamp))return null;
+  const created=Date.parse(local.createdAt),finished=Date.parse(local.updatedAt),checked=Date.parse(evidence.healthyAt),
+    observed=Date.parse(evidence.officialObservedAt),cloudCreated=Date.parse(cloud.createdAt),cloudFinished=Date.parse(cloud.updatedAt);
+  if(created<=Date.parse(previous.healthyAt) || created>observed || finished<created || finished>checked ||
+      cloudFinished<cloudCreated || cloudFinished>checked+HEALTH_CLOCK_SKEW_MS ||
+      cloudCreated>observed+HEALTH_CLOCK_SKEW_MS)return null;
+  return {rescueId:cloud.id,failureId:cloud.failureId,createdAt:local.createdAt,finishedAt:local.updatedAt};
+}
+
 /** Repeated failures never reset backoff; only a new proven official health epoch does. */
 export async function markRuntimeHealthy({directory,config,plan,snapshot,journalState,clock=()=>new Date()}) {
   const evidence=verifiedHealthEvidence({config,plan,snapshot,journalState,checkedAt:clock().toISOString()});
@@ -74,15 +99,20 @@ export async function markRuntimeHealthy({directory,config,plan,snapshot,journal
         Date.parse(previous.officialObservedAt)>Date.parse(previous.healthyAt) ||
         Date.parse(evidence.healthyAt)<Date.parse(previous.healthyAt)))
     throw new Error('Official health epoch regressed.');
-  // Keep the first successful epoch until a later failure consumes it. Do not
-  // write this file on every idle heartbeat or erase the old failure evidence.
-  if(!previous || previous.state!=='healthy')await atomicJson(file,{...evidence,
-    ...(previous?{retiredAttempts:previous.attempts,previousIssuedAt:previous.issuedAt,
+  const rescueEpoch=await newerClosedRescueEpoch(directory,plan,previous,evidence);
+  const changed=!previous || previous.state!=='healthy' || rescueEpoch!==null;
+  // Keep the first successful epoch until a retry counter OR a newly closed
+  // fault-rescue incident consumes it. Repeated idle reads do not write/reset.
+  if(changed)await atomicJson(file,{...evidence,
+    ...(previous?.state==='healthy'?Object.fromEntries(['retiredAttempts','previousIssuedAt','previousStatusDigest',
+      'previousStatusCheckedAt','legacyRetryRecord'].filter(key=>Object.hasOwn(previous,key)).map(key=>[key,previous[key]])):
+      previous?{retiredAttempts:previous.attempts,previousIssuedAt:previous.issuedAt,
       previousStatusDigest:previous.statusDigest,previousStatusCheckedAt:previous.statusCheckedAt,
       legacyRetryRecord:{version:1,failureCode:'browser_unavailable',attempts:previous.attempts,
-        issuedAt:previous.issuedAt,statusCheckedAt:previous.statusCheckedAt,statusDigest:previous.statusDigest}}:{})});
+        issuedAt:previous.issuedAt,statusCheckedAt:previous.statusCheckedAt,statusDigest:previous.statusDigest}}:{}),
+    ...(rescueEpoch?{faultRescueHealth:rescueEpoch}:{})});
   const alert=await resolveFailureAlerts(path.join(directory,'alert.json'),evidence);
   return {healthyAt:evidence.healthyAt,officialObservedAt:evidence.officialObservedAt,
-    backoffReset:!previous || previous.state!=='healthy',resolvedAlerts:alert.resolved,
+    backoffReset:changed,healthEpochRotated:rescueEpoch!==null,resolvedAlerts:alert.resolved,
     healthDiagnostic:evidence.healthDiagnostic,modelCalls:0};
 }

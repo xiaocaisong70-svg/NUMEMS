@@ -7,6 +7,7 @@ import { applyReminderPolicy, reminderMode } from "./reminder-policy";
 import { archivedRequestKey, persistHistoryCas, readHistoryPage } from "./history-store";
 import { enforceRequestRate } from "./request-rate-policy";
 import type { HistoryKind } from "./history-policy";
+import { publicFaultRescue, publicRecoveryProgress, rescueBlocksClaims } from './recovery-control';
 
 export const ADMIN_EMAIL = "xiaocaisong70@gmail.com";
 export const ADMIN_CONTACT_EMAIL = "2712467009@qq.com";
@@ -102,6 +103,10 @@ export async function portalData() {
     return transition(current, schedulerActor, { type: "tick" }, serverNow);
   });
   const view = viewState(state, user, serverNow);
+  // Admin views include the cloned aggregate for existing controls. Never
+  // expose the new handoff credential through a page response.
+  const aggregateBridge=(view as unknown as {codex?:{faultRescue?:unknown}}).codex;
+  if(aggregateBridge?.faultRescue)aggregateBridge.faultRescue=publicFaultRescue(state as BridgeState);
   const runtime = (state as State & { runtime?: { lastTickAt?: string; lastDeliveryError?: string } }).runtime;
   const codex = (state as BridgeState).codex;
   const onDemand = codex?.scheduleId?.startsWith("local:queue-checker:") ?? false;
@@ -121,8 +126,10 @@ export async function portalData() {
       mail: reminderMode(env.REMINDER_DELIVERY_MODE) === "relay" && Boolean(codex?.mailVerifiedAt || (env.REMINDER_WEBHOOK_URL && env.REMINDER_WEBHOOK_TOKEN)),
       lastDeliveryError: user?.isAdmin ? codex?.lastError ?? codex?.mailChannelError ?? runtime?.lastDeliveryError ?? null : undefined,
       isolatedOperations: user?.isAdmin ? codex?.holds?.length ?? 0 : undefined,
-      memberPaused: Boolean(codex?.lastError || codex?.globalFailureCode),
+      memberPaused: Boolean(codex?.lastError || codex?.globalFailureCode || rescueBlocksClaims(state as BridgeState)),
       browserRecovering: codex?.globalFailureCode === "browser_unavailable" && Boolean(codex?.browserUnavailableAt),
+      recoveryProgress: publicRecoveryProgress(state as BridgeState),
+      faultRescue: publicFaultRescue(state as BridgeState),
       officialObservedAt: codex?.observation?.observedAt ?? null,
       officialStale: !codex?.observation?.observedAt || Date.now() - Date.parse(codex.observation.observedAt) > 3 * 60_000,
     },

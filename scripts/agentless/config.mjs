@@ -17,6 +17,11 @@ export function validateConfig(input = {}) {
     browserMode: 'headless',
     pollSeconds: 15, officialReconcileSeconds: 120, maxItems: 6, mailMode: 'in_app', liveActions: false,
     legacyCheckerDisabled: false, ...input };
+  if(c.faultRescue!==undefined && (typeof c.faultRescue!=='object' || c.faultRescue===null ||
+      typeof c.faultRescue.enabled!=='boolean' || c.faultRescue.scope!=='read_only_reconcile' ||
+      !/^[a-zA-Z0-9:_-]{1,240}$/.test(c.faultRescue.threadId??'') ||
+      !Number.isInteger(c.faultRescue.timeoutSeconds) || c.faultRescue.timeoutSeconds<30 || c.faultRescue.timeoutSeconds>600))
+    throw new Error('一次性故障诊断配置无效。');
   if (new URL(c.siteUrl).href !== SITE_URL || c.adminEmail !== ADMIN ||
       c.workspaceId !== WORKSPACE || c.workspaceName !== 'My Workspace' ||
       c.workspaceSlug !== 'my-workspace' || c.totalSeats !== 4 || c.reservedSeats !== 1 || c.seatLabel !== '高级')

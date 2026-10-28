@@ -1,6 +1,6 @@
 // Explicit administrator CLI for setup/reconciliation. The routine worker never imports this file.
 import path from 'node:path';
-import {loadConfig,runtimeDir} from './config.mjs';
+import {loadConfig,runtimeDir,root} from './config.mjs';
 import {assertExclusive} from './guard.mjs';
 import {AgentlessBrowser} from './browser.mjs';
 import {PortalClient} from '../seat-executor/portal-client.mjs';
@@ -11,7 +11,23 @@ import {reviewTestWorkspace} from './review-test-workspace.mjs';
 import {reviewLiveWorkspace} from './review-live-workspace.mjs';
 import {reviewVerifiedOperation} from './review-verified-operation.mjs';
 import {safeOfficialDiagnostic} from '../seat-executor/official-readiness.mjs';
+import {reconcileRescueReadOnly} from './rescue-readonly.mjs';
+import {markRuntimeHealthy,verifiedHealthEvidence} from './health-cycle.mjs';
 const TEST_EMAIL='hit_wangning@outlook.com';
+
+// A new installation may have no journal yet. Create a settled marker only
+// after independent cloud + official validation proves no operation exists.
+export async function recordReadOnlyHealth({directory,config,plan,snapshot,ticket=null}) {
+  const journalFile=path.join(directory,'operation.json');let journalState=await readJson(journalFile);
+  verifiedHealthEvidence({config,plan,snapshot,journalState,checkedAt:new Date().toISOString()});
+  if(journalState===null) {
+    journalState={phase:'settled',updatedAt:new Date().toISOString(),createdFromVerifiedEmptyJournal:true};
+    await atomicJson(journalFile,journalState);
+  }
+  await markRuntimeHealthy({directory,config,plan,snapshot,journalState});
+  await atomicJson(path.join(directory,'status.json'),{checkedAt:new Date().toISOString(),mode:'idle',modelCalls:0,
+    liveActions:config.liveActions,...(ticket?.ticket?.id?{faultRescueEvidence:{rescueId:ticket.ticket.id,failureId:ticket.failureId}}:{})});
+}
 
 export function assertObservationSetup(plan,config,{prepareTest=false,journalState=null}={}) {
   if(!plan || plan.administrator!==config.adminEmail ||
@@ -106,13 +122,14 @@ const commands={status:['seat_portal_status',{}], 'prepare-test':['prepare_test_
   'test-expire':['set_test_deadline',{requestId:id,stage:'expire'}],
   'enable-live':['set_codex_live',{enabled:true}], 'disable':['set_codex_live',{enabled:false}],
   'rollback-status':['version_rollback_status',{}], 'prepare-v11-rollback':['prepare_v11_rollback',{expectedRevision:Number(id)}]};
-const withId=['release-test','test-reminder','test-expire','prepare-v11-rollback'];
-if((!commands[command] && !['observe','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation'].includes(command)) || extra.length ||
+const withId=['release-test','test-reminder','test-expire','prepare-v11-rollback','finish-fault-rescue'];
+if((!commands[command] && !['observe','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','prepare-fault-rescue','finish-fault-rescue'].includes(command)) || extra.length ||
     (!withId.includes(command) && id!==undefined))
-  throw new Error('用法：admin.mjs status|observe|prepare-test|release-test ID|test-reminder ID|test-expire ID|enable-live|disable|reconcile|recover-browser|resolve-alert|resume-test-invite|review-test-workspace|review-live-workspace|review-verified-operation|rollback-status|prepare-v11-rollback REVISION');
+  throw new Error('用法：admin.mjs status|observe|prepare-test|release-test ID|test-reminder ID|test-expire ID|enable-live|disable|reconcile|recover-browser|resolve-alert|resume-test-invite|review-test-workspace|review-live-workspace|review-verified-operation|rollback-status|prepare-v11-rollback REVISION|prepare-fault-rescue|finish-fault-rescue RESCUE_ID');
 if(command==='prepare-v11-rollback' && (!/^\d+$/.test(id??'') || !Number.isSafeInteger(Number(id))))
   throw new Error('必须提供刚读取的 D1 修订号。');
-if(withId.includes(command) && command!=='prepare-v11-rollback' && !/^req_[a-zA-Z0-9_]+$/.test(id??''))
+if(command==='finish-fault-rescue' && !/^rescue_[a-zA-Z0-9_-]{16,100}$/.test(id??''))throw new Error('必须提供原故障处置 ID。');
+if(withId.includes(command) && !['prepare-v11-rollback','finish-fault-rescue'].includes(command) && !/^req_[a-zA-Z0-9_]+$/.test(id??''))
   throw new Error('必须提供已登记测试申请的 ID。');
 const config=await loadConfig();
 if(command!=='status') await assertExclusive({...config,liveActions:true});
@@ -123,8 +140,36 @@ const report={command,requestId:id,startedAt:new Date().toISOString(),modelCalls
 try {
   await browser.open();
   const portal=new PortalClient(browser.context,config,['prepare_test_request','release_test_request',
-    'set_test_deadline','set_codex_live','review_seat_failure','verified_review_receipt','version_rollback_status','prepare_v11_rollback']);
-  if(command==='review-verified-operation') {
+    'set_test_deadline','set_codex_live','review_seat_failure','verified_review_receipt','version_rollback_status','prepare_v11_rollback',
+    'begin_fault_rescue','finish_fault_rescue','fault_rescue_status','record_recovery_progress']);
+  if(command==='prepare-fault-rescue') {
+    const {prepareFaultRescue}=await import('./fault-rescue.mjs');
+    report.result=await prepareFaultRescue({directory:runtimeDir,config,portal,hostSafe:true,
+      journalState:await readJson(path.join(runtimeDir,'operation.json'))});
+  } else if(command==='finish-fault-rescue') {
+    const {settleFaultRescue,faultRescueFile}=await import('./fault-rescue.mjs');
+    const {FaultRescueClient}=await import('./fault-rescue-client.mjs');
+    const {resolveCodexCli}=await import('../codex-cli-resolver.mjs');
+    const ticket=await readJson(faultRescueFile(runtimeDir));
+    if(ticket?.ticket?.id!==id)throw new Error('故障处置 ID 与本机记录不符。');
+    const client=new FaultRescueClient(await resolveCodexCli(config.faultRescue?.cliPath),{cwd:root,timeoutMs:30000});
+    try {
+      await client.initialize();
+      const proof=await client.observeTurnState({threadId:ticket.threadId,clientUserMessageId:ticket.clientId,queuedId:ticket.queuedId??null});
+      if(proof.confirmed!==true || proof.stopped!==true)throw new Error('尚未确认故障诊断会话结束，不能交还执行权。');
+      let verifiedRecovery=false,diagnostic,officialResult;
+      try {
+        officialResult=await reconcileRescueReadOnly({portal,browser,config,journalFile:path.join(runtimeDir,'operation.json'),ticket});
+        verifiedRecovery=officialResult.healthy;
+      } catch(error) {diagnostic=safeOfficialDiagnostic(error);}
+      report.result=await settleFaultRescue({directory:runtimeDir,portal,client,hostSafe:true,verifiedRecovery,
+        readDiagnostic:async()=>diagnostic});
+      if(report.result.state==='finished' && report.result.outcome==='recovered' && verifiedRecovery) {
+        const plan=(await portal.call('seat_portal_status')).plan;
+        await recordReadOnlyHealth({directory:runtimeDir,config,plan,snapshot:officialResult.snapshot,ticket});
+      }
+    } finally {await client.close();}
+  } else if(command==='review-verified-operation') {
     const rawRetry=process.env.NUMEMS_REVIEW_RETRY_EXPECTED;
     const expectedStopDigest=process.env.NUMEMS_REVIEW_STOP_DIGEST;
     if((rawRetry===undefined)!==(expectedStopDigest===undefined))throw new Error('重试和停机票据必须同时提供。');
@@ -165,10 +210,13 @@ try {
     if(['status','observe'].includes(command))Object.assign(report.result,await readTestSummary(portal,config));
     console.log(JSON.stringify(report.result,null,2));
   } else if(command==='recover-browser') {
-    const p=(await portal.call('seat_portal_status')).plan;
-    if(p.globalFailureCode!=='browser_unavailable' || p.busy || p.lease) throw new Error('此故障不能自动恢复。');
-    const observation=bridgeObservation(await browser.observe());
-    await portal.call('review_seat_failure',{decision:'recover_browser',observation});
+    const ticket=await readJson(path.join(runtimeDir,'fault-rescue.json'));
+    const result=await reconcileRescueReadOnly({portal,browser,config,journalFile:path.join(runtimeDir,'operation.json'),
+      ticket:ticket?.phase==='finished'?null:ticket});
+    if(!result.healthy)throw new Error('官方读取完成，但云端仍有故障或隔离记录，未确认恢复。');
+    if(!['pending','uncertain'].includes(result.plan.faultRescue?.phase))
+      await recordReadOnlyHealth({directory:runtimeDir,config,plan:result.plan,snapshot:result.snapshot,ticket});
+    report.result={state:'verified',officialObservedAt:result.snapshot.observedAt,modelCalls:0};
     console.log('已通过最新官方证据恢复；未执行任何成员动作。');
   } else if(command==='resolve-alert') {
     const p=(await portal.call('seat_portal_status')).plan;
@@ -177,6 +225,11 @@ try {
     const file=path.join(runtimeDir,'alert.json'),a=await readJson(file);
     if(a) await atomicJson(file,{...a,resolvedAt:new Date().toISOString()});
   } else {
+    const ticket=await readJson(path.join(runtimeDir,'fault-rescue.json'));
+    if(ticket && ticket.phase!=='finished') {
+      await reconcileRescueReadOnly({portal,browser,config,journalFile:path.join(runtimeDir,'operation.json'),ticket});
+      console.log('已核对原租约；未执行新的成员动作。');
+    } else {
     const file=path.join(runtimeDir,'operation.json'),j=await readJson(file);
     const p=(await portal.call('seat_portal_status')).plan;
     if(p.receipts?.some(r=>r.id===j?.lease?.id)) await new Journal(file).settled();
@@ -196,6 +249,7 @@ try {
       await new Journal(file).settled();
     }
     console.log('已按原租约和真实证据结案；没有重复执行外部动作。');
+    }
   }
   report.success=true;
 } catch(error) {

@@ -15,6 +15,7 @@ import * as history from '../lib/history-store.ts';
 import * as rate from '../lib/request-rate-policy.ts';
 import * as officialIdle from '../lib/official-idle-state.ts';
 import * as historyRollback from '../lib/history-rollback.ts';
+import * as recoveryControl from '../lib/recovery-control.ts';
 import {ADMIN,WORKSPACE} from '../scripts/agentless/config.mjs';
 
 const require=createRequire(import.meta.url), ts=require('typescript');
@@ -65,7 +66,7 @@ async function exercise(useFreshClock,wrongTarget=false,checkAuth=false){
   const base={'cloudflare:workers':{env},'@/app/chatgpt-auth':{getChatGPTUser:async()=>currentUser},
     '@/lib/seat-engine':engine,'@/lib/codex-bridge':bridge,'@/lib/reminder-policy':policy,'@/lib/portal-access':access,
     './seat-engine':engine,'./reminder-policy':policy,'./portal-access':access,
-    './history-store':history,'./request-rate-policy':rate,'@/lib/history-rollback':historyRollback,'@/lib/official-idle-state':officialIdle,
+    './recovery-control':recoveryControl,'./history-store':history,'./request-rate-policy':rate,'@/lib/recovery-control':recoveryControl,'@/lib/history-rollback':historyRollback,'@/lib/official-idle-state':officialIdle,
     '@/lib/jobs':{runJobs:async()=>({}),refreshSeatQueue:async()=>({})}};
   const service=new vm.SourceTextModule(await compile('../lib/portal-service.ts'),{context:ctx});
   await service.link(spec=>{if(!base[spec])throw new Error(`Unexpected service import ${spec}`);return make(base[spec]);});
