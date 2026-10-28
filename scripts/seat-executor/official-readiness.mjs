@@ -6,6 +6,12 @@ export class OfficialPageError extends Error {
   }
 }
 
+// A local stop during a pre-claim read is neither a provider failure nor a
+// completed member operation. Callers must not use it to resume the workspace.
+export class OfficialReadCancelled extends Error {
+  constructor() { super('已停止尚未开始成员操作的官方只读核查。'); this.code='OFFICIAL_READ_CANCELLED'; }
+}
+
 const stages = new Set(['page','members_navigation','invites_navigation','members_rows','invites_rows','capacity','snapshot']);
 const states = new Set(['loading','challenge','login','workspace_mismatch','network','capacity_unavailable']);
 // Never retain body text, actual redirect URLs, query strings or authentication
@@ -30,23 +36,26 @@ export function officialPageState({ url, expectedUrl, body, ready }) {
   if (/^(auth|auth0)\.openai\.com$/.test(actual.hostname) || /\/(log-in|login|sign-in)(\/|$)/.test(actual.pathname))
     return "login_expired";
   if (actual.origin !== expected.origin || actual.pathname !== expected.pathname) return "workspace_mismatch";
-  if (/verify you are human|captcha|安全验证|验证您不是自动程序|just a moment|checking your browser/i.test(body))
+  if (/verify you are human|captcha|安全验证|验证您不是自动程序|完成验证|验证您是真人|just a moment|checking your browser/i.test(body))
     return "browser_unavailable";
   if (/sign in to continue|登录以继续/i.test(body)) return "login_expired";
   return ready ? "ready" : "loading";
 }
 
 export async function waitForOfficialPage({ inspect, pause, now = Date.now, timeoutMs = 45_000,
-  challengeTimeoutMs=timeoutMs,stage='page' }) {
+  challengeTimeoutMs=timeoutMs,stage='page',shouldStop=async()=>false,onProgress=async()=>{} }) {
   if (!Number.isInteger(timeoutMs) || timeoutMs<1 || timeoutMs>300_000 ||
       !Number.isInteger(challengeTimeoutMs) || challengeTimeoutMs<1 || challengeTimeoutMs>300_000 || !stages.has(stage))
     throw new Error('Invalid read-only readiness budget.');
   const started=now(),hardDeadline=started+Math.min(300_000,timeoutMs+challengeTimeoutMs);
   let loadingDeadline=started+timeoutMs,challengeSeen=false,postChallengeLoading=false;
   while (true) {
+    if (await shouldStop()) throw new OfficialReadCancelled();
     const inspected=await inspect(), state = officialPageState(inspected),instant=now();
     const diagnostic=officialDiagnostic({stage,state:state==='browser_unavailable'?'challenge':
       state==='login_expired'?'login':state,expectedUrl:inspected.expectedUrl,at:instant});
+    if (await shouldStop()) throw new OfficialReadCancelled();
+    if (diagnostic) await onProgress(diagnostic);
     if (state === "ready") return;
     if (state === "login_expired") throw new OfficialPageError("官方后台登录已失效，需管理员重新登录。", state,diagnostic);
     if (state === "workspace_mismatch") throw new OfficialPageError("官方后台跳转到非目标工作空间，已停止。", state,diagnostic);

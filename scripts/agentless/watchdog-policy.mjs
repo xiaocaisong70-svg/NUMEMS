@@ -96,7 +96,7 @@ export function restartDecision(input={}) {
   if(status) {
     if(!stamp(status.checkedAt) || Date.parse(status.checkedAt)>current ||
       (present(status.state) && !['blocked','stopped','recovering'].includes(status.state)) ||
-      (present(status.mode) && !['idle','processed','browser_recovered','disabled','dry_run','portal_recovery'].includes(status.mode)) ||
+      (present(status.mode) && !['idle','processed','browser_recovered','browser_recovery','disabled','dry_run','portal_recovery'].includes(status.mode)) ||
       (!present(status.state) && !present(status.mode)) ||
       (present(status.failureCode) && (typeof status.failureCode!=='string' || !status.failureCode.trim())) ||
       (present(status.error) && (typeof status.error!=='string' || !status.error.trim())) ||

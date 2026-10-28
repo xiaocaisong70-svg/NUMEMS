@@ -19,6 +19,9 @@ export const ui = {
   keepSeats: /^(保留付费席位|Keep paid seats)$/i,
   empty: /^(无结果|未找到成员|没有待处理的邀请|No results|No pending invitations|No members found)[。.]*$/i
 };
+export const REMOVE_OPERATION_STAGES=Object.freeze(['permission','load','target_row','menu_open',
+  'menu_action','confirmation_wait','confirmation_validate','confirmation_click',
+  'retention_wait','retention_validate','retention_click','dialogs_closed']);
 const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 // A capacity/list mismatch can arise while an invitation is being accepted
 // between the sequential page reads. The evidence is incomplete, never a
@@ -123,6 +126,7 @@ export class BrowserAdapter {
     }
     const selected = p.getByRole("tab", { name: tab === "members" ? ui.members : ui.invites });
     await waitForOfficialPage({
+      ...this.readOnlyWaitControls,
       stage:tab==='members'?'members_navigation':'invites_navigation',challengeTimeoutMs:180_000,
       inspect: async () => ({ url: p.url(), expectedUrl: this.url(tab),
         body: await p.locator("body").innerText(), ready: await selected.isVisible() }),
@@ -151,6 +155,7 @@ export class BrowserAdapter {
     // Table headers appear before the official data request has finished. A visible
     // table is not evidence of an empty list, including after pagination/filtering.
     await waitForOfficialPage({
+      ...this.readOnlyWaitControls,
       stage:expectedTab==='members'?'members_rows':'invites_rows',challengeTimeoutMs:180_000,
       inspect: async () => {
         const selected = p.getByRole("tab", { name: expectedTab === "members" ? ui.members : ui.invites }).filter({ visible:true });
@@ -223,6 +228,7 @@ export class BrowserAdapter {
     const p = await this.open(), label = `${this.config.seatLabel}席位`;
     let candidates = [];
     await waitForOfficialPage({
+      ...this.readOnlyWaitControls,
       stage:'capacity',challengeTimeoutMs:180_000,
       inspect: async () => {
         candidates = await p.getByText(new RegExp(`^${escape(this.config.seatLabel)}(?:席位| seats)$`, "i"))
@@ -337,7 +343,13 @@ export class BrowserAdapter {
       observedAt: new Date().toISOString(), pageUrl: this.page.url()
     };
   }
-  async observe() {
+  async observe({shouldStop,onProgress}={}) {
+    const previous=this.readOnlyWaitControls;
+    this.readOnlyWaitControls={shouldStop,onProgress};
+    try { return await this.observeStable(); }
+    finally { this.readOnlyWaitControls=previous; }
+  }
+  async observeStable() {
     // Validate each reading before comparing. A normal join can change two safe
     // snapshots; wrong identity, workspace or purchased capacity must still stop.
     const a = validateObservation(await this.snapshot(), this.config);
@@ -420,43 +432,67 @@ export class BrowserAdapter {
     throw new Error("未定位到确切目标邮箱。");
   }
   async remove(email, before) {
-    this.permit(email, before);
-    const original = presence(before, email); if (original === "absent") return;
-    await this.load(original === "member" ? "members" : "invites");
-    const p = this.page, row = await this.locateRow(email);
-    const parsed = parseRow(await row.getByRole("cell").allInnerTexts(), this.config.seatLabel);
-    if (parsed.email !== email || parsed.role !== "member" || parsed.self) throw new Error("目标身份或角色不安全。");
-    await (await only(row.getByRole("button", { name: /打开.+的操作|Open .+ actions|Actions for/i }), "成员操作菜单")).click();
-    // Some UI variants apply invite revocation directly from the menu. Mark the
-    // outcome as potentially external before that click so an unexpected UI
-    // transition cannot be recorded as an operation that never started.
-    const menuAction = await readyOnly(p.getByRole("menuitem", {
-      name: original === "member" ? ui.removeMenu : ui.revoke,
-    }), "成员移除或撤销邀请菜单");
-    await this.onExternalAction("remove", email);
-    await menuAction.click();
-    const confirmName = original === "member" ? ui.removeConfirm : ui.revoke;
-    const dialog = await readyOnly(p.getByRole("dialog").filter({
-      has: p.getByRole("button", { name: confirmName }) }), "移除确认对话框");
-    const dialogText = await dialog.innerText();
-    // The official dialog may show display name rather than email; retain exact row identity and workspace.
-    if (!dialogText.includes(this.config.workspaceName)) throw new Error("移除确认的工作空间不匹配。");
-    if (/删除数据|Delete data|permanently delete/i.test(dialogText)) throw new Error("检测到删除数据流程，禁止操作。");
-    await this.guard();
-    await (await only(dialog.getByRole("button", { name: original === "member" ? ui.removeConfirm : ui.revoke }), "最终确认按钮")).click();
-    if (original === "member") {
-      const keep = p.getByRole("button", { name: ui.keepSeats });
-      // Current Business flow presents paid-seat retention after a member is removed.
-      // Wait for that control OR all dialogs closing; never click a purchase/reduction button.
-      await p.waitForFunction(() => {
-        const visible = e => e.getClientRects().length;
-        return [...document.querySelectorAll("button")].some(e => visible(e) && /^(保留付费席位|Keep paid seats)$/i.test(e.innerText.trim())) ||
-          ![...document.querySelectorAll('[role="dialog"]')].some(visible);
-      }, null, { timeout: 25_000 });
-      if (await keep.filter({ visible: true }).count()) await (await only(keep, "保留付费席位")).click();
+    let stage='permission';
+    try {
+      this.permit(email, before);
+      const original = presence(before, email); if (original === "absent") return;
+      stage='load';
+      await this.load(original === "member" ? "members" : "invites");
+      stage='target_row';
+      const p = this.page, row = await this.locateRow(email);
+      const parsed = parseRow(await row.getByRole("cell").allInnerTexts(), this.config.seatLabel);
+      if (parsed.email !== email || parsed.role !== "member" || parsed.self) throw new Error("目标身份或角色不安全。");
+      stage='menu_open';
+      await (await only(row.getByRole("button", { name: /打开.+的操作|Open .+ actions|Actions for/i }), "成员操作菜单")).click();
+      // Some UI variants apply invite revocation directly from the menu. Mark the
+      // outcome as potentially external before that click so an unexpected UI
+      // transition cannot be recorded as an operation that never started.
+      stage='menu_action';
+      const menuAction = await readyOnly(p.getByRole("menuitem", {
+        name: original === "member" ? ui.removeMenu : ui.revoke,
+      }), "成员移除或撤销邀请菜单");
+      await this.onExternalAction("remove", email);
+      await menuAction.click();
+      stage='confirmation_wait';
+      const confirmName = original === "member" ? ui.removeConfirm : ui.revoke;
+      const dialog = await readyOnly(p.getByRole("dialog").filter({
+        has: p.getByRole("button", { name: confirmName }) }), "移除确认对话框");
+      stage='confirmation_validate';
+      const dialogText = await dialog.innerText();
+      // The official dialog may show display name rather than email; retain exact row identity and workspace.
+      if (!dialogText.includes(this.config.workspaceName)) throw new Error("移除确认的工作空间不匹配。");
+      if (/删除数据|Delete data|permanently delete/i.test(dialogText)) throw new Error("检测到删除数据流程，禁止操作。");
+      await this.guard();
+      stage='confirmation_click';
+      await (await only(dialog.getByRole("button", { name: confirmName }), "最终确认按钮")).click();
+      if (original === "member") {
+        const keep = p.getByRole("button", { name: ui.keepSeats });
+        stage='retention_wait';
+        // Closing the first dialog is not completion: the paid-seat retention
+        // dialog can arrive later. Wait for its known control, never the empty
+        // interval between dialogs, and never choose a purchase/reduction action.
+        // A UI variant with no retention prompt fails closed here; core may only
+        // reconcile it with fresh complete official evidence, without a re-click.
+        await keep.filter({visible:true}).waitFor({state:'visible',timeout:25_000});
+        stage='retention_validate';
+        await this.guard();
+        const keepControl=await only(keep,"保留付费席位");
+        stage='retention_click';
+        await keepControl.click();
+      }
+      stage='dialogs_closed';
+      await p.waitForFunction(() => ![...document.querySelectorAll('dialog,[role="dialog"]')]
+        .some(e => e.getClientRects().length), null, { timeout: 20_000 });
+    } catch(error) {
+      // Fixed diagnostic fields only. Preserve the original exception and its
+      // failure policy; no page text, selectors, URLs, credentials, or messages.
+      try {
+        if(error && typeof error==='object' && Object.isExtensible(error))
+          error.operationDiagnostic=Object.freeze({kind:'remove',stage,
+            category:error.name==='TimeoutError'?'timeout':'other',observedAt:new Date().toISOString()});
+      } catch { /* Diagnostics cannot replace the original operation failure. */ }
+      throw error;
     }
-    await p.waitForFunction(() => ![...document.querySelectorAll('dialog,[role="dialog"]')]
-      .some(e => e.getClientRects().length), null, { timeout: 20_000 });
   }
   async close() { if (this.context) await this.context.close(); this.context = null; this.page = null; }
 }

@@ -8,6 +8,7 @@ import {createHash} from 'node:crypto';
 import {loadConfig,runtimeDir} from './config.mjs';
 import {readJson,atomicJson} from './journal.mjs';
 import {restartDecision,reviewRetryDecision} from './watchdog-policy.mjs';
+import {browserRetryDecision} from './browser-retry-policy.mjs';
 const execute=promisify(execFile);
 const file=path.join(runtimeDir,'watchdog.json');
 
@@ -16,7 +17,7 @@ export async function readStopSnapshot(directory=runtimeDir) {
 }
 
 export async function readEvidenceSnapshot(directory,name) {
-  if(!['stop-request.json','status.json','operation.json','admin-result.json','review-retry.json','verified-review-intent.json'].includes(name))
+  if(!['stop-request.json','status.json','operation.json','admin-result.json','review-retry.json','verified-review-intent.json','browser-retry.json'].includes(name))
     throw new Error('Invalid evidence name');
   try {
     const data=await readFile(path.join(directory,name));
@@ -50,7 +51,8 @@ export async function processGate({host,lock},signal=pid=>process.kill(pid,0),in
   return {clear:true};
 }
 
-export async function supervise({config,host,status,journal,adminResult,lock,retryRecord,reviewIntent,intentDigest,stopRequest,run,save,now=()=>new Date()}) {
+export async function supervise({config,host,status,journal,adminResult,lock,retryRecord,reviewIntent,intentDigest,stopRequest,run,save,
+  readBrowserRetry,saveBrowserRetry,now=()=>new Date()}) {
   const input={host,status,journal,adminResult,lock,retryRecord,reviewIntent,intentDigest,stopRequest,now:now().getTime()};
   const primary=restartDecision(input);
   const retry=!primary.allowed && host?.adminCommand==='review-verified-operation' ? reviewRetryDecision(input) : null;
@@ -62,6 +64,26 @@ export async function supervise({config,host,status,journal,adminResult,lock,ret
     await save(result);return result;
   }
   if(!decision.allowed) {const result={...base,state:'held',...(retry?{reviewRetryReason:retry.reason}: {})};await save(result);return result;}
+  // This gate only adds a deny/cooldown to the existing, explicitly blocked
+  // pre-action browser recovery path. In particular it does not affect the
+  // separately guarded verified-operation review retry or running workers.
+  let browserRetryRecord,browserRetry;
+  if(decision.reason==='browser_unavailable_read_only_recovery_candidate') {
+    try {
+      if(typeof readBrowserRetry!=='function' || typeof saveBrowserRetry!=='function')
+        throw new Error('Persistent browser retry store is required.');
+      browserRetryRecord=await readBrowserRetry();
+      browserRetry=browserRetryDecision({status,host,retryRecord:browserRetryRecord,now:now()});
+    } catch {
+      const result={...base,state:'held',allowed:false,reason:'browser_retry_store_unavailable'};
+      await save(result);return result;
+    }
+    if(!browserRetry.allowed) {
+      const {nextRecord,...detail}=browserRetry;
+      const result={...base,...detail,state:'held'};await save(result);return result;
+    }
+    base.browserRetry={attempts:browserRetry.attempts,dueAt:browserRetry.dueAt,delayMs:browserRetry.delayMs};
+  }
   // Check only desktop availability before starting a browser. No elevation,
   // secure-desktop access, or interactive-desktop fallback is attempted.
   let desktop;
@@ -69,6 +91,22 @@ export async function supervise({config,host,status,journal,adminResult,lock,ret
   catch {const result={...base,state:'waiting_desktop'};await save(result);return result;}
   if(!desktop || desktop.windowStation?.toLowerCase()!=='winsta0' || !desktop.inputDesktop || desktop.error) {
     const result={...base,state:'waiting_desktop'};await save(result);return result;
+  }
+  if(browserRetry) {
+    // Persist before launching. A failed or ambiguous write must not start a
+    // browser; a crash after persistence consumes this attempt conservatively.
+    browserRetry=browserRetryDecision({status,host,retryRecord:browserRetryRecord,now:now()});
+    if(!browserRetry.allowed) {
+      const {nextRecord,...detail}=browserRetry;
+      const result={...base,...detail,state:'held'};await save(result);return result;
+    }
+    try {await saveBrowserRetry(browserRetry.nextRecord);}
+    catch {
+      const result={...base,state:'held',allowed:false,reason:'browser_retry_store_unavailable'};
+      await save(result);return result;
+    }
+    base.browserRetry={attempts:browserRetry.nextRecord.attempts,issuedAt:browserRetry.nextRecord.issuedAt,
+      dueAt:browserRetry.dueAt,delayMs:browserRetry.delayMs};
   }
   await save({...base,state:'starting'});
   try {
@@ -114,9 +152,20 @@ export async function main() {
     const result={checkedAt:new Date().toISOString(),state:'held',...gate,modelCalls:0};
     await atomicJson(file,result);return result;
   }
+  let browserRetrySnapshot;
   return supervise({config,host,status,journal,adminResult,lock,retryRecord:retrySnapshot.value,
     reviewIntent:intentSnapshot.value,intentDigest:intentSnapshot.digest,stopRequest,
     save:report=>atomicJson(file,report),
+    readBrowserRetry:async()=>{
+      browserRetrySnapshot=await readEvidenceSnapshot(runtimeDir,'browser-retry.json');
+      return browserRetrySnapshot.value;
+    },
+    saveBrowserRetry:async value=>{
+      const fresh=await readEvidenceSnapshot(runtimeDir,'browser-retry.json');
+      if(!browserRetrySnapshot || fresh.digest!==browserRetrySnapshot.digest)
+        throw new Error('Browser retry record changed during the guarded check.');
+      await atomicJson(path.join(runtimeDir,'browser-retry.json'),value);
+    },
     run:async (kind,decision)=>{
       let retryProof=null;
       if(kind==='review') {

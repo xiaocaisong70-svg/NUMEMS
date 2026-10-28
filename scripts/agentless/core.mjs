@@ -2,6 +2,7 @@ import { acceptanceDue } from '../seat-executor/core.mjs';
 import { bridgeObservation, presence, assertOrdinary } from '../seat-executor/inventory.mjs';
 import {recoverablePortalError} from './portal-recovery.mjs';
 import {InventoryMismatchError} from '../seat-executor/browser.mjs';
+import {safeOperationDiagnostic} from './operation-diagnostic.mjs';
 
 const planOf = value => value.plan ?? value;
 const isolated = new Set(['member_action', 'approval_required', 'mail_delivery']);
@@ -23,6 +24,8 @@ function guard(plan, config) {
 }
 const safeCode = error => ['member_action','approval_required','login_expired','workspace_mismatch',
   'capacity_mismatch','role_mismatch','browser_unavailable'].includes(error.failureCode) ? error.failureCode : 'unknown';
+const fatalObservationCodes = new Set(['login_expired','workspace_mismatch','capacity_mismatch','role_mismatch']);
+const incompleteObservation = error => error instanceof InventoryMismatchError || error.failureCode==='browser_unavailable';
 
 // Called only after the cloud plan and local journal confirm no outstanding
 // lease and strictly before claim_seat_operation. Never use in post-claim
@@ -38,7 +41,8 @@ export async function observeBeforeClaim(browser, {pause=ms=>new Promise(resolve
 
 /** Fresh plan for every item. No API for starting or messaging an Agent exists here. */
 export async function runBatch({ portal, browser, config, journal,
-  clock = () => new Date(), maxItems = config.maxItems ?? 6 }) {
+  clock = () => new Date(), maxItems = config.maxItems ?? 6,
+  pause = ms => new Promise(resolve=>setTimeout(resolve,ms)) }) {
   let plan = planOf(await portal.call('seat_portal_status'));
   if (!config.liveActions) return { mode: 'dry_run', modelCalls: 0,
     pending: Object.fromEntries(['invites','removals','reminders','awaitingAcceptance']
@@ -124,9 +128,10 @@ export async function runBatch({ portal, browser, config, journal,
     if (!lease || lease.kind !== kind || lease.targetId !== item.id || lease.email !== item.email ||
         !lease.token || !lease.id) throw new StopError('领取结果与目标不符，禁止外部操作。');
     await journal?.claimed(lease);
-    let attempted = false, sentAt;
+    let attempted = false, sentAt, finishStarted = false;
     browser.onExternalAction = async () => { attempted = true; await journal?.attempting(); };
     const finish = async (after, outcome = 'verified') => {
+      finishStarted = true;
       const args = {operationId:lease.id,token:lease.token,outcome,observation:bridgeObservation(after),
         ...(sentAt ? {invitationSentAt:sentAt} : {})};
       // Store evidence before the receipt write. An interrupted completion can be reconciled.
@@ -139,10 +144,17 @@ export async function runBatch({ portal, browser, config, journal,
       lease.originalPresence === 'invite' && presence(s,lease.email) === 'member';
     const verified = s => kind === 'remove' ? presence(s,lease.email) === 'absent'
       : presence(s,lease.email) !== 'absent';
+    const assertTarget = snapshot => {
+      try {assertOrdinary(snapshot,lease.email,{config:{protectedEmails:[config.adminEmail]}});}
+      catch (cause) {
+        const blocked=new StopError('目标不再是可办理的普通成员，保留原租约并停止。','role_mismatch');
+        blocked.cause=cause;throw blocked;
+      }
+    };
     try {
       // Recheck after claim, including role. Never revoke a joined member for invite timeout.
       const fresh = await browser.observe();
-      assertOrdinary(fresh,lease.email,{config:{protectedEmails:[config.adminEmail]}});
+      assertTarget(fresh);
       if (joined(fresh)) { await finish(fresh,'joined'); continue; }
       if (kind === 'remove' && current.removalReason === 'invitation_expired' &&
           presence(fresh,lease.email) === 'member') throw new StopError('邀请超时目标已加入，保留成员并停止。');
@@ -151,18 +163,55 @@ export async function runBatch({ portal, browser, config, journal,
         else await browser.remove(lease.email,fresh);
       }
       const after = await browser.observe();
+      assertTarget(after);
       if (joined(after)) await finish(after,'joined');
       else if (verified(after)) await finish(after);
       else throw new StopError('操作后的真实状态未确认，保留租约。');
     } catch (error) {
-      // Read-only reconciliation, at most once. No second invite/remove click.
-      let after;
-      try { after = await browser.observe(); } catch { /* Keep uncertainty. */ }
+      const operationDiagnostic=safeOperationDiagnostic(error);
+      const blockedWithDiagnostic=(message,cause,code='unknown')=>{
+        const blocked=new StopError(message,code);blocked.cause=cause;
+        if(operationDiagnostic)blocked.operationDiagnostic=operationDiagnostic;
+        return blocked;
+      };
+      // A receipt write or local evidence write may already have landed. Do not
+      // call finish again, overwrite the retained receipt, or send a failure RPC.
+      if(finishStarted) {
+        throw blockedWithDiagnostic('原操作回执写入未确认；保留原租约与本地证据，禁止重复提交。',error);
+      }
+      if(operationDiagnostic)await journal?.update?.({operationDiagnostic});
+      // Existing reconciliation stays read-only. At most three observations are
+      // allowed, and another one needs an explicitly incomplete prior reading.
+      // No retry resumes an external action, extends a lease, or relaxes evidence.
+      let after,reconcileError;
+      if(!fatalObservationCodes.has(safeCode(error))) {
+        for(let attempt=1;attempt<=3;attempt++) {
+          if(attempt>1)await pause(attempt===2?1000:3000);
+          await journal?.update?.({postActionReconcile:{stage:'observing',attempt,classification:'read_only'}});
+          try {
+            const observed=await browser.observe();
+            assertTarget(observed);
+            await journal?.update?.({postActionReconcile:{stage:'observed',attempt,classification:'complete_read'}});
+            after=observed;reconcileError=undefined;
+            break;
+          } catch(readError) {
+            reconcileError=readError;
+            const retryable=incompleteObservation(readError);
+            await journal?.update?.({postActionReconcile:{stage:'failed',attempt,
+              classification:retryable?'incomplete_read':safeCode(readError)}});
+            if(!retryable || attempt===3)break;
+          }
+        }
+      }
       if (after && (joined(after) || verified(after))) {
-        await finish(after, joined(after) ? 'joined' : 'verified');
+        try {await finish(after, joined(after) ? 'joined' : 'verified');}
+        catch(completionError) {
+          throw blockedWithDiagnostic('原操作回执写入未确认；保留原租约与本地证据，禁止重复提交。',completionError);
+        }
         continue;
       }
-      let code = safeCode(error);
+      const failure=reconcileError??error;
+      let code = safeCode(failure);
       if (code === 'browser_unavailable') code = 'unknown'; // Already claimed.
       let check;
       try {
@@ -173,18 +222,16 @@ export async function runBatch({ portal, browser, config, journal,
       } catch (registrationError) {
         // A claim already exists. Even a later read timeout must not enter the
         // normal pre-claim read-only recovery path; the write could have landed.
-        const blocked = new StopError('已领取任务的完成登记或状态核对未确认；保留原租约与证据，禁止自动重试。');
-        blocked.cause = registrationError; throw blocked;
+        throw blockedWithDiagnostic('已领取任务的完成登记或状态核对未确认；保留原租约与证据，禁止自动重试。',registrationError);
       }
       const hold = check.blockedOperations?.find(h => h.operation.id === lease.id);
       if (!isolated.has(code) || !hold || check.busy || check.lastError || check.globalFailureCode) {
         if (code === 'unknown' || isolated.has(code)) {
           // Do not leak a misleading pre-claim browser_unavailable signal or
           // its "no action started" text after the operation was claimed.
-          const blocked = new StopError('已领取任务的操作结果或核实未确认；保留原租约与证据，禁止自动重试。');
-          blocked.cause = error; throw blocked;
+          throw blockedWithDiagnostic('已领取任务的操作结果或核实未确认；保留原租约与证据，禁止自动重试。',failure);
         }
-        throw error;
+        throw blockedWithDiagnostic('已领取任务的官方身份、角色或容量核对失败；保留原租约并停止。',failure,code);
       }
       await journal?.settled();
       actions.push({kind,targetId:item.id,outcome:'isolated',failureCode:code});

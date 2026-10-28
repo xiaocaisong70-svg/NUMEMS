@@ -9,15 +9,39 @@ import { notifyFailure } from './alert.mjs';
 import { recoverBrowser } from './recovery.mjs';
 import { GracefulStopControl,runGracefulBatch } from './graceful-stop.mjs';
 import {recoverPortal,recoverablePortalError} from './portal-recovery.mjs';
+import {safeOfficialDiagnostic} from '../seat-executor/official-readiness.mjs';
+import {safeRuntimeDiagnostics} from './operation-diagnostic.mjs';
 
 // The production error policy is independently testable without starting a
 // browser, scheduler, or live member operation.
-export async function recoverBatchError({error,portal,browser,config,journalFile,shouldStop,saveStatus,
-  recoverPortalFn=recoverPortal,recoverBrowserFn=recoverBrowser}) {
+export async function recoverBatchError({error,portal,browser,config,journalFile,shouldStop,saveStatus,saveBrowserProgress,
+  recoverPortalFn=recoverPortal,recoverBrowserFn=recoverBrowser,clock=()=>new Date()}) {
   if(recoverablePortalError(error))return recoverPortalFn({error,portal,browser,config,
     journalFile,shouldStop,saveStatus});
-  if(error.failureCode!=='browser_unavailable' || !await recoverBrowserFn({portal,browser,journalFile})) throw error;
+  if(error.failureCode!=='browser_unavailable')throw error;
+  // Persist the actual pre-claim failure before waiting, including on the first
+  // transition from idle. Progress then goes to its own file in production so
+  // an interrupted read cannot replace restart evidence with an in-flight state.
+  const diagnostic=safeOfficialDiagnostic(error);
+  if(typeof saveStatus==='function')await saveStatus({checkedAt:clock().toISOString(),state:'blocked',
+    modelCalls:0,error:error.message,failureCode:'browser_unavailable',
+    ...(typeof config?.liveActions==='boolean'?{liveActions:config.liveActions}:{}),
+    ...(diagnostic?{officialDiagnostic:diagnostic}:{})});
+  const recovered=await recoverBrowserFn({portal,browser,config,journalFile,shouldStop,
+    saveStatus:saveBrowserProgress??saveStatus});
+  if(recovered?.stopped===true)return {mode:'idle',actions:[],stopped:true,modelCalls:0};
+  if(recovered!==true)throw error;
   return {mode:'browser_recovered',modelCalls:0};
+}
+
+// This records an installed local scheduler, not official membership health.
+// Actual member actions keep their independent fresh inventory/claim gates.
+export async function registerRunningSchedule({portal,config}) {
+  const p=(await portal.call('seat_portal_status')).plan;
+  if(!config.liveActions || !p || p.workspaceId!==config.workspaceId || p.administrator!==config.adminEmail ||
+      !p.enabled || p.testOnly || p.busy || p.lease || p.lastError || p.globalFailureCode)return false;
+  await portal.call('record_codex_schedule',{scheduleId:`local:seat-executor:${TASK_NAME}`});
+  return true;
 }
 
 export async function main(args=process.argv.slice(2)) {
@@ -59,19 +83,15 @@ export async function main(args=process.argv.slice(2)) {
         try {
           const result=await runBatch({portal,browser,config,journal});
           if(config.liveActions && !registered && ['idle','processed'].includes(result.mode) && !await shouldStop()) {
-            const p=(await portal.call('seat_portal_status')).plan;
-            if(p.enabled && !p.testOnly) {
-              await browser.observe();
-              await portal.call('record_codex_schedule',{scheduleId:`local:seat-executor:${TASK_NAME}`});
-              registered=true;
-            }
+            registered=await registerRunningSchedule({portal,config});
           }
           return result;
         }
         catch(error) {
           return recoverBatchError({error,portal,browser,config,
             journalFile:path.join(runtimeDir,'operation.json'),shouldStop,
-            saveStatus:value=>atomicJson(path.join(runtimeDir,'status.json'),value)});
+            saveStatus:value=>atomicJson(path.join(runtimeDir,'status.json'),value),
+            saveBrowserProgress:value=>atomicJson(path.join(runtimeDir,'browser-recovery-progress.json'),value)});
         }
       },shouldStop);
       if(!batch.ran)break;
@@ -88,6 +108,7 @@ export async function main(args=process.argv.slice(2)) {
     failed=true;
     await atomicJson(path.join(runtimeDir,'status.json'),{checkedAt:new Date().toISOString(),state:'blocked',
       modelCalls:0,liveActions:config.liveActions,error:error.message,failureCode:error.failureCode || 'unknown',
+      ...safeRuntimeDiagnostics(error),
       ...(recoverablePortalError(error)?{readFailure:error.metadata}:{})});
     if(config.liveActions) await notifyFailure(path.join(runtimeDir,'alert.json'),{code:error.failureCode || 'unknown'});
     throw error;
@@ -104,6 +125,7 @@ if(process.argv[1] && path.resolve(process.argv[1])===import.meta.filename)
   main().catch(async e=>{
     await atomicJson(path.join(runtimeDir,'status.json'),{checkedAt:new Date().toISOString(),state:'blocked',
       modelCalls:0,error:e.message,failureCode:e.failureCode||'unknown',
+      ...safeRuntimeDiagnostics(e),
       ...(recoverablePortalError(e)?{readFailure:e.metadata}:{})}).catch(()=>{});
     // Also record setup/lock/conflict failures that happened before the browser opened.
     try {if((await loadConfig()).liveActions) await notifyFailure(path.join(runtimeDir,'alert.json'),{code:e.failureCode||'unknown'});} catch {}
