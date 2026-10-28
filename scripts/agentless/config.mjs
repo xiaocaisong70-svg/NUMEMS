@@ -15,7 +15,7 @@ export function validateConfig(input = {}) {
     totalSeats: 4, reservedSeats: 1, seatLabel: '高级',
     profile: path.join(runtimeDir, 'browser'), browserChannel: 'msedge', headless: true,
     browserMode: 'headless',
-    pollSeconds: 15, maxItems: 6, mailMode: 'in_app', liveActions: false,
+    pollSeconds: 15, officialReconcileSeconds: 120, maxItems: 6, mailMode: 'in_app', liveActions: false,
     legacyCheckerDisabled: false, ...input };
   if (new URL(c.siteUrl).href !== SITE_URL || c.adminEmail !== ADMIN ||
       c.workspaceId !== WORKSPACE || c.workspaceName !== 'My Workspace' ||
@@ -28,6 +28,7 @@ export function validateConfig(input = {}) {
       (c.browserMode === 'headless' && c.headless !== true) ||
       (c.browserMode === 'isolated_desktop' && c.headless !== false) ||
       !Number.isInteger(c.pollSeconds) || c.pollSeconds < 10 || c.pollSeconds > 300 ||
+      !Number.isInteger(c.officialReconcileSeconds) || c.officialReconcileSeconds < 120 || c.officialReconcileSeconds > 3600 ||
       !Number.isInteger(c.maxItems) || c.maxItems < 1 || c.maxItems > 20)
     throw new Error('无 Agent 执行器配置无效；到期提醒仅支持网页或独立 relay。');
   c.profile = path.resolve(root, c.profile);

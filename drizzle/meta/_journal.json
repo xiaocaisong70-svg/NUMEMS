@@ -8,6 +8,13 @@
       "when": 1792465274333,
       "tag": "0000_bored_stick",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1793164714599,
+      "tag": "0001_chilly_squirrel_girl",
+      "breakpoints": true
     }
   ]
 }

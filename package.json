@@ -18,7 +18,7 @@
     "agentless:probe": "node scripts/agentless/host.mjs probe",
     "agentless:once": "node scripts/agentless/host.mjs once",
     "agentless:run": "node scripts/agentless/host.mjs run",
-    "agentless:test": "node --test tests/*.test.mjs",
+    "agentless:test": "node --experimental-vm-modules --test --test-concurrency=1 tests/*.test.mjs",
     "agentless:admin": "node scripts/agentless/host.mjs admin"
   },
   "dependencies": {

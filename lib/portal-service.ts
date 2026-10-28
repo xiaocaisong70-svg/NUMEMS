@@ -4,6 +4,9 @@ import { createState, upgradeState, transition, viewState, type Actor, type Stat
 import type { BridgeState } from "./codex-bridge";
 import { portalAccess, requirePortalAccess } from "./portal-access";
 import { applyReminderPolicy, reminderMode } from "./reminder-policy";
+import { archivedRequestKey, persistHistoryCas, readHistoryPage } from "./history-store";
+import { enforceRequestRate } from "./request-rate-policy";
+import type { HistoryKind } from "./history-policy";
 
 export const ADMIN_EMAIL = "xiaocaisong70@gmail.com";
 export const ADMIN_CONTACT_EMAIL = "2712467009@qq.com";
@@ -42,29 +45,44 @@ export async function readState(): Promise<{ state: State; revision: number }> {
 }
 
 // Retrying pure transforms is safe. No email or member mutation belongs here.
-export async function mutateState(change: (state: State) => State): Promise<State> {
+export async function mutateState(change: (state: State) => State | Promise<State>): Promise<State> {
   for (let attempt = 0; attempt < 12; attempt++) {
     const old = await readState();
-    const next = change(structuredClone(old.state));
-    if (JSON.stringify(next) === JSON.stringify(old.state)) return next;
-    const result = await database().prepare(
-      "UPDATE portal_state SET document=?, revision=revision+1 WHERE id=? AND revision=?"
-    ).bind(JSON.stringify(next), "main", old.revision).run();
-    if (result.meta.changes === 1) return next;
+    const next = await change(structuredClone(old.state));
+    const result = await persistHistoryCas(database(), old.state, next, old.revision);
+    if (result.committed) return result.state;
   }
   throw new Error("当前申请较多，请稍后重试。");
 }
 
 export async function runCommand(actor: Actor, command: Record<string, unknown>) {
-  const now = new Date().toISOString();
   const normalized = { ...command, id: command.id ?? command.requestId };
-  return mutateState(state => {
+  return mutateState(async state => {
+    const now = new Date().toISOString();
     // Recheck the latest whitelist in the same transaction as every mutation.
     requirePortalAccess(state.config, actor);
+    // Recheck on EVERY CAS attempt: another writer may have archived the
+    // original hot record between attempts. A cached miss is not evidence.
+    const archivedDuplicate = command.type === "apply" && typeof command.requestKey === "string" && command.requestKey.length <= 100
+      ? await archivedRequestKey(database(), actor, command.requestKey) : null;
+    if (archivedDuplicate) return state;
     const changed = transition(state, actor, normalized as Parameters<typeof transition>[2], now);
+    enforceRequestRate(state, changed, actor, normalized, now);
     // The same atomic write records the request and any resulting allocation.
     return transition(changed, schedulerActor, { type: "tick" }, now);
   });
+}
+
+export async function portalHistory(kind: HistoryKind, cursor?: string | null, limit = 50) {
+  const actor = await currentActor();
+  if (!actor) return { access: "signin_required" as const, page: null };
+  const latest = await readState();
+  if (portalAccess(latest.state.config, actor) !== "allowed") return { access: "not_authorized" as const, page: null };
+  const page = await readHistoryPage(database(), actor, kind, cursor, limit);
+  // A concurrent whitelist revocation must also close an in-flight read.
+  const after = await readState();
+  requirePortalAccess(after.state.config, actor);
+  return { access: "allowed" as const, page };
 }
 
 export async function portalData() {
@@ -105,6 +123,8 @@ export async function portalData() {
       isolatedOperations: user?.isAdmin ? codex?.holds?.length ?? 0 : undefined,
       memberPaused: Boolean(codex?.lastError || codex?.globalFailureCode),
       browserRecovering: codex?.globalFailureCode === "browser_unavailable" && Boolean(codex?.browserUnavailableAt),
+      officialObservedAt: codex?.observation?.observedAt ?? null,
+      officialStale: !codex?.observation?.observedAt || Date.now() - Date.parse(codex.observation.observedAt) > 3 * 60_000,
     },
     setup: !state.config.inventoryVerified
       ? "首次使用需由管理员核对工作空间、登记当前成员并设置员工白名单。"

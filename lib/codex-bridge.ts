@@ -101,7 +101,7 @@ function record(state: BridgeState, action: string, now: string, requestId?: str
   state.revision++;
   state.audit.push({ id: "codex_" + state.revision + "_" + time(now), at: now,
     actor: PROTECTED_OWNER_EMAIL, action, ...(requestId ? { requestId } : {}) });
-  state.audit = state.audit.slice(-1000);
+  // Archive after the complete CAS transform, never discard events here.
 }
 export function validateObservation(snapshot: Observation, now: string) {
   if (!snapshot || snapshot.workspaceId !== TARGET_WORKSPACE_ID ||
@@ -232,9 +232,10 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
         time(invitationDeadline(current)!) > time(now)) {
       next = transition(next, systemActor, { type: "confirm_active", id: old.id }, now) as BridgeState;
     }
-    if (current.status === "pending_removal" && current.removalReason === "invitation_expired" &&
-        member?.role === "member" && freshForRequest && !targetHeld(next, "remove", current.id, current.email) &&
-        !(next.codex?.lease && next.codex.lease.email === current.email)) {
+    if (current.status === "pending_removal" && ["invitation_expired", "whitelist_revoked"].includes(current.removalReason ?? "") &&
+        member?.role === "member" && freshForRequest &&
+        (!targetHeld(next, "remove", current.id, current.email) || verifiedInvite) &&
+        (!(next.codex?.lease && next.codex.lease.email === current.email) || verifiedInvite)) {
       // Preserve a joined member until the pending invitation is actually revoked.
       // The official snapshot does not establish the exact acceptance time.
       if (!current.joinTimingEvidence) current.joinTimingEvidence = {
@@ -310,12 +311,14 @@ export function workPlan(input: BridgeState, now: string) {
     faultIsolationVersion: 1, globalFailureCode: b?.globalFailureCode ?? null,
     globalFailureId: b?.globalFailureCode ? latestWorkspaceFailureId(input) : null,
     workspaceReviewedAt: b?.workspaceReviewedAt ?? null,
+    officialObservedAt: b?.observation?.observedAt ?? null,
     browserRecovery: b?.globalFailureCode === "browser_unavailable" && b.browserUnavailableAt && !b.lease
       ? { eligible: true, blockedAt: b.browserUnavailableAt } : null,
     blockedOperations: b?.holds ?? [],
     mailChannelError: b?.mailChannelError ?? null,
     scheduleId: b?.scheduleId ?? null, lastRunAt: b?.lastRunAt ?? null,
-    invites: input.requests.filter(r => r.status === "pending_invite" && allowed(r.email) && !targetHeld(input, "invite", r.id, r.email)),
+    invites: input.requests.filter(r => r.status === "pending_invite" && input.config.whitelist.includes(r.email) &&
+      allowed(r.email) && !targetHeld(input, "invite", r.id, r.email)),
     removals: input.requests.filter(r => r.status === "pending_removal" &&
       allowed(r.email) && !targetHeld(input, "remove", r.id, r.email)),
     awaitingAcceptance: input.requests.filter(r => r.status === "invited" && allowed(r.email) && !targetHeld(input, "acceptance", r.id, r.email)),
@@ -352,6 +355,8 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     const r = next.requests.find(r => r.id === targetId);
     if (!r || r.status !== (kind === "invite" ? "pending_invite" : "pending_removal"))
       throw new Error("申请状态已变化，不能执行此操作。");
+    if (kind === "invite" && !next.config.whitelist.includes(r.email))
+      throw new Error("员工白名单授权已撤销，不能发送新的工作空间邀请。");
     if (!b.observation) throw new Error("缺少官方成员证据。");
     const s = validateObservation(b.observation, now);
     const member = s.members.find(p => norm(p.email) === r.email);
@@ -359,10 +364,12 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     originalPresence = member ? "member" : invitation ? "invite" : "absent";
     if ((member && member.role !== "member") || (invitation && invitation.role !== "member"))
       throw new Error("禁止自动移除管理员或 Owner。");
-    if (kind === "remove" && r.removalReason === "invitation_expired") {
-      if (time(s.observedAt) < time(invitationDeadline(r)!))
+    if (kind === "remove" && ["invitation_expired", "whitelist_revoked"].includes(r.removalReason ?? "")) {
+      if (r.removalReason === "invitation_expired" && time(s.observedAt) < time(invitationDeadline(r)!))
         throw new Error("须先取得加入窗口截止后的完整官方快照。");
-      if (member) throw new Error("员工已加入，禁止按邀请超时回收成员；请重新同步官方状态。");
+      if (r.removalReason === "whitelist_revoked" && time(s.observedAt) < time(r.authorizationRevokedAt ?? r.updatedAt))
+        throw new Error("须先取得白名单撤销后的完整官方快照。");
+      if (member) throw new Error("员工已加入，禁止按邀请撤回规则移除成员；请重新同步官方状态。");
     }
     if (kind === "invite") {
       if ([...s.members, ...s.invites].some(p => norm(p.email) === r.email))
@@ -397,7 +404,7 @@ export function completeOperation(input: BridgeState, args: {
   if (hold && b.lease) throw new Error("其他操作正在办理，请稍后核对隔离记录。");
   if (args.outcome === "joined") {
     if (op.kind !== "remove" || op.originalPresence !== "invite" ||
-        next.requests.find(r => r.id === op.requestId)?.removalReason !== "invitation_expired")
+        !["invitation_expired", "whitelist_revoked"].includes(next.requests.find(r => r.id === op.requestId)?.removalReason ?? ""))
       throw new Error("只有撤回未接受邀请时转为普通成员，才可提交加入竞态回执。");
     const s = validateObservation(args.observation!, now);
     if (time(s.observedAt) < time(op.claimedAt) ||
@@ -468,7 +475,7 @@ export function completeOperation(input: BridgeState, args: {
       if (time(args.invitationSentAt) < time(op.claimedAt) || time(args.invitationSentAt) > time(s.observedAt))
         throw new Error("邀请发出时间必须位于本次实际办理与核实之间。");
       const r = next.requests.find(r => r.id === op.requestId);
-      if (r?.status === "pending_invite")
+      if (r?.status === "pending_invite" || r?.status === "pending_removal" && r.removalReason === "whitelist_revoked")
         next = transition(next, systemActor, { type: "confirm_invited", id: r.id, sentAt: args.invitationSentAt }, now) as BridgeState;
     }
     next = observeWorkspace(next, s, now, op.id); b = bridge(next);

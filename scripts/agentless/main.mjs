@@ -5,12 +5,14 @@ import { PortalClient } from '../seat-executor/portal-client.mjs';
 import { runBatch } from './core.mjs';
 import { Journal,atomicJson,acquireLock,readJson } from './journal.mjs';
 import { assertExclusive } from './guard.mjs';
-import { notifyFailure } from './alert.mjs';
+import { notifyFailure,flushFailureAlerts,runtimeIncidentKey } from './alert.mjs';
 import { recoverBrowser } from './recovery.mjs';
 import { GracefulStopControl,runGracefulBatch } from './graceful-stop.mjs';
 import {recoverPortal,recoverablePortalError} from './portal-recovery.mjs';
 import {safeOfficialDiagnostic} from '../seat-executor/official-readiness.mjs';
 import {safeRuntimeDiagnostics} from './operation-diagnostic.mjs';
+import {reconcileIdle} from './idle-reconcile.mjs';
+import {markRuntimeHealthy} from './health-cycle.mjs';
 
 // The production error policy is independently testable without starting a
 // browser, scheduler, or live member operation.
@@ -82,6 +84,12 @@ export async function main(args=process.argv.slice(2)) {
       const batch=await runGracefulBatch(async()=>{
         try {
           const result=await runBatch({portal,browser,config,journal});
+          if(config.liveActions && result.mode==='idle' && !await shouldStop()) {
+            result.officialReconciliation=await reconcileIdle({portal,browser,config,
+              journalState:await readJson(journal.file),record:await readJson(path.join(runtimeDir,'idle-reconcile.json')),
+              shouldStop,save:value=>atomicJson(path.join(runtimeDir,'idle-reconcile.json'),value),
+              onHealthy:evidence=>markRuntimeHealthy({directory:runtimeDir,config,...evidence})});
+          }
           if(config.liveActions && !registered && ['idle','processed'].includes(result.mode) && !await shouldStop()) {
             registered=await registerRunningSchedule({portal,config});
           }
@@ -99,7 +107,10 @@ export async function main(args=process.argv.slice(2)) {
       await atomicJson(path.join(runtimeDir,'status.json'),{checkedAt:new Date().toISOString(),...result,
         liveActions:config.liveActions,ignoredStaleStopRequest:control.ignoredStaleRequest});
       if(result.mailChannelError || result.actions?.some(a=>a.outcome==='isolated'))
-        await notifyFailure(path.join(runtimeDir,'alert.json'),{code:'isolated',detail:'存在隔离任务或邮件通道故障，其他有效席位任务继续办理。'});
+        await notifyFailure(path.join(runtimeDir,'alert.json'),{code:'isolated',
+          incidentKey:result.actions?.filter(a=>a.outcome==='isolated').map(a=>a.targetId).sort().join(',') || 'mail_channel',
+          detail:'存在隔离任务或邮件通道故障，其他有效席位任务继续办理。'});
+      await flushFailureAlerts(path.join(runtimeDir,'alert.json'));
       if(batch.stopped || args.includes('--once') || !config.liveActions || result.mode==='disabled') break;
       // Short sleeps allow graceful shutdown without interrupting an in-flight receipt.
       for(let n=0;n<config.pollSeconds && !await shouldStop();n++) await new Promise(r=>setTimeout(r,1000));
@@ -110,7 +121,7 @@ export async function main(args=process.argv.slice(2)) {
       modelCalls:0,liveActions:config.liveActions,error:error.message,failureCode:error.failureCode || 'unknown',
       ...safeRuntimeDiagnostics(error),
       ...(recoverablePortalError(error)?{readFailure:error.metadata}:{})});
-    if(config.liveActions) await notifyFailure(path.join(runtimeDir,'alert.json'),{code:error.failureCode || 'unknown'});
+    if(config.liveActions) await notifyFailure(path.join(runtimeDir,'alert.json'),{code:error.failureCode || 'unknown',incidentKey:runtimeIncidentKey(error)});
     throw error;
   } finally {
     try {
@@ -128,6 +139,6 @@ if(process.argv[1] && path.resolve(process.argv[1])===import.meta.filename)
       ...safeRuntimeDiagnostics(e),
       ...(recoverablePortalError(e)?{readFailure:e.metadata}:{})}).catch(()=>{});
     // Also record setup/lock/conflict failures that happened before the browser opened.
-    try {if((await loadConfig()).liveActions) await notifyFailure(path.join(runtimeDir,'alert.json'),{code:e.failureCode||'unknown'});} catch {}
+    try {if((await loadConfig()).liveActions) await notifyFailure(path.join(runtimeDir,'alert.json'),{code:e.failureCode||'unknown',incidentKey:runtimeIncidentKey(e)});} catch {}
     console.error(e.message);process.exitCode=1;
   });

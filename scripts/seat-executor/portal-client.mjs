@@ -119,7 +119,7 @@ export class PortalClient {
   async call(name, args = {}) {
     const allowed = new Set(["process_seat_queue", "refresh_seat_queue", "seat_portal_status", "observe_workspace",
       "claim_seat_operation", "complete_seat_operation", "defer_seat_operation",
-      "record_codex_schedule"]);
+      "record_codex_schedule", "record_idle_observation_failure", "observe_idle_workspace"]);
     for (const operation of this.setupOperations) allowed.add(operation);
     if (!allowed.has(name)) throw new Error("执行器不允许调用该门户操作。");
     const page = await this.open(name);

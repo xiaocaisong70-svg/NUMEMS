@@ -140,7 +140,8 @@ export async function runBatch({ portal, browser, config, journal,
       await journal?.settled();
       actions.push({kind,targetId:item.id,outcome});
     };
-    const joined = s => kind === 'remove' && current.removalReason === 'invitation_expired' &&
+    const invitationOnly = ['invitation_expired','whitelist_revoked'].includes(current.removalReason);
+    const joined = s => kind === 'remove' && invitationOnly &&
       lease.originalPresence === 'invite' && presence(s,lease.email) === 'member';
     const verified = s => kind === 'remove' ? presence(s,lease.email) === 'absent'
       : presence(s,lease.email) !== 'absent';
@@ -156,7 +157,7 @@ export async function runBatch({ portal, browser, config, journal,
       const fresh = await browser.observe();
       assertTarget(fresh);
       if (joined(fresh)) { await finish(fresh,'joined'); continue; }
-      if (kind === 'remove' && current.removalReason === 'invitation_expired' &&
+      if (kind === 'remove' && invitationOnly &&
           presence(fresh,lease.email) === 'member') throw new StopError('邀请超时目标已加入，保留成员并停止。');
       if (!verified(fresh)) {
         if (kind === 'invite') sentAt = await browser.invite(lease.email,fresh);

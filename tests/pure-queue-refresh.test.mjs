@@ -9,6 +9,8 @@ import ts from 'typescript';
 import * as engine from '../lib/seat-engine.ts';
 import * as bridge from '../lib/codex-bridge.ts';
 import * as reminder from '../lib/reminder-policy.ts';
+import * as officialIdle from '../lib/official-idle-state.ts';
+import * as historyRollback from '../lib/history-rollback.ts';
 
 const root=path.resolve(import.meta.dirname,'..');
 const initial='2026-10-26T06:00:00.000Z';
@@ -53,7 +55,7 @@ function fixture(mode='in_app') {
     }},Clock);
   const route=load('app/mcp/route.ts',{'cloudflare:workers':{env},'@/lib/portal-service':service,
     '@/lib/jobs':jobs,'@/lib/codex-bridge':bridge,'@/lib/seat-engine':engine,
-    '@/lib/reminder-policy':reminder},Clock);
+    '@/lib/reminder-policy':reminder,'@/lib/history-rollback':historyRollback,'@/lib/official-idle-state':officialIdle},Clock);
   const post=(name='refresh_seat_queue',args={},headers={})=>route.POST(new Request('https://portal.example.test/api/codex',{
     method:'POST',headers:{'content-type':'application/json',origin:'https://portal.example.test',...headers},
     body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name,arguments:args}}),

@@ -1,7 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$NodeExe,
   [ValidateSet('probe','once','run','admin')][string]$Mode = 'probe',
-  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation')][string]$AdminCommand,
+  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','rollback-status','prepare-v11-rollback')][string]$AdminCommand,
   [string]$RequestId,
   [switch]$RecoverSettledLock,
   [switch]$ReviewRetry
@@ -138,8 +138,10 @@ try {
       -not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'An absolute installed node.exe path is required.' }
   if ($Mode -eq 'admin') {
     if (-not $AdminCommand) { throw 'AdminCommand is required in admin mode.' }
-    $requiresRequestId = $AdminCommand -cin @('release-test','test-reminder','test-expire')
-    if ($requiresRequestId -and $RequestId -cnotmatch '\Areq_[a-zA-Z0-9_]+\z') { throw 'This test command requires a registered req_ ID.' }
+    $requiresRequestId = $AdminCommand -cin @('release-test','test-reminder','test-expire','prepare-v11-rollback')
+    if ($AdminCommand -ceq 'prepare-v11-rollback') {
+      if ($RequestId -cnotmatch '\A\d{1,15}\z') { throw 'Rollback requires a current numeric D1 revision.' }
+    } elseif ($requiresRequestId -and $RequestId -cnotmatch '\Areq_[a-zA-Z0-9_]+\z') { throw 'This test command requires a registered req_ ID.' }
     if (-not $requiresRequestId -and $PSBoundParameters.ContainsKey('RequestId')) { throw 'RequestId is allowed only for test commands that require an ID.' }
     $report['adminCommand'] = $AdminCommand
   } elseif ($PSBoundParameters.ContainsKey('AdminCommand') -or $PSBoundParameters.ContainsKey('RequestId')) {

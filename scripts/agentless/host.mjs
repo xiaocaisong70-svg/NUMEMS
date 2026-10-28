@@ -6,12 +6,13 @@ import {spawn} from 'node:child_process';
 export function hostArguments(args,node=process.execPath) {
   const [mode,command,id,...extra]=args;
   const commands=['status','observe','prepare-test','release-test','test-reminder','test-expire',
-    'enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation'];
-  const withId=['release-test','test-reminder','test-expire'];
+    'enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','rollback-status','prepare-v11-rollback'];
+  const withId=['release-test','test-reminder','test-expire','prepare-v11-rollback'];
+  const validId=command==='prepare-v11-rollback' ? /^\d{1,15}$/.test(id??'') && Number.isSafeInteger(Number(id)) : /^req_[a-zA-Z0-9_]+$/.test(id??'');
   if(!['probe','once','run','admin'].includes(mode) || extra.length ||
     (mode!=='admin' && (command!==undefined || id!==undefined)) ||
     (mode==='admin' && (!commands.includes(command) ||
-      (withId.includes(command) ? !/^req_[a-zA-Z0-9_]+$/.test(id??'') : id!==undefined))))
+      (withId.includes(command) ? !validId : id!==undefined))))
     throw new Error('用法：host.mjs probe|once|run|admin <管理员命令> [已登记测试申请ID]');
   return ['-NoProfile','-NonInteractive','-WindowStyle','Hidden','-File',
     path.join(import.meta.dirname,'isolated-desktop.ps1'),'-NodeExe',node,'-Mode',mode,

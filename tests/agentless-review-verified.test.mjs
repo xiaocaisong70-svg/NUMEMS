@@ -243,6 +243,9 @@ test('changed official snapshot or local record stops before server review',asyn
 });
 test('three expired members retain capacity; queued applicant remains queued during review',async t=>{
   const f=await fixture(t),base=f.state.requests[0];
+  // This scenario represents authorized employees. Revoked queued applicants
+  // now correctly cancel during the review's pure queue transition.
+  f.state.config.whitelist.push('second@example.com','third@example.com','waiting@example.com');
   base.status='active';base.expiresAt='2026-10-27T09:59:00.000Z';
   for(const [i,email] of ['second@example.com','third@example.com'].entries()){
     f.state.requests.push({...structuredClone(base),id:`req_extra_${i}`,userId:`u_extra_${i}`,email,name:email});

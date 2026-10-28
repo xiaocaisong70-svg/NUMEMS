@@ -104,12 +104,15 @@ const [command,id,...extra]=args;
 const commands={status:['seat_portal_status',{}], 'prepare-test':['prepare_test_request',{}],
   'release-test':['release_test_request',{requestId:id}], 'test-reminder':['set_test_deadline',{requestId:id,stage:'reminder'}],
   'test-expire':['set_test_deadline',{requestId:id,stage:'expire'}],
-  'enable-live':['set_codex_live',{enabled:true}], 'disable':['set_codex_live',{enabled:false}]};
-const withId=['release-test','test-reminder','test-expire'];
+  'enable-live':['set_codex_live',{enabled:true}], 'disable':['set_codex_live',{enabled:false}],
+  'rollback-status':['version_rollback_status',{}], 'prepare-v11-rollback':['prepare_v11_rollback',{expectedRevision:Number(id)}]};
+const withId=['release-test','test-reminder','test-expire','prepare-v11-rollback'];
 if((!commands[command] && !['observe','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation'].includes(command)) || extra.length ||
     (!withId.includes(command) && id!==undefined))
-  throw new Error('用法：admin.mjs status|observe|prepare-test|release-test ID|test-reminder ID|test-expire ID|enable-live|disable|reconcile|recover-browser|resolve-alert|resume-test-invite|review-test-workspace');
-if(withId.includes(command) && !/^req_[a-zA-Z0-9_]+$/.test(id??''))
+  throw new Error('用法：admin.mjs status|observe|prepare-test|release-test ID|test-reminder ID|test-expire ID|enable-live|disable|reconcile|recover-browser|resolve-alert|resume-test-invite|review-test-workspace|review-live-workspace|review-verified-operation|rollback-status|prepare-v11-rollback REVISION');
+if(command==='prepare-v11-rollback' && (!/^\d+$/.test(id??'') || !Number.isSafeInteger(Number(id))))
+  throw new Error('必须提供刚读取的 D1 修订号。');
+if(withId.includes(command) && command!=='prepare-v11-rollback' && !/^req_[a-zA-Z0-9_]+$/.test(id??''))
   throw new Error('必须提供已登记测试申请的 ID。');
 const config=await loadConfig();
 if(command!=='status') await assertExclusive({...config,liveActions:true});
@@ -120,7 +123,7 @@ const report={command,requestId:id,startedAt:new Date().toISOString(),modelCalls
 try {
   await browser.open();
   const portal=new PortalClient(browser.context,config,['prepare_test_request','release_test_request',
-    'set_test_deadline','set_codex_live','review_seat_failure','verified_review_receipt']);
+    'set_test_deadline','set_codex_live','review_seat_failure','verified_review_receipt','version_rollback_status','prepare_v11_rollback']);
   if(command==='review-verified-operation') {
     const rawRetry=process.env.NUMEMS_REVIEW_RETRY_EXPECTED;
     const expectedStopDigest=process.env.NUMEMS_REVIEW_STOP_DIGEST;
@@ -156,7 +159,7 @@ try {
       const [name,arguments_]=commands[command];response=await portal.call(name,arguments_);
     }
     const p=response.plan??response;
-    report.result={enabled:p.enabled,testOnly:p.testOnly,busy:p.busy,
+    report.result=['rollback-status','prepare-v11-rollback'].includes(command)?p:{enabled:p.enabled,testOnly:p.testOnly,busy:p.busy,
       pendingInvites:p.invites?.length,pendingRemovals:p.removals?.length,held:p.blockedOperations?.length,
       testRequests:[...(p.invites??[]),...(p.awaitingAcceptance??[]),...(p.removals??[])].filter(r=>r.isTest).map(r=>r.id)};
     if(['status','observe'].includes(command))Object.assign(report.result,await readTestSummary(portal,config));

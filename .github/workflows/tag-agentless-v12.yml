@@ -1,0 +1,91 @@
+name: Tag NUMEMS agentless v12
+
+on:
+  push:
+    branches: [agentless]
+    paths: [releases/agentless-v12/manifest.json]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-numems-agentless-v12
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    if: github.repository == 'xiaocaisong70-svg/NUMEMS' && github.ref == 'refs/heads/agentless'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate release and create the exact annotated tag
+        shell: python
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          import base64
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.request
+
+          repository = os.environ['GITHUB_REPOSITORY']
+          target = os.environ['GITHUB_SHA']
+          tag = 'agentless-v12'
+          source = 'aa41d10d4d1481c472d6073a232dcdaaa94b1948'
+          if repository != 'xiaocaisong70-svg/NUMEMS' or os.environ['GITHUB_REF'] != 'refs/heads/agentless':
+              raise RuntimeError('Unexpected repository or branch; no tag created.')
+          if os.environ['GITHUB_EVENT_NAME'] != 'push' or not re.fullmatch(r'[0-9a-f]{40}', target):
+              raise RuntimeError('Unexpected event or target commit; no tag created.')
+
+          def api(method, path, payload=None, missing_ok=False):
+              data = None if payload is None else json.dumps(payload).encode('utf-8')
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/' + repository + path,
+                  data=data, method=method,
+                  headers={
+                      'Authorization': 'Bearer ' + os.environ['GITHUB_TOKEN'],
+                      'Accept': 'application/vnd.github+json',
+                      'User-Agent': 'NUMEMS-agentless-versioning',
+                      'Content-Type': 'application/json',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                  })
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if missing_ok and error.code == 404:
+                      return None
+                  raise RuntimeError('GitHub API returned HTTP ' + str(error.code) + '; no tag was overwritten.') from None
+
+          entry = api('GET', '/contents/releases/agentless-v12/manifest.json?ref=' + target)
+          manifest = json.loads(base64.b64decode(entry['content']))
+          if manifest['source']['commit'] != source or manifest['repository']['tag'] != tag:
+              raise RuntimeError('Release manifest does not match the approved v12 source.')
+
+          def verify_reference(reference):
+              if reference['object']['type'] != 'tag':
+                  raise RuntimeError('A true annotated tag is required; existing refs are never overwritten.')
+              obj = reference['object']
+              for _ in range(5):
+                  if obj['type'] == 'commit':
+                      if obj['sha'] != target:
+                          raise RuntimeError('Existing tag points elsewhere; refusing to overwrite it.')
+                      return
+                  if obj['type'] != 'tag':
+                      raise RuntimeError('Unexpected tag object type.')
+                  obj = api('GET', '/git/tags/' + obj['sha'])['object']
+              raise RuntimeError('Tag indirection limit reached.')
+
+          existing = api('GET', '/git/ref/tags/' + tag, missing_ok=True)
+          if existing is not None:
+              verify_reference(existing)
+          else:
+              annotation = api('POST', '/git/tags', {
+                  'tag': tag, 'message': 'NUMEMS agentless v12; Sites source ' + source,
+                  'object': target, 'type': 'commit'})
+              api('POST', '/git/refs', {'ref': 'refs/tags/' + tag, 'sha': annotation['sha']})
+              verify_reference(api('GET', '/git/ref/tags/' + tag))
+          print('Verified ' + tag + ' -> ' + target)
+          print('https://github.com/' + repository + '/tree/' + tag)

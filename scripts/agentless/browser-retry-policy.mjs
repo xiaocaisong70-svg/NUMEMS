@@ -23,6 +23,22 @@ export function browserRetryDecision({status,host,retryRecord=null,now=Date.now(
     return deny('browser_retry_evidence_invalid');
   const statusDigest=browserFailureDigest(status),statusAt=Date.parse(status.checkedAt);
   let attempts=0,anchor=Math.max(statusAt,Date.parse(host.checkedAt));
+  if(retryRecord?.version===2) {
+    // This marker is emitted only by the verified official-health guard, after
+    // the cloud lease/fault and local journal have all been checked. An idle
+    // status or a new failure timestamp is never sufficient to mint it.
+    if(!record(retryRecord) || retryRecord.state!=='healthy' || !stamp(retryRecord.healthyAt) ||
+        !stamp(retryRecord.officialObservedAt) ||
+        typeof retryRecord.workspaceId!=='string' || !retryRecord.workspaceId ||
+        typeof retryRecord.administrator!=='string' || !retryRecord.administrator ||
+        Date.parse(retryRecord.officialObservedAt)>Date.parse(retryRecord.healthyAt) ||
+        Date.parse(retryRecord.healthyAt)-Date.parse(retryRecord.officialObservedAt)>60_000 ||
+        Date.parse(retryRecord.healthyAt)>current || statusAt<Date.parse(retryRecord.healthyAt))
+      return deny('browser_retry_health_epoch_invalid');
+    // The current, independently eligible failure starts a new incident. Its
+    // first launch still waits the full 60-second cooldown and all outer gates.
+    retryRecord=null;
+  }
   if(retryRecord!==null) {
     if(!record(retryRecord) || retryRecord.version!==1 || retryRecord.failureCode!=='browser_unavailable' ||
         !digest(retryRecord.statusDigest) || !stamp(retryRecord.statusCheckedAt) || !stamp(retryRecord.issuedAt) ||

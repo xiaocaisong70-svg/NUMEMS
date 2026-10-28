@@ -5,6 +5,8 @@ import { observeWorkspace, prepareTest, workPlan, claimOperation, completeOperat
   setTestDeadline, recordSchedule, type BridgeState, type Observation } from "@/lib/codex-bridge";
 import { transition } from "@/lib/seat-engine";
 import { reminderMode } from "@/lib/reminder-policy";
+import { recordIdleFailure, applyIdleObservation } from "@/lib/official-idle-state";
+import { restoreV11History } from "@/lib/history-rollback";
 export const dynamic = "force-dynamic";
 
 const personSchema = { type: "object", properties: {
@@ -16,6 +18,25 @@ const observationSchema = { type: "object", properties: {
   members: { type: "array", items: personSchema }, invites: { type: "array", items: personSchema },
 }, required: ["workspaceId", "accountEmail", "pageUrl", "observedAt", "complete", "totalSeats", "members", "invites"], additionalProperties: false };
 const tools = [
+  {
+    name:"version_rollback_status",description:"仅读取当前 D1 修订与 V11 回退前提，不修改数据或成员。",
+    inputSchema:{type:"object",properties:{},additionalProperties:false},annotations:{readOnlyHint:true},
+  },
+  {
+    name:"prepare_v11_rollback",description:"仅管理员显式维护：停用所有调度且原租约结案后，按当前修订把归档补回当前状态，为 V11 回退准备；保留归档，不恢复旧数据库快照。",
+    inputSchema:{type:"object",properties:{expectedRevision:{type:"integer",minimum:0}},required:["expectedRevision"],additionalProperties:false},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false},
+  },
+  {
+    name:"observe_idle_workspace", description:"定期只读对账的完整官方证据；CAS 再核实无未完成租约、无全局故障且证据基线未变化，不办理外部动作。",
+    inputSchema:{type:"object",properties:{observation:observationSchema,expectedObservedAt:{type:["string","null"]}},required:["observation","expectedObservedAt"],additionalProperties:false},
+    annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false},
+  },
+  {
+    name: "record_idle_observation_failure", description: "仅登记无租约、未开始外部动作的定期官方核对故障，不变更成员或释放席位；不能覆盖现有故障。",
+    inputSchema: { type: "object", properties: {failureCode: {type:"string",enum:["browser_unavailable","login_expired","workspace_mismatch","capacity_mismatch","role_mismatch","unknown"]}, expectedObservedAt:{type:["string","null"]}}, required:["failureCode","expectedObservedAt"], additionalProperties:false },
+    annotations: {readOnlyHint:false,destructiveHint:false,idempotentHint:false},
+  },
   {
     name: "defer_seat_operation",
     description: "登记故障。仅在未claim且未开始外部动作时，暂时加载/网络/安全验证页使用browser_unavailable，由普通程序只读复核恢复；其它全局故障保持暂停。邮件/单一成员/单次审批仅隔离目标。不会确认成功或释放席位。",
@@ -136,6 +157,21 @@ export async function POST(request: Request) {
     } else if (body.method === "tools/call") {
       const actor = await currentActor();
       if (!actor?.isAdmin) throw new Error("只有已登录的门户管理员可以运行此工具。");
+      if (body.params?.name === "version_rollback_status") {
+        if(Object.keys(body.params?.arguments??{}).length)throw new Error("回退状态不接受参数。");
+        const {state,revision}=await readState();const b=(state as BridgeState).codex;
+        return Response.json({jsonrpc:"2.0",id,result:{content:[{type:"text",text:JSON.stringify({revision,
+          schedulerEnabled:state.config.automationEnabled,memberEnabled:b?.enabled??false,
+          busy:!!b?.lease,holds:b?.holds?.length??0,
+          incompatiblePending:state.requests.filter(r=>r.status==="pending_removal"&&r.removalReason==="whitelist_revoked").length})}]}},{headers:{"Cache-Control":"no-store"}});
+      }
+      if(body.params?.name === "prepare_v11_rollback") {
+        const args=body.params?.arguments;
+        if(!args || Object.keys(args).join(',')!=="expectedRevision" || !Number.isSafeInteger(args.expectedRevision) || args.expectedRevision<0 || !env.DB)
+          throw new Error("回退参数无效。");
+        const prepared=await restoreV11History(env.DB,args.expectedRevision);
+        return Response.json({jsonrpc:"2.0",id,result:{content:[{type:"text",text:JSON.stringify(prepared)}]}},{headers:{"Cache-Control":"no-store"}});
+      }
       if (body.params?.name === "refresh_seat_queue") {
         const args = body.params?.arguments === undefined ? {} : body.params.arguments;
         if (!args || typeof args !== "object" || Array.isArray(args) || Object.keys(args).length)
@@ -170,6 +206,8 @@ export async function POST(request: Request) {
         const state = await mutateState(current => {
           const s = current as BridgeState;
           if (name === "observe_workspace") return observeWorkspace(s, args.observation as Observation, now);
+          if (name === "record_idle_observation_failure") return recordIdleFailure(s, args, new Date().toISOString());
+          if (name === "observe_idle_workspace") return applyIdleObservation(s, args, new Date().toISOString());
           if (name === "defer_seat_operation") return deferOperation(s, args, now);
           // A CAS retry can happen long after the request began. The guarded
           // recovery must measure snapshot age on each retry, not against the

@@ -138,10 +138,10 @@ test('protected owner never auto-expires even when a corrupt lease exists', () =
   assert.equal(act(state, { type: 'tick' }, owner, at(1)).requests[0].status, 'active');
   assert.throws(() => act(state, { type: 'release', id: state.requests[0].id }), /受保护/);
 });
-test('bounded audit and no-op revisions', () => {
+test('pure transforms retain audit until durable storage compaction and no-op revisions stay unchanged', () => {
   let state = createState(NOW);
   for (let i = 0; i < 1005; i++) state = act(state, { type: 'configure', config: { leaseHours: i % 2 ? 3 : 2 } });
-  assert.equal(state.audit.length, 1000); assert.equal(new Set(state.audit.map(r => r.id)).size, 1000);
+  assert.equal(state.audit.length, 1005); assert.equal(new Set(state.audit.map(r => r.id)).size, 1005);
   assert.equal(act(state, { type: 'tick' }).revision, state.revision);
 });
 

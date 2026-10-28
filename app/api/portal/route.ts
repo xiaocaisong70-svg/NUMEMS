@@ -1,5 +1,6 @@
 import { currentActor, portalData, runCommand } from "@/lib/portal-service";
 import { PortalAccessError } from "@/lib/portal-access";
+import { RequestRateError } from "@/lib/request-rate-policy";
 
 export const dynamic = "force-dynamic";
 const allowed = new Set([
@@ -33,6 +34,8 @@ export async function POST(request: Request) {
     await runCommand(actor, command);
     return Response.json(await portalData(), { headers: privateHeaders });
   } catch (error) {
+    if (error instanceof RequestRateError)
+      return Response.json({ error: error.message }, { status: 429, headers: { ...privateHeaders, "Retry-After": "3600" } });
     if (error instanceof PortalAccessError)
       return Response.json({ error: error.message, access: error.access, user: await currentActor(), view: null },
         { status: error.status, headers: privateHeaders });

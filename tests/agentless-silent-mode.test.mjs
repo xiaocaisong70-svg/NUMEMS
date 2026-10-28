@@ -44,6 +44,10 @@ test('hidden entry permits only fixed modes and validated administrator argument
   assert.equal(args[args.indexOf('-NodeExe')+1],node);
   assert.equal(args[args.indexOf('-WindowStyle')+1],'Hidden');
   assert.ok(args.includes('req_example_1'));
+  assert.ok(hostArguments(['admin','rollback-status'],node).includes('rollback-status'));
+  assert.ok(hostArguments(['admin','prepare-v11-rollback','23'],node).includes('23'));
+  for(const id of ['-1','1;bad','1.2','9007199254740992','req_23'])
+    assert.throws(()=>hostArguments(['admin','prepare-v11-rollback',id],node));
   for(const input of [[],['run','anything'],['probe','admin'],['admin','x'],
     ['admin','status','req_1'],['admin','test-expire'],['admin','test-expire','req_1;malicious'],
     ['admin','test-expire','req_1','extra']]) assert.throws(()=>hostArguments(input,node));

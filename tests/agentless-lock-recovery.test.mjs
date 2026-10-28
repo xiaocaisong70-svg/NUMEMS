@@ -28,7 +28,9 @@ try {
     $result+=@{case=$phase;blocked=$blocked;lockRetained=[IO.File]::Exists($lockPath)}
   }
   [IO.File]::WriteAllText($journalPath,'{"phase":"settled"}')
-  [IO.File]::WriteAllText($lockPath,('{"pid":'+$PID+',"at":"2026-10-26T01:00:00Z"}'))
+  # Use this live Node test worker, not the PowerShell helper's PID. A helper
+  # with an older lock timestamp can legitimately prove unrelated PID reuse.
+  [IO.File]::WriteAllText($lockPath,('{"pid":${process.pid},"at":"${new Date().toISOString()}"}'))
   $blocked=$false;try {& $recover} catch {$blocked=$true}
   $result+=@{case='alive';blocked=$blocked;lockRetained=[IO.File]::Exists($lockPath)}
   [IO.File]::WriteAllText($lockPath,'{"pid":2147483647,"at":"2026-10-26T01:00:00Z"}')

@@ -40,14 +40,17 @@ test('launcher admits only fixed worker modes and probe fails closed', async () 
 
 test('native command builder fixes entries and rejects non-whitelisted admin arguments', {skip:process.platform!=='win32'}, async () => {
   const node = 'C:\\Program Files\\nodejs\\node.exe', project = 'D:\\NUMEMS project';
-  const allowed = ['status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace'];
+  const allowed = ['status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','rollback-status','prepare-v11-rollback'];
   const adminSource = await readFile(path.join(dir,'admin.mjs'),'utf8');
   const advertised = adminSource.match(/用法：admin\.mjs ([^']+)/)?.[1].split('|').map(value=>value.trim().split(/\s+/)[0]);
   assert.deepEqual(new Set(advertised),new Set(allowed),'isolated admin whitelist must match the current CLI');
   const requiresId = new Set(['release-test','test-reminder','test-expire']);
   const cases = [
     ...['probe','once','run'].map(mode=>({mode,adminCommand:null,requestId:null,valid:true})),
-    ...allowed.map(adminCommand=>({mode:'admin',adminCommand,requestId:requiresId.has(adminCommand)?'req_Ab12_3':null,valid:true})),
+    ...allowed.map(adminCommand=>({mode:'admin',adminCommand,requestId:adminCommand==='prepare-v11-rollback'?'23':requiresId.has(adminCommand)?'req_Ab12_3':null,valid:true})),
+    {mode:'admin',adminCommand:'prepare-v11-rollback',requestId:'1;bad',valid:false},
+    {mode:'admin',adminCommand:'prepare-v11-rollback',requestId:'req_23',valid:false},
+    {mode:'admin',adminCommand:'prepare-v11-rollback',requestId:'-1',valid:false},
     {mode:'admin',adminCommand:'status & calc',requestId:null,valid:false},
     {mode:'admin',adminCommand:'../admin.mjs',requestId:null,valid:false},
     {mode:'admin',adminCommand:'STATUS',requestId:null,valid:false},
@@ -79,7 +82,7 @@ ConvertTo-Json -InputObject @($result) -Compress`;
   assert.equal(result[1].command,`${prefix}main.mjs" "--once"`);
   assert.equal(result[2].command,`${prefix}main.mjs"`);
   for (const [index,command] of allowed.entries()) {
-    assert.equal(result[index+3].command,`${prefix}admin.mjs" "${command}"${requiresId.has(command)?' "req_Ab12_3"':''}`);
+    assert.equal(result[index+3].command,`${prefix}admin.mjs" "${command}"${command==='prepare-v11-rollback'?' "23"':requiresId.has(command)?' "req_Ab12_3"':''}`);
   }
 });
 

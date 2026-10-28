@@ -2,10 +2,11 @@
 
 Developed by xcsong.
 
-这是新站 **Sites 第 11 版（2026-10-27，America/Los_Angeles）**的源码与维护分支。网页托管在 Sites，Windows 上的普通程序负责工作空间成员操作，日常办理不调用模型，也不唤醒 Codex。
+这是新站 **NUMEMS V12（Sites 部署版本 13；2026-10-27，America/Los_Angeles）**的源码与维护分支。网页托管在 Sites，Windows 上的普通程序负责工作空间成员操作，日常办理不调用模型，也不唤醒 Codex。
 
 - [线上新站](https://numems-seat-portal-agentless.workspace-026021.chatgpt.site/)
-- 维护分支：`agentless`；本版发布标签约定为 `agentless-v11`，远端标签须在上传流程结束时核实。
+- 维护分支：`agentless`；本版发布标签约定为 `agentless-v12`，远端标签须在上传流程结束时核实。
+- [第十二版说明与校验清单](releases/agentless-v12/README.md)
 - [第十一版说明与校验清单](releases/agentless-v11/README.md)
 - [第十版说明与校验清单](releases/agentless-v10/README.md)
 - [到期回收根因修复与验收边界](docs/EXPIRY-ROOTFIX-20261027.md)
@@ -45,14 +46,16 @@ cd NUMEMS-agentless
 git switch -c feature/your-change
 node scripts/verify-release.mjs
 npm run install:ci
-node --test tests/*.test.mjs
+node --experimental-vm-modules --test --test-concurrency=1 tests/*.test.mjs
 node node_modules/typescript/bin/tsc --noEmit
 npm run build
 ```
 
-`verify-release.mjs` 默认核对 `agentless-v11` 归档；也可显式指定版本名。旧版须先检出相应固定标签，再运行该标签自带的校验脚本。修改代码后出现差异是预期行为；新版本保留旧清单并增加新的版本记录。
+`verify-release.mjs` 默认核对 `agentless-v12` 归档；也可显式指定版本名。旧版须先检出相应固定标签，再运行该标签自带的校验脚本。修改代码后出现差异是预期行为；新版本保留旧清单并增加新的版本记录。
 
-第十一版通过 **105 项联合回归**及新增启动/诊断 **5 项小测试**，生产构建通过。管理员完成官方验证后，第二轮真实申请、自动邀请、加入核对、网页提前释放、成员移除与回执均由普通程序完成，无人工补回执；该轮回收约 87.597 秒，已购 4 席保留，模型调用与用户输入桌面窗口均为 0。官方之后再次要求验证仍须管理员本人处理，不能承诺会话永久有效。
+第十二版通过 **460 项联合回归**、**8 项独立真实 D1 验证**、TypeScript 与 Sites 生产构建。此次验证的具体范围和真实运行状态见[第十二版说明](releases/agentless-v12/README.md)及清单，不将历史版本的真实邀请/回收结果冒充本版新验收。
+
+历史记录：第十一版通过 **105 项联合回归**及新增启动/诊断 **5 项小测试**，生产构建通过。管理员完成官方验证后，第二轮真实申请、自动邀请、加入核对、网页提前释放、成员移除与回执均由普通程序完成，无人工补回执；该轮回收约 87.597 秒，已购 4 席保留，模型调用与用户输入桌面窗口均为 0。官方之后再次要求验证仍须管理员本人处理，不能承诺会话永久有效。
 
 历史记录：第十版通过 **85 项联合测试**、TypeScript、Sites 生产构建及独立真实 D1 的 **6 项合成数据原子性测试**。三条到期记录已由管理员授权的受控官方浏览器流程完成真实回收并保存回执；这不等同于无模型执行器全链路验收。专用浏览器在隐藏模式仍可能遭官方安全验证阻塞，运行状态须以实时计划、宿主日志和官方名单为准，不能据本归档宣称无人值守已通过。
 
@@ -71,6 +74,8 @@ GitHub 保存源码和版本，**不会因推送而自动部署站点或启用�
 ## 版本与隐私
 
 原第五版快照对应 Sites 源提交 `bee319c270dc845aa0748b7a8bfc26c8ab17696f`，原始清单保存在 [manifest.json](releases/agentless-v5/manifest.json)。GitHub 归档额外整理了说明、忽略规则和校验工具。`package.json` 的 `1.0.0` 是包版本，不等同于 Sites 发布序号。
+
+第十二版发布源提交为 `aa41d10d4d1481c472d6073a232dcdaaa94b1948`，完整性以[第十二版清单](releases/agentless-v12/manifest.json)为准。本版补齐白名单撤销、分事件告警、健康周期重置退避、两分钟空闲官方对账及有界热历史/分页归档。归档保留完整历史，因此冷存储仍随业务增长；告警网关未配置时不会声称外部推送已启用。
 
 第十一版发布源提交为 `59a43e80f55d93419c2e8dc010e4ea2e998a8427`，完整性以[第十一版清单](releases/agentless-v11/manifest.json)为准。本版修复付费席位确认空档、操作后只读核对与回执重复提交保护、空队列调度登记及阶段诊断；真实第二轮闭环已通过。
 

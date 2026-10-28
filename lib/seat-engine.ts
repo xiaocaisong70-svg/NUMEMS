@@ -12,7 +12,8 @@ export type RequestRecord = {
   id: string; userId: string; email: string; name: string; reason: string; hours: number;
   status: RequestStatus; createdAt: string; updatedAt: string; expiresAt?: string | null;
   acceptanceRequestedAt?: string; acceptanceCheckedAt?: string;
-  joinDeadlineAt?: string; removalReason?: "invitation_expired" | "release" | "lease_expired";
+  joinDeadlineAt?: string; removalReason?: "invitation_expired" | "whitelist_revoked" | "release" | "lease_expired";
+  authorizationRevokedAt?: string;
   joinTimingEvidence?: { firstMemberSeenAt: string; lastPendingSeenAt?: string };
   invitedAt?: string; operationId?: string; error?: string; requestKey?: string; lastRenewalKey?: string; isTest?: boolean;
 };
@@ -100,7 +101,8 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
   const audit = (action: string, requestId?: string) => {
     changed = true;
     next.audit.push({ id: id("audit"), at, actor: actor.email, action, ...(requestId ? { requestId } : {}) });
-    next.audit = next.audit.slice(-1000);
+    // Durable history compaction runs once after the complete composed CAS
+    // transform; trimming here could silently lose new bulk-transition events.
   };
   const notice = (r: RequestRecord, type: string, title: string, message: string) => {
     const cycle = r.expiresAt ?? r.invitedAt ?? r.createdAt;
@@ -125,6 +127,24 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
     for (const item of next.notices)
       if (item.requestId === r.id && item.type === "expiry_30m" && item.status === "pending") item.status = "cancelled";
     notice(r, type, "席位等待回收确认", message);
+  };
+  // Revocation is not proof of official absence. Queued requests never granted
+  // access and can close immediately; allocated or sent invitations retain
+  // their reservation until a fresh official check. Existing active members
+  // keep their current lease and still follow the normal expiry/release rules.
+  const revokePendingAuthorizations = () => {
+    for (const r of next.requests) {
+      if (isProtected(r.email) || next.config.whitelist.includes(r.email)) continue;
+      if (r.status === "queued") {
+        r.authorizationRevokedAt ??= at;
+        update(r, "cancelled", "whitelist_revoke_queued");
+        for (const n of next.notices) if (n.requestId === r.id && n.status === "pending") n.status = "cancelled";
+        notice(r, "authorization_revoked", "申请授权已撤销", "管理员已将此邮箱移出员工白名单，本次排队申请已取消。");
+      } else if (["pending_invite", "invited"].includes(r.status)) {
+        r.authorizationRevokedAt ??= at;
+        remove(r, "whitelist_revoked", "authorization_revoked", "员工白名单授权已撤销。系统只撤回仍待接受的邀请，已加入成员保留当前使用期限；官方确认后才释放预留席位。");
+      }
+    }
   };
   if (!command || typeof command.type !== "string") throw new Error("操作类型无效。");
   switch (command.type) {
@@ -154,6 +174,7 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
       if (c.totalSeats < c.reservedSeats + occupied) throw new Error("总席位不能少于已占用和保留的席位。");
       if (c.workspaceId !== next.config.workspaceId && (next.config.inventoryVerified || occupied)) throw new Error("已盘点或有占用时不能更换工作空间。");
       if (JSON.stringify(c) !== JSON.stringify(next.config)) { next.config = c; audit("configure"); }
+      revokePendingAuthorizations();
       break;
     }
     case "cancel": {
@@ -217,13 +238,16 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
     }
     case "confirm_invited": {
       const r = get(command.id, true); if (r.status === "invited" || r.status === "active") break;
-      if (r.status !== "pending_invite") throw new Error("该申请不在待邀请状态，不能确认邀请。");
+      const revokedInFlight = r.status === "pending_removal" && r.removalReason === "whitelist_revoked";
+      if (r.status !== "pending_invite" && !revokedInFlight) throw new Error("该申请不在待邀请状态，不能确认邀请。");
       const sentAt = command.sentAt ? timestamp(command.sentAt) : at;
       if (Date.parse(sentAt) > instant || Date.parse(sentAt) < Date.parse(r.createdAt))
         throw new Error("邀请发出时间无效。");
-      update(r, "invited", "confirm_invited"); r.invitedAt = sentAt;
+      if (revokedInFlight) audit("confirm_revoked_inflight_invitation", r.id);
+      else update(r, "invited", "confirm_invited");
+      r.invitedAt = sentAt;
       r.joinDeadlineAt = new Date(Date.parse(sentAt) + INVITATION_MS).toISOString();
-      notice(r, "invited", "工作空间邀请已发送", `请在邀请发出后 5 分钟内接受。截止时间（UTC）：${r.joinDeadlineAt}。核实加入后开始计算使用时长。`); break;
+      if (!revokedInFlight) notice(r, "invited", "工作空间邀请已发送", `请在邀请发出后 5 分钟内接受。截止时间（UTC）：${r.joinDeadlineAt}。核实加入后开始计算使用时长。`); break;
     }
     case "confirm_active": {
       const r = get(command.id, true); if (r.status === "active") break;
@@ -234,8 +258,8 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
     }
     case "confirm_joined_after_timeout": {
       const r = get(command.id, true); if (r.status === "active") break;
-      if (r.status !== "pending_removal" || r.removalReason !== "invitation_expired")
-        throw new Error("该申请不是待核实的加入窗口截止状态。");
+      if (r.status !== "pending_removal" || !["invitation_expired", "whitelist_revoked"].includes(r.removalReason ?? ""))
+        throw new Error("该申请不是待核实的邀请撤回状态。");
       update(r, "active", "official_join_confirmed_before_revoke");
       delete r.removalReason;
       r.expiresAt = new Date(instant + r.hours * HOUR).toISOString();
@@ -265,6 +289,9 @@ export function transition(state: State, rawActor: Actor, command: Command, now:
     }
     case "tick": {
       admin();
+      // Also repairs pending grants loaded from a pre-V12 state without relying
+      // on a new configure command having been issued after deployment.
+      revokePendingAuthorizations();
       for (const r of next.requests) {
         if (isProtected(r.email) || r.email === actor.email) continue;
         if (r.status === "invited" && invitationDeadline(r) && Date.parse(invitationDeadline(r)!) <= instant) remove(r, "invitation_expired", "invitation_expired", "5 分钟加入窗口已结束，正在核对官方状态：仍待接受则撤回邀请，已加入则保留席位。核实完成前不会释放预留席位。");
