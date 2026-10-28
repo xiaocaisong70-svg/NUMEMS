@@ -9,6 +9,8 @@ import {Journal,readJson,acquireLock,atomicJson} from './journal.mjs';
 import {resumeTestInvite} from './resume-test-invite.mjs';
 import {reviewTestWorkspace} from './review-test-workspace.mjs';
 import {reviewLiveWorkspace} from './review-live-workspace.mjs';
+import {reviewVerifiedOperation} from './review-verified-operation.mjs';
+import {safeOfficialDiagnostic} from '../seat-executor/official-readiness.mjs';
 const TEST_EMAIL='hit_wangning@outlook.com';
 
 export function assertObservationSetup(plan,config,{prepareTest=false,journalState=null}={}) {
@@ -104,7 +106,7 @@ const commands={status:['seat_portal_status',{}], 'prepare-test':['prepare_test_
   'test-expire':['set_test_deadline',{requestId:id,stage:'expire'}],
   'enable-live':['set_codex_live',{enabled:true}], 'disable':['set_codex_live',{enabled:false}]};
 const withId=['release-test','test-reminder','test-expire'];
-if((!commands[command] && !['observe','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace'].includes(command)) || extra.length ||
+if((!commands[command] && !['observe','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation'].includes(command)) || extra.length ||
     (!withId.includes(command) && id!==undefined))
   throw new Error('用法：admin.mjs status|observe|prepare-test|release-test ID|test-reminder ID|test-expire ID|enable-live|disable|reconcile|recover-browser|resolve-alert|resume-test-invite|review-test-workspace');
 if(withId.includes(command) && !/^req_[a-zA-Z0-9_]+$/.test(id??''))
@@ -118,8 +120,21 @@ const report={command,requestId:id,startedAt:new Date().toISOString(),modelCalls
 try {
   await browser.open();
   const portal=new PortalClient(browser.context,config,['prepare_test_request','release_test_request',
-    'set_test_deadline','set_codex_live','review_seat_failure']);
-  if(command==='review-live-workspace') {
+    'set_test_deadline','set_codex_live','review_seat_failure','verified_review_receipt']);
+  if(command==='review-verified-operation') {
+    const rawRetry=process.env.NUMEMS_REVIEW_RETRY_EXPECTED;
+    const expectedStopDigest=process.env.NUMEMS_REVIEW_STOP_DIGEST;
+    if((rawRetry===undefined)!==(expectedStopDigest===undefined))throw new Error('重试和停机票据必须同时提供。');
+    let expectedRetry;
+    if(rawRetry!==undefined) {
+      try {expectedRetry=JSON.parse(rawRetry);} catch {throw new Error('重试票据无效。');}
+      if(!expectedRetry || typeof expectedRetry!=='object' || Array.isArray(expectedRetry))throw new Error('重试票据无效。');
+    }
+    report.result=await reviewVerifiedOperation({portal,browser,config,
+      journalFile:path.join(runtimeDir,'operation.json'),statusFile:path.join(runtimeDir,'status.json'),
+      expectedRetry,expectedStopDigest});
+    console.log(JSON.stringify(report.result,null,2));
+  } else if(command==='review-live-workspace') {
     report.result=await reviewLiveWorkspace({portal,browser,config,
       journalFile:path.join(runtimeDir,'operation.json'),statusFile:path.join(runtimeDir,'status.json')});
     console.log(JSON.stringify(report.result,null,2));
@@ -182,6 +197,11 @@ try {
   report.success=true;
 } catch(error) {
   report.error=error.message;
+  const diagnostic=safeOfficialDiagnostic(error);
+  if(diagnostic)report.officialFailure=diagnostic;
+  if(command==='review-verified-operation' && error.reviewRetry?.phase==='pre_submit' &&
+      error.reviewRetry?.reason==='browser_unavailable' && error.reviewRetry?.retryable===true)
+    report.reviewRetry=error.reviewRetry;
   if(command==='resume-test-invite') {
     try {report.uiDiagnosticSaved=await saveResumeTestUi(browser,config,
       path.join(runtimeDir,'resume-test-ui.json'));}

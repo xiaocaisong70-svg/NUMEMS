@@ -164,13 +164,28 @@ export async function runBatch({ portal, browser, config, journal,
       }
       let code = safeCode(error);
       if (code === 'browser_unavailable') code = 'unknown'; // Already claimed.
-      await portal.call('complete_seat_operation', {operationId:lease.id,token:lease.token,
-        outcome:attempted ? 'uncertain' : 'blocked',failureCode:code,
-        detail:'程序办理未完成；保留原租约和证据，不自动重做外部动作。'});
-      const check = planOf(await portal.call('seat_portal_status'));
+      let check;
+      try {
+        await portal.call('complete_seat_operation', {operationId:lease.id,token:lease.token,
+          outcome:attempted ? 'uncertain' : 'blocked',failureCode:code,
+          detail:'程序办理未完成；保留原租约和证据，不自动重做外部动作。'});
+        check = planOf(await portal.call('seat_portal_status'));
+      } catch (registrationError) {
+        // A claim already exists. Even a later read timeout must not enter the
+        // normal pre-claim read-only recovery path; the write could have landed.
+        const blocked = new StopError('已领取任务的完成登记或状态核对未确认；保留原租约与证据，禁止自动重试。');
+        blocked.cause = registrationError; throw blocked;
+      }
       const hold = check.blockedOperations?.find(h => h.operation.id === lease.id);
-      if (!isolated.has(code) || !hold || check.busy || check.lastError || check.globalFailureCode)
+      if (!isolated.has(code) || !hold || check.busy || check.lastError || check.globalFailureCode) {
+        if (code === 'unknown' || isolated.has(code)) {
+          // Do not leak a misleading pre-claim browser_unavailable signal or
+          // its "no action started" text after the operation was claimed.
+          const blocked = new StopError('已领取任务的操作结果或核实未确认；保留原租约与证据，禁止自动重试。');
+          blocked.cause = error; throw blocked;
+        }
         throw error;
+      }
       await journal?.settled();
       actions.push({kind,targetId:item.id,outcome:'isolated',failureCode:code});
     } finally { browser.onExternalAction = () => {}; }

@@ -9,9 +9,10 @@ const releases = new Map([
   ['agentless-v5-watchdog-20261025','d6013c85ec821abfd83c5890c3a0e0f61833ab7a'],
   ['agentless-v6','4f3a325fcde294aa8956a49108911510b0734e1f'],
   ['agentless-v7','b1caa6877d04a3552ad2b934e730f3970f7cd1a4'],
+  ['agentless-v10','1a55cfe21f1914997df41facbd584bc58ad42d42'],
 ]);
-const requested=process.argv[2]??'agentless-v7';
-if(process.argv.length>3 || !releases.has(requested))throw new Error('Unknown release; use a documented fixed release tag.');
+const requested=process.argv[2]??'agentless-v10';
+if(process.argv.length>3 || !releases.has(requested))throw new Error('Unknown release; use a documented release name.');
 const manifest = JSON.parse(await readFile(path.join(root, `releases/${requested}/manifest.json`), 'utf8'));
 if (manifest.schemaVersion !== 1 || manifest.release !== requested ||
     manifest.source?.commit !== releases.get(requested) || !Array.isArray(manifest.files) || !manifest.files.length) {

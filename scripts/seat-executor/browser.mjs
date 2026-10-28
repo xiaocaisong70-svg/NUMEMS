@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { root, normalizeEmail } from "./config.mjs";
 import { validateObservation, presence, assertOrdinary } from "./inventory.mjs";
-import { OfficialPageError, waitForOfficialPage } from "./official-readiness.mjs";
+import { OfficialPageError, officialPageState, officialDiagnostic, waitForOfficialPage } from "./official-readiness.mjs";
 
 export const ui = {
   members: /^(用户|活跃成员(?:\s*\d+)?|Users|Members(?:\s*\d+)?)$/,
@@ -28,6 +28,11 @@ export class InventoryMismatchError extends Error {
     super(`读取成员及邀请数与席位已分配数不一致（已购 ${capacity.total}，已分配 ${capacity.assigned}，可用 ${capacity.available}，成员 ${members}，邀请 ${invites}）。`);
     this.name = "InventoryMismatchError";
   }
+}
+// A recognized official capacity-card error permits one page navigation only.
+// It is not capacity evidence and never permits a member or invitation action.
+export class CapacityCardUnavailable extends OfficialPageError {
+  constructor(diagnostic) { super("官方席位信息加载失败；完整名单未采纳。", "browser_unavailable",diagnostic); }
 }
 export function parseCapacity(text, label) {
   const clean = text.replace(/\u00a0/g, " ").trim();
@@ -112,11 +117,13 @@ export class BrowserAdapter {
     try { await p.goto(this.url(tab), { waitUntil: "domcontentloaded", timeout: 30_000 }); }
     catch (error) {
       if (/Timeout|net::ERR_(TIMED_OUT|CONNECTION|NETWORK|INTERNET_DISCONNECTED|NAME_NOT_RESOLVED)/i.test(String(error)))
-        throw new OfficialPageError("官方后台暂时无法连接，未开始成员操作。", "browser_unavailable");
+        throw new OfficialPageError("官方后台暂时无法连接，未开始成员操作。", "browser_unavailable",
+          officialDiagnostic({stage:tab==='members'?'members_navigation':'invites_navigation',state:'network',expectedUrl:this.url(tab)}));
       throw error;
     }
     const selected = p.getByRole("tab", { name: tab === "members" ? ui.members : ui.invites });
     await waitForOfficialPage({
+      stage:tab==='members'?'members_navigation':'invites_navigation',challengeTimeoutMs:180_000,
       inspect: async () => ({ url: p.url(), expectedUrl: this.url(tab),
         body: await p.locator("body").innerText(), ready: await selected.isVisible() }),
       pause: ms => p.waitForTimeout(ms),
@@ -144,6 +151,7 @@ export class BrowserAdapter {
     // Table headers appear before the official data request has finished. A visible
     // table is not evidence of an empty list, including after pagination/filtering.
     await waitForOfficialPage({
+      stage:expectedTab==='members'?'members_rows':'invites_rows',challengeTimeoutMs:180_000,
       inspect: async () => {
         const selected = p.getByRole("tab", { name: expectedTab === "members" ? ui.members : ui.invites }).filter({ visible:true });
         const selectedCount = await selected.count();
@@ -200,9 +208,22 @@ export class BrowserAdapter {
     return {expectedTotal, expectedTab};
   }
   async capacity() {
+    try { return await this.capacityOnce(); }
+    catch (error) {
+      if (!(error instanceof CapacityCardUnavailable)) throw error;
+      // Navigate the existing official members page once; never click a retry
+      // control or use partial lists as evidence. The normal snapshot checks
+      // and two-read consistency verification remain mandatory afterwards.
+      await this.guard();
+      await this.load("members");
+      return this.capacityOnce();
+    }
+  }
+  async capacityOnce() {
     const p = await this.open(), label = `${this.config.seatLabel}席位`;
     let candidates = [];
     await waitForOfficialPage({
+      stage:'capacity',challengeTimeoutMs:180_000,
       inspect: async () => {
         candidates = await p.getByText(new RegExp(`^${escape(this.config.seatLabel)}(?:席位| seats)$`, "i"))
           .filter({ visible:true }).evaluateAll(nodes => {
@@ -219,9 +240,27 @@ export class BrowserAdapter {
         if (candidates.length > 1) throw new Error(`无法唯一确定${label}容量卡。`);
         const text = candidates[0] ?? "";
         const total = new RegExp(`(?:^|\\n)\\s*\\d+\\s*(?:\\n|\\s)+${escape(this.config.seatLabel)}(?:席位|\\s+seats)|${escape(this.config.seatLabel)}(?:席位|\\s+seats)\\s*\\d+`, "i");
-        const ready = candidates.length === 1 && total.test(text) &&
+        let ready = candidates.length === 1 && total.test(text) &&
           /(?:已分配|Assigned)\s*\d+/i.test(text) && /(?:可用|Available)\s*\d+/i.test(text);
-        return { url:p.url(), expectedUrl:this.url(), body:await p.locator("body").innerText(), ready };
+        const body = await p.locator("body").innerText();
+        // Only the exact visible capacity error and one visible retry control
+        // qualify. Security challenges, ambiguous UI and another workspace do
+        // not. An error banner makes even a visible old card untrustworthy.
+        if (officialPageState({url:p.url(),expectedUrl:this.url(),body,ready:false}) === 'loading' &&
+            new URL(p.url()).searchParams.get('tab') !== 'invites') {
+          const messages = p.getByText(/^无法加载席位信息[。.]?$/).filter({visible:true});
+          const noticeCount = await messages.count();
+          if (noticeCount > 1) throw new Error('席位信息错误提示不唯一，未采纳容量。');
+          if (noticeCount === 1) {
+            ready = false;
+            const buttons = p.getByRole('button',{name:/^(?:重试|Retry)$/i}).filter({visible:true});
+            const buttonCount = await buttons.count();
+            if (buttonCount > 1) throw new Error('席位信息重试控件不唯一，未采纳容量。');
+            if (buttonCount === 1) { await this.guard(); throw new CapacityCardUnavailable(
+              officialDiagnostic({stage:'capacity',state:'capacity_unavailable',expectedUrl:this.url()})); }
+          }
+        }
+        return { url:p.url(), expectedUrl:this.url(), body, ready };
       },
       pause: ms => p.waitForTimeout(ms), timeoutMs:25_000,
     });

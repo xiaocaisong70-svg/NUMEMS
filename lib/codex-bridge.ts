@@ -20,6 +20,10 @@ export type FailureCode = (typeof FAILURE_CODES)[number];
 export type OperationHold = {
   operation: Lease; code: FailureCode; detail: string; at: string; attempted: boolean;
 };
+type OperationFailureOrigin = {
+  failureId: string; operationId: string; requestId: string;
+  kind: "invite" | "remove"; email: string; claimedAt: string; failedAt: string;
+};
 export type BridgeState = State & {
   codex?: {
     enabled: boolean; testOnly: boolean; mailEnabled: boolean;
@@ -28,15 +32,49 @@ export type BridgeState = State & {
     scheduleId?: string;
     holds?: OperationHold[]; globalFailureCode?: FailureCode; mailChannelError?: string;
     browserUnavailableAt?: string; workspaceReviewedAt?: string;
+    operationFailureOrigin?: OperationFailureOrigin;
     receipts: { id: string; kind: string; email: string; at: string; evidence: string }[];
+    reviewReceipts?: { failureId: string; targetId: string; operationId: string; workspaceId: string; observedAt: string; reviewedAt: string }[];
   };
 };
 const systemActor: Actor = { userId: "system:codex", email: PROTECTED_OWNER_EMAIL, isAdmin: true };
 const norm = (value: string) => value.trim().toLowerCase();
 const minute = 60_000;
 const PRECLAIM_INVENTORY_ERROR = "官方完整名单核对失败；未开始成员写入。";
+const POSTCLAIM_UNCERTAIN_ERROR = "程序办理未完成；保留原租约和证据，不自动重做外部动作。";
 function latestWorkspaceFailureId(state: BridgeState) {
   return [...state.audit].reverse().find(a => a.action === "codex_workspace_blocked")?.id ?? null;
+}
+function sameOperation(origin: OperationFailureOrigin | undefined, op: Lease) {
+  return Boolean(origin && origin.operationId === op.id && origin.requestId === op.requestId &&
+    origin.kind === op.kind && origin.email === op.email && origin.claimedAt === op.claimedAt);
+}
+function resolvedOperationOrigin(state: BridgeState, op: Lease, snapshot: Observation) {
+  const b = bridge(state), origin = b.operationFailureOrigin;
+  const entries = [...snapshot.members, ...snapshot.invites];
+  if (!origin || !sameOperation(origin, op) || origin.failureId !== latestWorkspaceFailureId(state) ||
+      b.lease?.id !== op.id || op.status !== "uncertain" || b.globalFailureCode !== "unknown" ||
+      b.lastError !== POSTCLAIM_UNCERTAIN_ERROR || b.enabled !== true || b.testOnly !== false ||
+      (b.holds?.length ?? 0) !== 0 || b.mailChannelError ||
+      !state.config.inventoryVerified || state.config.workspaceId !== TARGET_WORKSPACE_ID ||
+      snapshot.totalSeats !== state.config.totalSeats || entries.length > snapshot.totalSeats ||
+      new Set(entries.map(p => norm(p.email))).size !== entries.length ||
+      snapshot.members.some(p => norm(p.email) === PROTECTED_OWNER_EMAIL ? p.role !== "owner" : p.role !== "member") ||
+      snapshot.invites.some(p => p.role !== "member" || norm(p.email) === PROTECTED_OWNER_EMAIL) ||
+      norm(op.email) === PROTECTED_OWNER_EMAIL || state.config.protectedEmails.includes(norm(op.email)) ||
+      time(snapshot.observedAt) < time(origin.failedAt) || time(origin.failedAt) < time(op.claimedAt)) return null;
+  return structuredClone(origin);
+}
+function finishOperationFault(state: BridgeState, origin: OperationFailureOrigin | null, now: string) {
+  if (!origin) return;
+  const b = bridge(state), current = b.operationFailureOrigin;
+  // observeWorkspace can discover a new role/capacity fault. Do not clear it.
+  if (!current || JSON.stringify(current) !== JSON.stringify(origin) ||
+      origin.failureId !== latestWorkspaceFailureId(state) || b.globalFailureCode !== "unknown" ||
+      b.lastError !== POSTCLAIM_UNCERTAIN_ERROR || b.lease || (b.holds?.length ?? 0) !== 0 ||
+      b.mailChannelError || b.enabled !== true || b.testOnly !== false) return;
+  delete b.globalFailureCode; delete b.lastError; delete b.operationFailureOrigin;
+  record(state, "codex_resolved_original_operation_fault", now, origin.requestId);
 }
 function time(value: string) { const n = Date.parse(value); if (!Number.isFinite(n)) throw new Error("时间无效。"); return n; }
 function bridge(state: BridgeState) {
@@ -99,6 +137,7 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
     const b = bridge(next);
     b.lastError = "已购容量与门户配置不一致，需管理员核对后恢复。";
     b.globalFailureCode = "capacity_mismatch";
+    delete b.operationFailureOrigin;
     record(next, "codex_capacity_mismatch", now);
     return next;
   }
@@ -177,6 +216,7 @@ export function observeWorkspace(input: BridgeState, snapshot: Observation, now:
       if (occupied > next.config.totalSeats) {
         bridge(next).lastError = "官方已有成员使门户占用超过席位容量，请核对后恢复。";
         bridge(next).globalFailureCode = "capacity_mismatch";
+        delete bridge(next).operationFailureOrigin;
       }
     } else if (old.status === "pending_invite" && (member || invited) &&
         (safelyUnclaimed || verifiedInvite) && freshForRequest) {
@@ -364,6 +404,7 @@ export function completeOperation(input: BridgeState, args: {
         !s.members.some(p => norm(p.email) === op.email && p.role === "member") ||
         s.invites.some(p => norm(p.email) === op.email))
       throw new Error("须提供本次办理后已成为普通成员、且无待接受邀请的完整官方证据。");
+    const origin = resolvedOperationOrigin(next, op, s);
     if (hold) b.holds = b.holds?.filter(h => h.operation.id !== op.id);
     else delete b.lease;
     next = observeWorkspace(next, s, now); b = bridge(next);
@@ -371,6 +412,7 @@ export function completeOperation(input: BridgeState, args: {
       throw new Error("官方加入状态未能确认，不能结束撤回租约。");
     b.receipts.push({ id: op.id, kind: "joined_during_revocation", email: op.email, at: now, evidence: s.pageUrl });
     b.receipts = b.receipts.slice(-500);
+    finishOperationFault(next, origin, now);
     if (!b.globalFailureCode) delete b.lastError;
     record(next, "codex_joined_during_revocation", now, op.requestId);
     return next;
@@ -388,12 +430,22 @@ export function completeOperation(input: BridgeState, args: {
       if (b.lease?.id === op.id) delete b.lease;
       record(next, "codex_isolate_" + op.kind, now, op.requestId);
     } else {
+      const priorOrigin = b.operationFailureOrigin;
+      const mayAttach = code === "unknown" && detail === POSTCLAIM_UNCERTAIN_ERROR &&
+        op.kind !== "mail" && !hold && b.lease?.id === op.id && (b.holds?.length ?? 0) === 0 && !b.mailChannelError &&
+        ((!b.globalFailureCode && !b.lastError) || sameOperation(priorOrigin, op) &&
+          priorOrigin?.failureId === latestWorkspaceFailureId(next) && b.globalFailureCode === "unknown" &&
+          b.lastError === POSTCLAIM_UNCERTAIN_ERROR);
       b.lastError = detail; b.globalFailureCode = code;
       record(next, "codex_workspace_blocked", now, op.requestId);
+      delete b.operationFailureOrigin;
+      if (mayAttach) b.operationFailureOrigin = {failureId: latestWorkspaceFailureId(next)!,
+        operationId: op.id, requestId: op.requestId, kind: op.kind as "invite" | "remove",
+        email: op.email, claimedAt: op.claimedAt, failedAt: now};
     }
     return next;
   }
-  let evidence: string;
+  let evidence: string, origin: OperationFailureOrigin | null = null;
   if (op.kind === "mail") {
     if (!args.providerMessageId || !/^[a-zA-Z0-9_-]{5,200}$/.test(args.providerMessageId))
       throw new Error("需要 Gmail 或发信服务返回的消息 ID。");
@@ -411,6 +463,7 @@ export function completeOperation(input: BridgeState, args: {
       throw new Error("实际目标角色异常，禁止确认办理成功。");
     if (op.kind === "invite" && !member && !invited) throw new Error("没有核实到实际邀请。");
     if (op.kind === "remove" && (member || invited)) throw new Error("目标邮箱仍在成员或邀请列表中。");
+    origin = resolvedOperationOrigin(next, op, s);
     if (op.kind === "invite" && args.invitationSentAt) {
       if (time(args.invitationSentAt) < time(op.claimedAt) || time(args.invitationSentAt) > time(s.observedAt))
         throw new Error("邀请发出时间必须位于本次实际办理与核实之间。");
@@ -432,6 +485,7 @@ export function completeOperation(input: BridgeState, args: {
     // A verified target receipt cannot clear a workspace-wide safety incident.
     if (!b.globalFailureCode) delete b.lastError;
   }
+  finishOperationFault(next, origin, now);
   record(next, "codex_verified_" + op.kind, now, op.requestId);
   return next;
 }
@@ -460,6 +514,7 @@ export function deferOperation(input: BridgeState, args: {
   if (code === "browser_unavailable" && b.globalFailureCode && b.globalFailureCode !== code)
     throw new Error("不能把现有全局故障降级为可自动恢复的浏览器故障。");
   if (!isIsolated(code)) {
+    delete b.operationFailureOrigin;
     b.lastError = detail; b.globalFailureCode = code;
     if (code === "browser_unavailable") b.browserUnavailableAt ??= now;
     else delete b.browserUnavailableAt;
@@ -476,8 +531,8 @@ export function deferOperation(input: BridgeState, args: {
 }
 
 export function reviewFailure(input: BridgeState, args: {
-  decision: "retry_not_started" | "resume_workspace" | "recover_browser" | "resume_preclaim_inventory";
-  operationId?: string; expectedFailureId?: string; observation?: Observation;
+  decision: "retry_not_started" | "resume_workspace" | "recover_browser" | "resume_preclaim_inventory" | "resume_verified_operation";
+  operationId?: string; expectedFailureId?: string; expectedTargetId?: string; observation?: Observation;
 }, now: string): BridgeState {
   let next = structuredClone(input), b = bridge(next);
   if (b.lease) throw new Error("仍有未完成操作，必须先提交真实核实回执。");
@@ -490,23 +545,82 @@ export function reviewFailure(input: BridgeState, args: {
     }
     b.holds = b.holds?.filter(h => h.operation.id !== args.operationId);
     record(next, "codex_review_unstarted", now, hold.operation.requestId);
-  } else if (args.decision === "resume_workspace" || args.decision === "recover_browser" || args.decision === "resume_preclaim_inventory") {
+  } else if (args.decision === "resume_workspace" || args.decision === "recover_browser" || args.decision === "resume_preclaim_inventory" || args.decision === "resume_verified_operation") {
     if (args.decision === "resume_preclaim_inventory" &&
         (b.enabled !== true || b.testOnly !== false || b.globalFailureCode !== "unknown" ||
          b.lastError !== PRECLAIM_INVENTORY_ERROR || (b.holds?.length ?? 0) !== 0 || b.mailChannelError ||
          !args.expectedFailureId || args.expectedFailureId !== latestWorkspaceFailureId(next)))
       throw new Error("未开始成员写入的故障已变化或存在其他未结案事项；不得恢复。");
+    if (args.decision === "resume_verified_operation") {
+      // This guard runs inside mutateState's revision CAS. A fresh incident,
+      // lease, missing original receipt or changed request invalidates it.
+      const failure = [...next.audit].reverse().find(a => a.action === "codex_workspace_blocked");
+      const receipts = b.receipts.filter(r => r.id === args.operationId);
+      const receipt = receipts[0];
+      const request = next.requests.find(r => r.id === failure?.requestId);
+      const action = receipt?.kind === "joined_during_revocation" ? "codex_joined_during_revocation" : `codex_verified_${receipt?.kind}`;
+      const matchingAudit = next.audit.filter(a => a.action === action && a.requestId === failure?.requestId && a.at === receipt?.at);
+      const failureIndex = next.audit.findIndex(a => a.id === args.expectedFailureId);
+      const subsequentVerified = next.audit.slice(failureIndex + 1).filter(a => a.requestId === failure?.requestId &&
+        ["codex_verified_invite", "codex_verified_remove", "codex_joined_during_revocation"].includes(a.action));
+      if (b.enabled !== true || b.testOnly !== false || b.globalFailureCode !== "unknown" ||
+          b.lastError !== POSTCLAIM_UNCERTAIN_ERROR || (b.holds?.length ?? 0) !== 0 || b.mailChannelError ||
+          !args.expectedFailureId || args.expectedFailureId !== failure?.id || !failure.requestId ||
+          !args.expectedTargetId || args.expectedTargetId !== failure.requestId ||
+          (b.reviewReceipts ?? []).some(r => r.failureId === args.expectedFailureId) ||
+          !args.operationId || receipts.length !== 1 || !receipt || !request ||
+          !["invite", "remove", "joined_during_revocation"].includes(receipt.kind) ||
+          norm(receipt.email) !== norm(request.email) || norm(request.email) === PROTECTED_OWNER_EMAIL ||
+          next.config.protectedEmails.includes(norm(request.email)) || matchingAudit.length !== 1 ||
+          failureIndex < 0 || subsequentVerified.length !== 1 || subsequentVerified[0].id !== matchingAudit[0].id ||
+          time(receipt.at) < time(failure.at))
+        throw new Error("故障、原操作回执或申请目标已变化，不能解除工作空间暂停。");
+      const evidence = new URL(receipt.evidence);
+      if (evidence.protocol !== "https:" || evidence.hostname !== "admin.openai.com" ||
+          evidence.pathname !== "/workspace/" + TARGET_WORKSPACE_ID + "/members")
+        throw new Error("原操作缺少目标工作空间的官方回执。");
+      const snapshot = validateObservation(args.observation!, now);
+      const entries = [...snapshot.members, ...snapshot.invites];
+      if (time(snapshot.observedAt) < time(receipt.at) || time(snapshot.observedAt) < time(failure.at) ||
+          !next.config.inventoryVerified || next.config.workspaceId !== TARGET_WORKSPACE_ID ||
+          snapshot.totalSeats !== next.config.totalSeats || entries.length > snapshot.totalSeats ||
+          new Set(entries.map(p => norm(p.email))).size !== entries.length ||
+          snapshot.members.some(p => norm(p.email) === PROTECTED_OWNER_EMAIL ? p.role !== "owner" : p.role !== "member") ||
+          snapshot.invites.some(p => p.role !== "member" || norm(p.email) === PROTECTED_OWNER_EMAIL))
+        throw new Error("工作空间容量、成员角色或名单异常，不能解除暂停。");
+    }
     if (args.decision === "recover_browser" &&
         (b.globalFailureCode !== "browser_unavailable" || !b.browserUnavailableAt))
       throw new Error("自动恢复仅适用于未开始外部操作的浏览器暂不可用故障。");
     validateObservation(args.observation!, now);
-    delete b.lastError; delete b.globalFailureCode;
+    delete b.lastError; delete b.globalFailureCode; delete b.operationFailureOrigin;
     next = observeWorkspace(next, args.observation!, now); b = bridge(next);
     if (b.lastError) throw new Error("最新官方证据仍有工作空间异常。");
     b.workspaceReviewedAt = now;
+    if (args.decision === "resume_verified_operation") {
+      // Stored in the same CAS as the cleared failure. Old receipts may age
+      // out, in which case clients must stop rather than infer success.
+      b.reviewReceipts = [...(b.reviewReceipts ?? []), {failureId: args.expectedFailureId!,
+        targetId: args.expectedTargetId!, operationId: args.operationId!,
+        workspaceId: TARGET_WORKSPACE_ID, observedAt: args.observation!.observedAt, reviewedAt: now}].slice(-1000);
+    }
     delete b.browserUnavailableAt;
     record(next, args.decision === "recover_browser" ? "codex_browser_recovered" :
-      args.decision === "resume_preclaim_inventory" ? "codex_review_preclaim_inventory" : "codex_review_workspace", now);
+      args.decision === "resume_preclaim_inventory" ? "codex_review_preclaim_inventory" :
+      args.decision === "resume_verified_operation" ? "codex_review_verified_operation" : "codex_review_workspace", now);
   } else throw new Error("核查决定无效。");
   return next;
+}
+
+export function verifiedReviewReceipt(input: BridgeState, key: {
+  failureId: string; targetId: string; operationId: string;
+}) {
+  if (!key || !/^codex_[a-zA-Z0-9_]{1,140}$/.test(key.failureId ?? "") ||
+      !/^req_[a-zA-Z0-9_]{1,140}$/.test(key.targetId ?? "") ||
+      !/^op_[a-zA-Z0-9_-]{1,140}$/.test(key.operationId ?? ""))
+    throw new Error("复核回执查询参数无效。");
+  const matches = (input.codex?.reviewReceipts ?? []).filter(r => r.failureId === key.failureId &&
+    r.targetId === key.targetId && r.operationId === key.operationId);
+  if (matches.length > 1) throw new Error("复核回执不唯一，保持暂停。");
+  return { receipt: matches[0] ?? null };
 }

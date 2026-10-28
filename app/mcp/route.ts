@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { currentActor, readState, mutateState, schedulerActor } from "@/lib/portal-service";
 import { runJobs, refreshSeatQueue } from "@/lib/jobs";
-import { observeWorkspace, prepareTest, workPlan, claimOperation, completeOperation, deferOperation, reviewFailure, FAILURE_CODES, setBridgeMode,
+import { observeWorkspace, prepareTest, workPlan, claimOperation, completeOperation, deferOperation, reviewFailure, verifiedReviewReceipt, FAILURE_CODES, setBridgeMode,
   setTestDeadline, recordSchedule, type BridgeState, type Observation } from "@/lib/codex-bridge";
 import { transition } from "@/lib/seat-engine";
 import { reminderMode } from "@/lib/reminder-policy";
@@ -27,12 +27,18 @@ const tools = [
   },
   {
     name: "review_seat_failure",
-    description: "retry_not_started仅重排明确未开始的隔离项；resume_workspace需管理员核查；recover_browser仅允许程序对未开始操作的browser_unavailable故障恢复；resume_preclaim_inventory需提供预期故障ID与完整官方证据并原子核查特定未开始成员写入故障。所有恢复均禁止有未完成租约。",
+    description: "retry_not_started仅重排明确未开始的隔离项；resume_workspace需管理员核查；recover_browser仅允许程序对未开始操作的browser_unavailable故障恢复；resume_preclaim_inventory限定未开始名单故障；resume_verified_operation仅允许已完成原操作回执且审计、目标、故障ID和新鲜完整证据一致时恢复。所有恢复均禁止有未完成租约。",
     inputSchema: { type: "object", properties: {
-      decision: { type: "string", enum: ["retry_not_started", "resume_workspace", "recover_browser", "resume_preclaim_inventory"] },
-      operationId: { type: "string" }, expectedFailureId: { type: "string" }, observation: observationSchema,
+      decision: { type: "string", enum: ["retry_not_started", "resume_workspace", "recover_browser", "resume_preclaim_inventory", "resume_verified_operation"] },
+      operationId: { type: "string" }, expectedFailureId: { type: "string" }, expectedTargetId: { type: "string" }, observation: observationSchema,
     }, required: ["decision"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  },
+  {
+    name: "verified_review_receipt", description: "仅管理员按原故障、申请及操作 ID 查询已提交的安全复核回执；只读，不重做任何操作。",
+    inputSchema: { type: "object", properties: {failureId:{type:"string"}, targetId:{type:"string"},
+      operationId:{type:"string"}}, required:["failureId","targetId","operationId"], additionalProperties:false },
+    annotations: {readOnlyHint:true},
   },
   {
     name: "record_codex_schedule", description: "本地定时任务或按需队列检查程序已实际安装核对后登记其ID；空字符串表示清除登记，不代替真正暂停任务。",
@@ -149,6 +155,13 @@ export async function POST(request: Request) {
           inventoryVerified: state.config.inventoryVerified,
           plan: workPlan(state as BridgeState, new Date().toISOString()),
         }) }] };
+      } else if (body.params?.name === "verified_review_receipt") {
+        const args = body.params?.arguments;
+        if (!args || typeof args !== "object" || Array.isArray(args) ||
+            Object.keys(args).sort().join(",") !== "failureId,operationId,targetId")
+          throw new Error("复核回执查询参数无效。");
+        const {state} = await readState();
+        result = {content:[{type:"text",text:JSON.stringify(verifiedReviewReceipt(state as BridgeState,args))}]};
       } else {
         const name = body.params?.name;
         const args = body.params?.arguments ?? {};
@@ -158,7 +171,11 @@ export async function POST(request: Request) {
           const s = current as BridgeState;
           if (name === "observe_workspace") return observeWorkspace(s, args.observation as Observation, now);
           if (name === "defer_seat_operation") return deferOperation(s, args, now);
-          if (name === "review_seat_failure") return reviewFailure(s, args, now);
+          // A CAS retry can happen long after the request began. The guarded
+          // recovery must measure snapshot age on each retry, not against the
+          // original request time. Preserve existing timing for other decisions.
+          if (name === "review_seat_failure") return reviewFailure(s, args,
+            args.decision === "resume_verified_operation" ? new Date().toISOString() : now);
           if (name === "prepare_test_request") return prepareTest(s, now);
           if (name === "record_codex_schedule") return recordSchedule(s, args.scheduleId, now);
           if (name === "set_test_deadline") return setTestDeadline(s, args.requestId, args.stage, now);
@@ -169,7 +186,9 @@ export async function POST(request: Request) {
             if (!["invite", "remove", "mail"].includes(args.kind) || typeof args.targetId !== "string") throw new Error("办理参数无效。");
             return claimOperation(s, args.kind, args.targetId, token, now);
           }
-          if (name === "complete_seat_operation") return completeOperation(s, args, now);
+          if (name === "complete_seat_operation") return completeOperation(s, args,
+            s.codex?.operationFailureOrigin?.operationId === args.operationId &&
+              ["verified", "joined"].includes(args.outcome) ? new Date().toISOString() : now);
           if (name === "set_codex_live") {
             if (typeof args.enabled !== "boolean") throw new Error("启用参数无效。");
             return setBridgeMode(s, args.enabled, now);

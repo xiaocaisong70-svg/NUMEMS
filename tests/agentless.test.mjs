@@ -113,12 +113,50 @@ test('defer rejection, uncertain result or malformed acknowledgement cannot trig
 test('a count mismatch after a claim never becomes an automatically recoverable browser failure',async()=>{
   const f=fixture();f.apply(0);const original=f.browser.observe;let reads=0;
   f.browser.observe=async()=>{if(++reads>2)throw inconsistentInventory();return original();};
-  await assert.rejects(f.run(),InventoryMismatchError);
+  await assert.rejects(f.run(),error=>error.failureCode==='unknown' && error.cause instanceof InventoryMismatchError);
   assert.deepEqual(f.clicks.map(x=>x[0]),['invite']);
   assert.equal(f.state.codex.globalFailureCode,'unknown');assert.ok(f.state.codex.lease);
   const finish=f.calls.find(c=>c.name==='complete_seat_operation');
   assert.equal(finish.args.outcome,'uncertain');assert.equal(finish.args.failureCode,'unknown');
   assert.equal(f.calls.some(c=>c.name==='defer_seat_operation'),false);
+});
+
+test('post-claim browser unavailability never masquerades as safe pre-claim recovery',async()=>{
+  for(const afterClick of [false,true]) {
+    const f=fixture();f.apply(0);const original=f.browser.observe;let reads=0;
+    f.browser.observe=async()=>{
+      if(++reads>(afterClick?2:1))throw Object.assign(new Error('未开始成员操作，稍后只读复核。'),{failureCode:'browser_unavailable'});
+      return original();
+    };
+    let failure;try{await f.run();}catch(error){failure=error;}
+    assert.equal(failure?.failureCode,'unknown');
+    assert.doesNotMatch(failure.message,/未开始成员操作/);
+    assert.equal(failure.cause?.failureCode,'browser_unavailable');
+    assert.equal(f.state.codex.globalFailureCode,'unknown');assert.ok(f.state.codex.lease);
+    assert.equal(f.clicks.length,afterClick?1:0);
+    assert.equal(f.calls.find(c=>c.name==='complete_seat_operation').args.outcome,afterClick?'uncertain':'blocked');
+    let recoveries=0;
+    await assert.rejects(recoverBatchError({error:failure,portal:f.portal,browser:f.browser,config:f.config,
+      recoverBrowserFn:async()=>{recoveries++;return true;},recoverPortalFn:async()=>{recoveries++;return true;}}),error=>error===failure);
+    assert.equal(recoveries,0);
+  }
+});
+
+test('post-claim failure registration or verification failure remains unknown',async()=>{
+  for(const failurePoint of ['complete','status']) {
+    const f=fixture();f.apply(0);const original=f.browser.observe;let reads=0;
+    f.browser.observe=async()=>{if(++reads>2)throw Object.assign(new Error('transient'),{failureCode:'browser_unavailable'});return original();};
+    let completed=false;const call=f.portal.call;
+    f.portal.call=async function(name,args) {
+      if(name==='complete_seat_operation' && failurePoint==='complete')throw new Error('completion response unavailable');
+      if(name==='seat_portal_status' && completed && failurePoint==='status')throw new Error('status response unavailable');
+      const result=await call.call(this,name,args);
+      if(name==='complete_seat_operation')completed=true;
+      return result;
+    };
+    await assert.rejects(f.run(),error=>error.failureCode==='unknown' && /登记或状态核对未确认/.test(error.message));
+    assert.equal(f.clicks.length,1);
+  }
 });
 
 test('unrelated identity or purchased-capacity errors are never retried as transient inventory counts',async()=>{
@@ -183,7 +221,7 @@ test('single classified member failure does not block another reclaim and is not
 test('unknown result retains global lease and stops; actual absence after timeout completes once',async()=>{
   const f=fixture();f.apply(0);await f.run();f.advance(301);
   f.browser.remove=async function(){await this.onExternalAction();throw new Error('connection lost');};
-  await assert.rejects(f.run(),/connection lost/);assert.equal(f.state.codex.globalFailureCode,'unknown');assert.ok(f.state.codex.lease);
+  await assert.rejects(f.run(),error=>error.failureCode==='unknown' && /connection lost/.test(error.cause?.message));assert.equal(f.state.codex.globalFailureCode,'unknown');assert.ok(f.state.codex.lease);
   const g=fixture();g.apply(0);await g.run();g.advance(301);const remove=g.browser.remove;
   g.browser.remove=async function(email){await remove.call(this,email);throw new Error('dialog timeout');};
   await g.run();assert.equal(g.state.requests[0].status,'completed');assert.equal(g.clicks.filter(x=>x[0]==='remove').length,1);

@@ -1,9 +1,10 @@
 param(
   [Parameter(Mandatory=$true)][string]$NodeExe,
   [ValidateSet('probe','once','run','admin')][string]$Mode = 'probe',
-  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace')][string]$AdminCommand,
+  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation')][string]$AdminCommand,
   [string]$RequestId,
-  [switch]$RecoverSettledLock
+  [switch]$RecoverSettledLock,
+  [switch]$ReviewRetry
 )
 $ErrorActionPreference = 'Stop'
 $projectPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
@@ -92,6 +93,39 @@ function Assert-WatchdogStart {
     finally { $sha.Dispose() }
   }
   if ($digest -cne $ticket.stopDigest) { throw 'Stop request changed after watchdog decision; stopped before launch.' }
+  if ($ReviewRetry -and ($null -eq $ticket.reviewProofDigests -or $null -eq $ticket.reviewProofDigests.retry -or $null -eq $ticket.expectedHostPid -or
+      $ticket.reviewProofDigests.intent -cne 'absent' -or [IO.File]::Exists((Join-Path $runtimePath 'verified-review-intent.json')))) {
+    throw 'A review retry requires bound prior host and retry evidence.'
+  }
+  if ($null -ne $ticket.reviewProofDigests) {
+    $entries = @(@{key='status'; name='status.json'}, @{key='journal'; name='operation.json'}, @{key='admin'; name='admin-result.json'})
+    if ($ReviewRetry) { $entries += @{key='retry'; name='review-retry.json'} }
+    else { $entries += @{key='intent'; name='verified-review-intent.json'} }
+    foreach ($entry in $entries) {
+      $expected = $ticket.reviewProofDigests.($entry.key)
+      $file = Join-Path $runtimePath $entry.name
+      if ($expected -isnot [string] -or $expected -cnotmatch '\A[0-9a-f]{64}\z' -or -not [IO.File]::Exists($file)) {
+        throw 'Review proof is missing or invalid; stopped before launch.'
+      }
+      $sha = [Security.Cryptography.SHA256]::Create()
+      try { $actual = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($file)))).Replace('-','').ToLowerInvariant() }
+      finally { $sha.Dispose() }
+      if ($actual -cne $expected) { throw 'Review proof changed after watchdog decision; stopped before launch.' }
+    }
+  }
+  if ($ReviewRetry) {
+    $expectedReview = $ticket.reviewExpected
+    $retryState = [IO.File]::ReadAllText((Join-Path $runtimePath 'review-retry.json')) | ConvertFrom-Json
+    if ($null -eq $expectedReview -or $expectedReview.failureId -cnotmatch '\A[a-zA-Z0-9_-]{1,160}\z' -or
+        $expectedReview.targetId -cnotmatch '\Areq_[a-zA-Z0-9_]{1,160}\z' -or
+        $expectedReview.operationId -cnotmatch '\Aop_[a-zA-Z0-9_-]{1,160}\z' -or
+        $retryState.failureId -cne $expectedReview.failureId -or $retryState.targetId -cne $expectedReview.targetId -or
+        $retryState.operationId -cne $expectedReview.operationId) {
+      throw 'Retry target changed after watchdog decision; stopped before launch.'
+    }
+    $env:NUMEMS_REVIEW_RETRY_EXPECTED = @{failureId=$expectedReview.failureId;targetId=$expectedReview.targetId;operationId=$expectedReview.operationId} | ConvertTo-Json -Compress
+    $env:NUMEMS_REVIEW_STOP_DIGEST = $ticket.stopDigest
+  }
   # Worker also treats any newer stop request as stopping this supervised start,
   # even if that request targeted the dead lock incarnation being recovered.
   $env:NUMEMS_WATCHDOG_START_AT = $ticket.at
@@ -112,6 +146,10 @@ try {
     throw 'Admin arguments are allowed only in admin mode.'
   }
   if ($RecoverSettledLock -and $Mode -ne 'run') { throw 'Verified dead-lock recovery is allowed only for the guarded watchdog run.' }
+  if ($ReviewRetry -and ($Mode -ne 'admin' -or $AdminCommand -cne 'review-verified-operation' -or $RecoverSettledLock)) {
+    throw 'Retry ticket is valid only for the read-only verified-operation review.'
+  }
+  if (-not $ReviewRetry) { Remove-Item Env:NUMEMS_REVIEW_RETRY_EXPECTED,Env:NUMEMS_REVIEW_STOP_DIGEST -ErrorAction SilentlyContinue }
   $entryName = if ($Mode -eq 'admin') { 'admin.mjs' } elseif ($Mode -eq 'probe') { 'probe.mjs' } else { 'main.mjs' }
   $entryPath = Join-Path $PSScriptRoot $entryName
   if (-not (Test-Path -LiteralPath $entryPath -PathType Leaf)) { throw 'Worker entry point is unavailable.' }
@@ -121,9 +159,12 @@ try {
   $mutex = [Threading.Mutex]::new($false, ('Local\NUMEMS-Agentless-Host-' + $suffix))
   try { $hasMutex = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $hasMutex = $true }
   if (-not $hasMutex) { throw 'An isolated host is already running for this project.' }
-  if ($RecoverSettledLock) { Assert-WatchdogStart; Restore-SettledWorkerLock }
+  if ($RecoverSettledLock -or $ReviewRetry) { Assert-WatchdogStart }
+  if ($RecoverSettledLock) { Restore-SettledWorkerLock }
+  if ($ReviewRetry -and [IO.File]::Exists((Join-Path $runtimePath 'worker.lock'))) { throw 'Retry requires no worker lock.' }
   Add-Type -LiteralPath (Join-Path $PSScriptRoot 'desktop-native.cs')
-  if ($RecoverSettledLock) { Assert-WatchdogStart }
+  if ($RecoverSettledLock -or $ReviewRetry) { Assert-WatchdogStart }
+  if ($ReviewRetry -and [IO.File]::Exists((Join-Path $runtimePath 'worker.lock'))) { throw 'Worker lock appeared during retry setup.' }
   $session = [NumemsDesktop.Native]::Start($nodePath, $projectPath, $Mode, $AdminCommand, $RequestId)
   $report.state = 'running'
   $report.desktop = $session.desktopName

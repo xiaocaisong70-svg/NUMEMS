@@ -6,7 +6,7 @@ import {spawn} from 'node:child_process';
 export function hostArguments(args,node=process.execPath) {
   const [mode,command,id,...extra]=args;
   const commands=['status','observe','prepare-test','release-test','test-reminder','test-expire',
-    'enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace'];
+    'enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation'];
   const withId=['release-test','test-reminder','test-expire'];
   if(!['probe','once','run','admin'].includes(mode) || extra.length ||
     (mode!=='admin' && (command!==undefined || id!==undefined)) ||

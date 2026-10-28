@@ -2,10 +2,12 @@
 
 Developed by xcsong.
 
-这是新站 **Sites 第 7 版（2026-10-27）**的源码与维护分支。网页托管在 Sites，Windows 上的普通程序负责工作空间成员操作，日常办理不调用模型，也不唤醒 Codex。
+这是新站 **Sites 第 10 版（2026-10-27）**的源码与维护分支。网页托管在 Sites，Windows 上的普通程序负责工作空间成员操作，日常办理不调用模型，也不唤醒 Codex。
 
 - [线上新站](https://numems-seat-portal-agentless.workspace-026021.chatgpt.site/)
-- 维护分支：`agentless`；当前固定版本：`agentless-v7`
+- 维护分支：`agentless`；当前版本归档分支：`agentless-v10`（以归档提交 SHA 为准）
+- [第十版说明与校验清单](releases/agentless-v10/README.md)
+- [到期回收根因修复与验收边界](docs/EXPIRY-ROOTFIX-20261027.md)
 - [第七版说明与校验清单](releases/agentless-v7/README.md)
 - [官方成员状态对账与执行器恢复](docs/RECONCILIATION-20261027.md)
 - [第六版说明与校验清单](releases/agentless-v6/README.md)
@@ -47,7 +49,9 @@ node node_modules/typescript/bin/tsc --noEmit
 npm run build
 ```
 
-`verify-release.mjs` 默认核对 `agentless-v7` 归档；也可显式指定版本名。旧版须先检出相应固定标签，再运行该标签自带的校验脚本。修改代码后出现差异是预期行为；新版本保留旧清单并增加新的版本记录。
+`verify-release.mjs` 默认核对 `agentless-v10` 归档；也可显式指定版本名。旧版须先检出相应固定标签，再运行该标签自带的校验脚本。修改代码后出现差异是预期行为；新版本保留旧清单并增加新的版本记录。
+
+第十版通过 **85 项联合测试**、TypeScript、Sites 生产构建及独立真实 D1 的 **6 项合成数据原子性测试**。三条到期记录已由管理员授权的受控官方浏览器流程完成真实回收并保存回执；这不等同于无模型执行器全链路验收。专用浏览器在隐藏模式仍可能遭官方安全验证阻塞，运行状态须以实时计划、宿主日志和官方名单为准，不能据本归档宣称无人值守已通过。
 
 第七版通过 **127 项针对性及回归测试**、TypeScript 和 Sites 生产构建。隔离桌面只读双快照与恢复已核实，恢复后自动到期回收及官方邀请取得回执，输入桌面执行窗口数为 0。本次未重跑全部浏览器夹具，不宣称全量浏览器回归通过；第六版的验证范围保留在对应版本说明中。
 
@@ -64,6 +68,8 @@ GitHub 保存源码和版本，**不会因推送而自动部署站点或启用�
 ## 版本与隐私
 
 原第五版快照对应 Sites 源提交 `bee319c270dc845aa0748b7a8bfc26c8ab17696f`，原始清单保存在 [manifest.json](releases/agentless-v5/manifest.json)。GitHub 归档额外整理了说明、忽略规则和校验工具。`package.json` 的 `1.0.0` 是包版本，不等同于 Sites 发布序号。
+
+第十版发布源提交为 `1a55cfe21f1914997df41facbd584bc58ad42d42`，完整性以[第十版清单](releases/agentless-v10/manifest.json)为准。本版为原操作暂停遗留的根因修复，保留官方验证、角色和容量保护；不是两分钟空闲对账候选版。
 
 第七版发布源提交为 `b1caa6877d04a3552ad2b934e730f3970f7cd1a4`，完整性以[第七版清单](releases/agentless-v7/manifest.json)为准。它修复官方名单与席位数短暂不一致后无法恢复、以及进程号复用使看护程序持续停住的问题。领取前只进行有界重读；已领取或结果不明时保留原租约。空闲两分钟对账候选版没有包含在第七版内。
 

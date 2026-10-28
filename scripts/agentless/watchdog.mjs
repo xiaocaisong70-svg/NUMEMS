@@ -7,13 +7,19 @@ import {readFile} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
 import {loadConfig,runtimeDir} from './config.mjs';
 import {readJson,atomicJson} from './journal.mjs';
-import {restartDecision} from './watchdog-policy.mjs';
+import {restartDecision,reviewRetryDecision} from './watchdog-policy.mjs';
 const execute=promisify(execFile);
 const file=path.join(runtimeDir,'watchdog.json');
 
 export async function readStopSnapshot(directory=runtimeDir) {
+  return await readEvidenceSnapshot(directory,'stop-request.json');
+}
+
+export async function readEvidenceSnapshot(directory,name) {
+  if(!['stop-request.json','status.json','operation.json','admin-result.json','review-retry.json','verified-review-intent.json'].includes(name))
+    throw new Error('Invalid evidence name');
   try {
-    const data=await readFile(path.join(directory,'stop-request.json'));
+    const data=await readFile(path.join(directory,name));
     return {value:JSON.parse(data.toString('utf8')),digest:createHash('sha256').update(data).digest('hex')};
   } catch(error) {if(error.code==='ENOENT')return {value:null,digest:'absent'};throw error;}
 }
@@ -44,15 +50,18 @@ export async function processGate({host,lock},signal=pid=>process.kill(pid,0),in
   return {clear:true};
 }
 
-export async function supervise({config,host,status,journal,stopRequest,run,save,now=()=>new Date()}) {
-  const decision=restartDecision({host,status,journal,stopRequest,now:now().getTime()});
+export async function supervise({config,host,status,journal,adminResult,lock,retryRecord,reviewIntent,intentDigest,stopRequest,run,save,now=()=>new Date()}) {
+  const input={host,status,journal,adminResult,lock,retryRecord,reviewIntent,intentDigest,stopRequest,now:now().getTime()};
+  const primary=restartDecision(input);
+  const retry=!primary.allowed && host?.adminCommand==='review-verified-operation' ? reviewRetryDecision(input) : null;
+  const decision=retry?.allowed ? retry : primary;
   const base={checkedAt:now().toISOString(),modelCalls:0,...decision};
   if(!config.liveActions || config.browserMode!=='isolated_desktop' || config.headless!==false ||
       config.legacyCheckerDisabled!==true) {
     const result={...base,state:'disabled',allowed:false,reason:'live_isolated_cutover_required'};
     await save(result);return result;
   }
-  if(!decision.allowed) {const result={...base,state:'held'};await save(result);return result;}
+  if(!decision.allowed) {const result={...base,state:'held',...(retry?{reviewRetryReason:retry.reason}: {})};await save(result);return result;}
   // Check only desktop availability before starting a browser. No elevation,
   // secure-desktop access, or interactive-desktop fallback is attempted.
   let desktop;
@@ -65,8 +74,9 @@ export async function supervise({config,host,status,journal,stopRequest,run,save
   try {
     // Native host mutex is acquired BEFORE any verified dead-lock archival.
     // main.mjs then checks the current cloud lease/identity before every action.
-    await run('worker');
-    const result={...base,checkedAt:now().toISOString(),state:'worker_exited'};
+    const isReview=decision.reason==='review_pre_submit_retry_candidate';
+    await run(isReview?'review':'worker',decision);
+    const result={...base,checkedAt:now().toISOString(),state:isReview?'review_exited':'worker_exited'};
     await save(result);return result;
   } catch {
     // Never interpret a nonzero exit as permission to retry here. Next scheduled
@@ -79,9 +89,19 @@ export async function supervise({config,host,status,journal,stopRequest,run,save
 export async function main() {
   if(process.platform!=='win32')throw new Error('Watchdog requires the Windows user session.');
   const config=await loadConfig();
-  const [host,status,journal,lock,stopSnapshot]=await Promise.all([
-    ...['host-desktop.json','status.json','operation.json','worker.lock'].map(name=>readJson(path.join(runtimeDir,name))),
+  const [host,lock,statusSnapshot,journalSnapshot,stopSnapshot]=await Promise.all([
+    ...['host-desktop.json','worker.lock'].map(name=>readJson(path.join(runtimeDir,name))),
+    ...['status.json','operation.json'].map(name=>readEvidenceSnapshot(runtimeDir,name)),
     readStopSnapshot()]);
+  // Unrelated old administrator reports must not affect the existing recovery
+  // paths; read this proof only for the exact reviewed-operation exit.
+  const adminSnapshot=host?.mode==='admin' && host.adminCommand==='review-verified-operation'
+    ? await readEvidenceSnapshot(runtimeDir,'admin-result.json') : {value:null,digest:'absent'};
+  const retrySnapshot=host?.mode==='admin' && host.adminCommand==='review-verified-operation'
+    ? await readEvidenceSnapshot(runtimeDir,'review-retry.json') : {value:null,digest:'absent'};
+  const intentSnapshot=host?.mode==='admin' && host.adminCommand==='review-verified-operation'
+    ? await readEvidenceSnapshot(runtimeDir,'verified-review-intent.json') : {value:null,digest:'absent'};
+  const {value:status}=statusSnapshot,{value:journal}=journalSnapshot,{value:adminResult}=adminSnapshot;
   const stopRequest=stopSnapshot.value;
   const powershell=path.join(process.env.SystemRoot||'C:\\Windows','System32','WindowsPowerShell','v1.0','powershell.exe');
   const gate=await processGate({host,lock},undefined,async pid=>{
@@ -94,15 +114,28 @@ export async function main() {
     const result={checkedAt:new Date().toISOString(),state:'held',...gate,modelCalls:0};
     await atomicJson(file,result);return result;
   }
-  return supervise({config,host,status,journal,stopRequest,
+  return supervise({config,host,status,journal,adminResult,lock,retryRecord:retrySnapshot.value,
+    reviewIntent:intentSnapshot.value,intentDigest:intentSnapshot.digest,stopRequest,
     save:report=>atomicJson(file,report),
-    run:async kind=>{
-      if(kind==='worker')await atomicJson(path.join(runtimeDir,'watchdog-start.json'),{
+    run:async (kind,decision)=>{
+      let retryProof=null;
+      if(kind==='review') {
+        await atomicJson(path.join(runtimeDir,'review-retry.json'),{version:1,failureId:decision.failureId,
+          targetId:decision.targetId,operationId:decision.operationId,attempts:decision.attempts,issuedAt:new Date().toISOString()});
+        retryProof=await readEvidenceSnapshot(runtimeDir,'review-retry.json');
+      }
+      if(kind==='worker' || kind==='review')await atomicJson(path.join(runtimeDir,'watchdog-start.json'),{
         version:1,pid:process.pid,at:new Date().toISOString(),stopDigest:stopSnapshot.digest,
-        expectedHostPid:host?.processId??null,expectedHostCheckedAt:host?.checkedAt??null});
+        expectedHostPid:host?.processId??null,expectedHostCheckedAt:host?.checkedAt??null,
+        ...(retryProof?{reviewExpected:{failureId:decision.failureId,targetId:decision.targetId,
+          operationId:decision.operationId}}:{}),
+        ...(['reviewed_verified_operation_start_candidate','review_pre_submit_retry_candidate'].includes(decision?.reason)
+          ? {reviewProofDigests:{status:statusSnapshot.digest,journal:journalSnapshot.digest,
+            admin:adminSnapshot.digest,intent:intentSnapshot.digest,...(retryProof?{retry:retryProof.digest}:{})}}:{})});
       const args=['-NoProfile','-NonInteractive','-WindowStyle','Hidden','-File',
         path.join(import.meta.dirname,kind==='desktop'?'desktop-probe.ps1':'isolated-desktop.ps1'),
-        ...(kind==='worker'?['-NodeExe',process.execPath,'-Mode','run','-RecoverSettledLock']:[])];
+        ...(kind==='worker'?['-NodeExe',process.execPath,'-Mode','run','-RecoverSettledLock']:
+          kind==='review'?['-NodeExe',process.execPath,'-Mode','admin','-AdminCommand','review-verified-operation','-ReviewRetry']:[])];
       const result=await execute(powershell,args,{windowsHide:true,maxBuffer:1_048_576,
         ...(kind==='desktop'?{timeout:20_000}:{})});
       return kind==='desktop'?JSON.parse(result.stdout.trim().replace(/^\uFEFF/,'')):null;
