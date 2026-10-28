@@ -3,6 +3,7 @@ import {validateObservation} from '../seat-executor/inventory.mjs';
 import {readJson,atomicJson} from './journal.mjs';
 import {resolveFailureAlerts} from './alert.mjs';
 import {cloudRecoveryOwned} from './recovery-fence.mjs';
+import {isDedicatedObservation} from './browser.mjs';
 
 const stamp=value=>typeof value==='string' && /(Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value));
 export const HEALTH_CLOCK_SKEW_MS=5000;
@@ -22,6 +23,8 @@ export function diagnoseHealthEvidence({config,plan,snapshot,journalState,checke
   if(plan.administrator!==config.adminEmail)return fail('administrator_identity_mismatch');
   if(plan.busy!==false||plan.lease!=null)return fail('cloud_operation_unsettled');
   if(cloudRecoveryOwned(plan))return fail('fault_rescue_unsettled');
+  if(plan.faultRescue?.scope==='approved_member_ops'&&plan.faultRescue.phase==='finished'&&!isDedicatedObservation(snapshot))
+    return fail('dedicated_channel_proof_missing');
   if(plan.lastError||plan.globalFailureCode)return fail('cloud_failure_present');
   if(!Array.isArray(plan.blockedOperations))return fail('cloud_holds_missing');
   if(plan.blockedOperations.length)return fail('cloud_holds_present');
@@ -39,7 +42,7 @@ export function diagnoseHealthEvidence({config,plan,snapshot,journalState,checke
   if(plan.officialObservedAt!==snapshot.observedAt)return fail('official_roundtrip_mismatch');
   if(timings.planObservationGapMs===null)return fail('official_time_invalid');
   if(timings.planObservationGapMs< -HEALTH_CLOCK_SKEW_MS)return fail('cloud_predates_official');
-  if(journalState&&(journalState.phase!=='settled'||journalState.lease!=null||journalState.receipt!=null))
+  if(journalState&&(journalState.phase!=='settled'||journalState.lease!=null||journalState.receipt!=null||journalState.submission!=null))
     return fail('local_operation_unsettled');
   try{validateObservation(snapshot,config,Date.parse(checkedAt));}
   catch{return fail('official_snapshot_invalid');}
@@ -67,9 +70,9 @@ async function newerClosedRescueEpoch(directory,plan,previous,evidence) {
   if(previous?.state!=='healthy')return null;
   const local=await readJson(path.join(directory,'fault-rescue.json')),cloud=plan.faultRescue;
   if(local?.version!==1 || local.phase!=='finished' || local.agentStopped!==true ||
-      !['recovered','unresolved','needs_human'].includes(local.outcome) || cloud?.phase!=='finished' ||
+      !['recovered','unresolved','needs_human','handled'].includes(local.outcome) || cloud?.phase!=='finished' ||
       cloud.outcome!==local.outcome || cloud.id!==local.ticket?.id || cloud.failureId!==local.failureId ||
-      local.ticket?.failureId!==local.failureId || cloud.scope!=='read_only_reconcile' || local.ticket?.scope!==cloud.scope ||
+      local.ticket?.failureId!==local.failureId || !['read_only_reconcile','approved_member_ops'].includes(cloud.scope) || local.ticket?.scope!==cloud.scope ||
       !/^rescue_[a-zA-Z0-9_-]{16,100}$/.test(cloud.id??'') ||
       !/^[a-zA-Z0-9:_-]{1,240}$/.test(cloud.failureId??'') ||
       ![local.createdAt,local.updatedAt,cloud.createdAt,cloud.updatedAt].every(stamp))return null;

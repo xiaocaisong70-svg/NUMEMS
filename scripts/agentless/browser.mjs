@@ -4,6 +4,10 @@ import { promisify } from 'node:util';
 import { BrowserAdapter } from '../seat-executor/browser.mjs';
 import { OfficialPageError,officialDiagnostic } from '../seat-executor/official-readiness.mjs';
 const execute = promisify(execFile);
+const dedicatedObservations=new WeakSet();
+// Process-local provenance, intentionally absent from JSON, cloud payloads and
+// IAB snapshots. Only a completed dedicated adapter read can acquire it.
+export const isDedicatedObservation=snapshot=>Boolean(snapshot&&typeof snapshot==='object'&&dedicatedObservations.has(snapshot));
 
 export function validateDesktopProof(proof, expected) {
   if (!/^NUMEMS-Agentless-[a-zA-Z0-9-]+$/.test(expected ?? '') ||
@@ -41,6 +45,11 @@ export async function assertDesktop(config, {env=process.env, platform=process.p
 
 /** Keeps normal browser rendering while refusing any launch on the user's desktop. */
 export class AgentlessBrowser extends BrowserAdapter {
+  async observe(options) {
+    const snapshot=await super.observe(options);
+    if(snapshot&&typeof snapshot==='object')dedicatedObservations.add(snapshot);
+    return snapshot;
+  }
   async desktopProofForLaunch(options) {return assertDesktop(this.config,options);}
   async open({timeoutMs=30000}={}) {
     if(!Number.isInteger(timeoutMs)||timeoutMs<1||timeoutMs>30000)throw new Error('Invalid standard browser startup budget.');
@@ -61,7 +70,9 @@ export class AgentlessBrowser extends BrowserAdapter {
   set onExternalAction(handler) {this.actionHandler = handler;}
   get onExternalAction() {
     return async () => {
-      await assertDesktop(this.config);
+      const remaining=await this.beforeOfficialRead('page');
+      await this.desktopProofForLaunch({timeoutMs:Math.max(1,Math.min(20000,remaining))});
+      await this.beforeOfficialRead('page');
       return this.actionHandler?.();
     };
   }

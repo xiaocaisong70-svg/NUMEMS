@@ -1,13 +1,13 @@
 import { env } from "cloudflare:workers";
 import { currentActor, readState, mutateState, schedulerActor } from "@/lib/portal-service";
 import { runJobs, refreshSeatQueue } from "@/lib/jobs";
-import { observeWorkspace, prepareTest, workPlan, claimOperation, completeOperation, deferOperation, reviewFailure, verifiedReviewReceipt, FAILURE_CODES, setBridgeMode,
+import { observeWorkspace, prepareTest, workPlan, claimOperation, claimRescueOperation, authorizeRescueAction, completeOperation, deferOperation, reviewFailure, verifiedReviewReceipt, FAILURE_CODES, setBridgeMode,
   setTestDeadline, recordSchedule, type BridgeState, type Observation } from "@/lib/codex-bridge";
 import { transition } from "@/lib/seat-engine";
 import { reminderMode } from "@/lib/reminder-policy";
 import { recordIdleFailure, applyIdleObservation } from "@/lib/official-idle-state";
 import { restoreV11History } from "@/lib/history-rollback";
-import { beginFaultRescue, finishFaultRescue, publicFaultRescue, recordRecoveryProgress, rescueBlocksClaims } from '@/lib/recovery-control';
+import { beginFaultRescue, finishFaultRescue, publicFaultRescue, recordRecoveryProgress, rescueBlocksClaims, prepareV13RollbackState } from '@/lib/recovery-control';
 export const dynamic = "force-dynamic";
 
 const personSchema = { type: "object", properties: {
@@ -21,13 +21,21 @@ const observationSchema = { type: "object", properties: {
 const tools = [
   {
     name:'record_recovery_progress', description:'记录恢复阶段，不改变故障、成员、租约或容量。普通安全检查不能被声明为人工认证；明确交互或登录提示须有新鲜官方诊断。',
-    inputSchema:{type:'object',properties:{expectedFailureId:{type:'string'},phase:{type:'string',enum:['auto_recovery','security_check','interaction_required','login_required','waiting_codex','review_required']},diagnostic:{type:'object',properties:{version:{type:'integer',enum:[1]},stage:{type:'string'},state:{type:'string'},expectedUrl:{type:'string'},observedAt:{type:'string'}},required:['version','stage','state','expectedUrl','observedAt'],additionalProperties:false}},required:['expectedFailureId','phase'],additionalProperties:false},
+    inputSchema:{type:'object',properties:{expectedFailureId:{type:'string'},phase:{type:'string',enum:['auto_recovery','security_check','interaction_required','login_required','waiting_codex','review_required','fallback_exhausted','fallback_timeout']},diagnostic:{type:'object',properties:{version:{type:'integer',enum:[1]},stage:{type:'string'},state:{type:'string'},expectedUrl:{type:'string'},observedAt:{type:'string'}},required:['version','stage','state','expectedUrl','observedAt'],additionalProperties:false}},required:['expectedFailureId','phase'],additionalProperties:false},
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true},
   },
   {
     name:'begin_fault_rescue',description:'仅管理员在确认本机执行器已正常停止后交接只读故障诊断权。保留原租约，阻止新的邀请、移除和邮件领取；同一故障幂等返回原票据。',
-    inputSchema:{type:'object',properties:{expectedFailureId:{type:'string'}},required:['expectedFailureId'],additionalProperties:false},
+    inputSchema:{type:'object',properties:{expectedFailureId:{type:'string'},scope:{type:'string',enum:['read_only_reconcile','approved_member_ops']},clientId:{type:'string'}},required:['expectedFailureId'],additionalProperties:false},
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true},
+  },
+  {
+    name:'claim_rescue_operation',description:'持有效执行型后备票据领取一个服务器冻结目标；普通执行器仍被隔离，不清除专用通道故障。',
+    inputSchema:{type:'object',properties:{rescueId:{type:'string'},token:{type:'string'},expectedFailureId:{type:'string'},kind:{type:'string',enum:['invite','remove']},targetId:{type:'string'}},required:['rescueId','token','expectedFailureId','kind','targetId'],additionalProperties:false},annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false},
+  },
+  {
+    name:'authorize_rescue_action',description:'执行型原租约写入前的一次性授权；需要领取后的新鲜官方证据，不允许重复授权或过期写入。',
+    inputSchema:{type:'object',properties:{rescueId:{type:'string'},token:{type:'string'},expectedFailureId:{type:'string'},operationId:{type:'string'},operationToken:{type:'string'}},required:['rescueId','token','expectedFailureId','operationId','operationToken'],additionalProperties:false},annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false},
   },
   {
     name:'fault_rescue_status',description:'只读查询故障诊断票据与当前计划，返回值不含处置凭证。',
@@ -35,8 +43,12 @@ const tools = [
   },
   {
     name:'finish_fault_rescue',description:'原故障会话已确认结束后归还执行权。recovered须原通道新鲜官方证据且无故障或未结案租约；普通challenge不能作为needs_human证据；结果不明保持独占。',
-    inputSchema:{type:'object',properties:{rescueId:{type:'string'},token:{type:'string'},expectedFailureId:{type:'string'},outcome:{type:'string',enum:['recovered','needs_human','unresolved','uncertain']},agentStopped:{type:'boolean'},diagnostic:{type:'object'}},required:['rescueId','token','expectedFailureId','outcome','agentStopped'],additionalProperties:false},
+    inputSchema:{type:'object',properties:{rescueId:{type:'string'},token:{type:'string'},expectedFailureId:{type:'string'},outcome:{type:'string',enum:['recovered','needs_human','unresolved','uncertain','handled']},agentStopped:{type:'boolean'},diagnostic:{type:'object'}},required:['rescueId','token','expectedFailureId','outcome','agentStopped'],additionalProperties:false},
     annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:true},
+  },
+  {
+    name:'prepare_v13_rollback',description:'显式维护回退：云端调度与成员执行均关闭、无未结案事项时，按D1修订CAS将finished handled归一为V13兼容unresolved，保留额度历史。',
+    inputSchema:{type:'object',properties:{expectedRevision:{type:'integer',minimum:0}},required:['expectedRevision'],additionalProperties:false},annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false},
   },
   {
     name:"version_rollback_status",description:"仅读取当前 D1 修订与 V11 回退前提，不修改数据或成员。",
@@ -132,7 +144,7 @@ const tools = [
     name: "complete_seat_operation", description: "提交实际执行回执。邀请/移除必须提供操作后的完整官方快照；撤回待接受邀请期间若员工已成为普通成员，使用joined加完整快照安全结束原租约并保留成员，不算移除成功；邮件必须提供Gmail消息ID。用failureCode明确故障。",
     inputSchema: { type: "object", properties: {
       operationId: { type: "string" }, token: { type: "string" },
-      outcome: { type: "string", enum: ["verified", "joined", "uncertain", "blocked"] },
+          outcome: { type: "string", enum: ["verified", "joined", "uncertain", "blocked", "not_started"] },
       observation: observationSchema, providerMessageId: { type: "string" }, detail: { type: "string" },
       invitationSentAt: { type: "string", description: "邀请点击发送成功时记录的UTC时间；只能是本次claim后、官方核实前的真实时间，用于5分钟加入倒计时。" },
       failureCode: { type: "string", enum: FAILURE_CODES },
@@ -181,7 +193,29 @@ export async function POST(request: Request) {
         const args=body.params?.arguments??{};
         if(!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).length)throw new Error('处置状态不接受参数。');
         const {state}=await readState();
-        return Response.json({jsonrpc:'2.0',id,result:{content:[{type:'text',text:JSON.stringify({ticket:publicFaultRescue(state as BridgeState),plan:workPlan(state as BridgeState,new Date().toISOString())})}]}},{headers:{'Cache-Control':'no-store'}});
+        return Response.json({jsonrpc:'2.0',id,result:{content:[{type:'text',text:JSON.stringify({ticket:publicFaultRescue(state as BridgeState,{includeTargets:true}),plan:workPlan(state as BridgeState,new Date().toISOString())})}]}},{headers:{'Cache-Control':'no-store'}});
+      }
+      if(body.params?.name==='prepare_v13_rollback') {
+        const args=body.params.arguments;
+        if(!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).join(',')!=='expectedRevision'||!Number.isSafeInteger(args.expectedRevision)||args.expectedRevision<0||!env.DB)throw new Error('回退参数无效。');
+        const before=await readState();if(before.revision!==args.expectedRevision)throw new Error('D1修订已变化，请重新读取回退状态。');
+        const next=prepareV13RollbackState(before.state as BridgeState,new Date().toISOString());
+        let revision=before.revision;
+        if(JSON.stringify(next)!==JSON.stringify(before.state)) {
+          const result=await env.DB.prepare('UPDATE portal_state SET revision = ?, document = ? WHERE id = ? AND revision = ?')
+            .bind(before.revision+1,JSON.stringify(next),'main',before.revision).run();
+          if(result.meta.changes!==1)throw new Error('回退准备期间D1已变化，未覆盖新状态。');revision++;
+        }
+        return Response.json({jsonrpc:'2.0',id,result:{content:[{type:'text',text:JSON.stringify({prepared:true,revision,ticket:publicFaultRescue(next)})}]}},{headers:{'Cache-Control':'no-store'}});
+      }
+      if(['claim_rescue_operation','authorize_rescue_action'].includes(body.params?.name)) {
+        const name=body.params.name,args=body.params.arguments,operationToken=crypto.randomUUID();
+        const state=await mutateState(current=>name==='claim_rescue_operation'
+          ?claimRescueOperation(current as BridgeState,args,operationToken,new Date().toISOString())
+          :authorizeRescueAction(current as BridgeState,args,new Date().toISOString()));
+        const op=(state as BridgeState).codex?.lease;
+        const authorization=name==='authorize_rescue_action'&&op?{operationId:op.id,rescueId:op.rescueId,authorizedAt:op.actionAuthorizedAt,expiresAt:op.actionAuthorizationExpiresAt}:undefined;
+        return Response.json({jsonrpc:'2.0',id,result:{content:[{type:'text',text:JSON.stringify({...(authorization?{authorization}:{}),plan:workPlan(state as BridgeState,new Date().toISOString())})}]}},{headers:{'Cache-Control':'no-store'}});
       }
       if(['record_recovery_progress','begin_fault_rescue','finish_fault_rescue'].includes(body.params?.name)) {
         const name=body.params.name,args=body.params.arguments;
@@ -261,7 +295,7 @@ export async function POST(request: Request) {
             return claimOperation(s, args.kind, args.targetId, token, now);
           }
           if (name === "complete_seat_operation") return completeOperation(s, args,
-            s.codex?.operationFailureOrigin?.operationId === args.operationId &&
+            (s.codex?.lease?.rescueId||s.codex?.holds?.some(h=>h.operation.id===args.operationId&&h.operation.rescueId)) || s.codex?.operationFailureOrigin?.operationId === args.operationId &&
               ["verified", "joined"].includes(args.outcome) ? new Date().toISOString() : now);
           if (name === "set_codex_live") {
             if (typeof args.enabled !== "boolean") throw new Error("启用参数无效。");

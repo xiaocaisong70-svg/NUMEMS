@@ -32,6 +32,16 @@ export class PortalQueueUnavailable extends Error {
   }
 }
 
+// Only a matched HTTP-200 tool error is a definite, atomic business rejection.
+// Never attach provider bodies, tokens or this flag to transport ambiguity.
+export class PortalOperationRejected extends Error {
+  constructor(operation) {
+    if(operation!=='begin_fault_rescue')throw new Error('Unsupported explicit operation rejection.');
+    super('The rescue capability request was explicitly rejected; fresh state must be checked.');
+    this.name='PortalOperationRejected';this.operation=operation;this.definitelyRejected=true;
+  }
+}
+
 // Optional deadlines are for recovery reads only. Mutation transport and
 // ambiguous-result handling retain their original single-attempt semantics.
 function normalizeReadControls(controls,operation) {
@@ -184,6 +194,8 @@ export class PortalClient {
     if(result?.transportFailure && name==='refresh_seat_queue')
       throw new PortalQueueUnavailable({stage:'queue_refresh',requestedOperation:name,
         idempotent:true,noExternalActions:true,reason:result.transportFailure.reason});
+    if(name==='begin_fault_rescue'&&result.status===200&&result.body?.id===body.id&&result.body?.result?.isError===true)
+      throw new PortalOperationRejected(name);
     if (result.status !== 200 || result.body?.id !== body.id ||
         result.body?.result?.isError || result.body?.error)
       throw new Error(`门户 ${name} 未能确认执行结果；不得盲目重试。`);

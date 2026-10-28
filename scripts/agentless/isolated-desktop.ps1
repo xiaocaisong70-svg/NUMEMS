@@ -1,7 +1,7 @@
 param(
   [Parameter(Mandatory=$true)][string]$NodeExe,
   [ValidateSet('probe','once','run','admin')][string]$Mode = 'probe',
-  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','rollback-status','prepare-v11-rollback','prepare-fault-rescue','finish-fault-rescue')][string]$AdminCommand,
+  [ValidateSet('status','observe','prepare-test','release-test','test-reminder','test-expire','enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','rollback-status','prepare-v11-rollback','prepare-v13-rollback','prepare-fault-rescue','finish-fault-rescue')][string]$AdminCommand,
   [string]$RequestId,
   [switch]$RecoverSettledLock,
   [switch]$ReviewRetry
@@ -59,7 +59,7 @@ function Restore-SettledWorkerLock {
   $journalPath = Join-Path $runtimePath 'operation.json'
   if ([IO.File]::Exists($journalPath)) {
     $journal = [IO.File]::ReadAllText($journalPath) | ConvertFrom-Json
-    if ($journal.phase -cne 'settled' -or $null -ne $journal.lease -or $null -ne $journal.receipt) {
+    if ($journal.phase -cne 'settled' -or $null -ne $journal.lease -or $null -ne $journal.receipt -or $null -ne $journal.submission) {
       throw 'Unfinished journal; no automatic lock recovery or member action.'
     }
   }
@@ -142,7 +142,7 @@ function Assert-WatchdogStart {
         $rescue.agentProof.source -cne 'app_server_thread_read' -or $rescue.agentProof.confirmed -ne $true -or
         $rescue.agentProof.stopped -ne $true -or $rescue.agentProof.threadId -cne $rescue.threadId -or
         $rescue.agentProof.clientUserMessageId -cne $rescue.clientId -or
-        $journal.phase -cne 'settled' -or $null -ne $journal.lease -or $null -ne $journal.receipt -or
+        $journal.phase -cne 'settled' -or $null -ne $journal.lease -or $null -ne $journal.receipt -or $null -ne $journal.submission -or
         $admin.command -cne 'finish-fault-rescue' -or $admin.requestId -cne $expectedRescue.rescueId -or $admin.success -ne $true -or
         $status.faultRescueEvidence.rescueId -cne $expectedRescue.rescueId -or
         $status.faultRescueEvidence.failureId -cne $expectedRescue.failureId -or $status.mode -cne 'idle' -or
@@ -177,8 +177,8 @@ try {
       -not (Test-Path -LiteralPath $nodePath -PathType Leaf)) { throw 'An absolute installed node.exe path is required.' }
   if ($Mode -eq 'admin') {
     if (-not $AdminCommand) { throw 'AdminCommand is required in admin mode.' }
-    $requiresRequestId = $AdminCommand -cin @('release-test','test-reminder','test-expire','prepare-v11-rollback','finish-fault-rescue')
-    if ($AdminCommand -ceq 'prepare-v11-rollback') {
+    $requiresRequestId = $AdminCommand -cin @('release-test','test-reminder','test-expire','prepare-v11-rollback','prepare-v13-rollback','finish-fault-rescue')
+    if ($AdminCommand -cin @('prepare-v11-rollback','prepare-v13-rollback')) {
       if ($RequestId -cnotmatch '\A\d{1,15}\z') { throw 'Rollback requires a current numeric D1 revision.' }
     } elseif ($AdminCommand -ceq 'finish-fault-rescue') {
       if ($RequestId -cnotmatch '\Arescue_[a-zA-Z0-9_-]{16,100}\z') { throw 'An existing rescue ticket ID is required.' }

@@ -2,7 +2,7 @@ import {bridgeObservation} from '../seat-executor/inventory.mjs';
 import {officialDiagnostic} from '../seat-executor/official-readiness.mjs';
 import {readJson} from './journal.mjs';
 
-const journalClear = journal => !journal || (journal.phase==='settled' && journal.lease==null && journal.receipt==null);
+const journalClear = journal => !journal || (journal.phase==='settled' && journal.lease==null && journal.receipt==null && journal.submission==null);
 const eligible = (plan,config) => plan?.globalFailureCode==='browser_unavailable' && plan.browserRecovery?.eligible===true &&
   !plan.busy && !plan.lease && (!config?.workspaceId || plan.workspaceId===config.workspaceId) &&
   (!config?.adminEmail || plan.administrator===config.adminEmail);

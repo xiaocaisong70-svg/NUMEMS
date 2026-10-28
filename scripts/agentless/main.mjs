@@ -18,7 +18,7 @@ import {cloudRecoveryOwned,localRecoveryOwned} from './recovery-fence.mjs';
 
 export function localContextRecoveryEligible(error,journal) {
   return error?.message==='page.evaluate: Target page, context or browser has been closed' &&
-    journal?.phase==='settled' && journal.lease==null && journal.receipt==null;
+    journal?.phase==='settled' && journal.lease==null && journal.receipt==null && journal.submission==null;
 }
 
 // The production error policy is independently testable without starting a
@@ -98,7 +98,7 @@ export async function main(args=process.argv.slice(2)) {
       await assertExclusive(config);
       const batch=await runGracefulBatch(async()=>{
         try {
-          const result=await runBatch({portal,browser,config,journal});
+          const result=await runBatch({portal,browser,config,journal,shouldStop});
           if(config.liveActions && result.mode==='idle' && !await shouldStop()) {
             result.officialReconciliation=await reconcileIdle({portal,browser,config,
               journalState:await readJson(journal.file),record:await readJson(path.join(runtimeDir,'idle-reconcile.json')),

@@ -1,6 +1,6 @@
 import {readJson} from './journal.mjs';
 import {officialDiagnostic} from '../seat-executor/official-readiness.mjs';
-const settled=j=>!j || j.phase==='settled' && j.lease==null && j.receipt==null;
+const settled=j=>!j || j.phase==='settled' && j.lease==null && j.receipt==null && j.submission==null;
 const planOf=value=>value.plan??value;
 const browserSettings=c=>JSON.stringify(['profile','browserChannel','headless','browserMode','workspaceId','adminEmail',
   'workspaceName','workspaceSlug','totalSeats','reservedSeats','seatLabel','liveActions']

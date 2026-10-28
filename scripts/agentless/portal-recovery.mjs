@@ -14,7 +14,7 @@ export function validPortalFailure(code,meta) {
      (meta.stage==='status' && meta.requestedOperation==='seat_portal_status' && meta.requestNotSent===false));
 }
 export function journalClear(journal) {
-  return !journal || (journal.phase==='settled' && journal.lease==null && journal.receipt==null);
+  return !journal || (journal.phase==='settled' && journal.lease==null && journal.receipt==null && journal.submission==null);
 }
 export function recoverablePortalError(error) {
   return (error instanceof PortalReadUnavailable || error instanceof PortalQueueUnavailable) &&

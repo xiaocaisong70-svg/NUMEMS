@@ -81,7 +81,7 @@ export function restartDecision(input={}) {
     if(present(value) && !record(value))return deny(`invalid_${name}`);
   }
   // Even an apparently settled journal cannot override retained lease/evidence.
-  if(journal && (present(journal.lease) || present(journal.receipt)))return deny('retained_operation_evidence');
+  if(journal && (present(journal.lease) || present(journal.receipt) || present(journal.submission)))return deny('retained_operation_evidence');
   if(journal && journal.phase!=='settled')return deny('unsettled_or_invalid_journal');
 
   if(host) {
@@ -156,7 +156,7 @@ export function reviewRetryDecision(input={}) {
   const current=timeOf(now), base=restartDecision(input);
   if(base.reason!=='non_run_or_normal_exit' || !Number.isFinite(current))return deny('review_base_guard');
   const proof=adminResult?.reviewRetry;
-  if(lock!=null || intentDigest!=='absent' || journal?.phase!=='settled' || present(journal.lease) || present(journal.receipt) ||
+  if(lock!=null || intentDigest!=='absent' || journal?.phase!=='settled' || present(journal.lease) || present(journal.receipt) || present(journal.submission) ||
      status?.state!=='blocked' || !['browser_unavailable','unknown'].includes(status.failureCode) || status.modelCalls!==0 ||
      host?.mode!=='admin' || host.adminCommand!=='review-verified-operation' || host.state!=='blocked' ||
      !Number.isInteger(host.exitCode) || host.exitCode<=0 || present(host.error) || !positivePid(host.processId) ||

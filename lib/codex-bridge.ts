@@ -1,6 +1,7 @@
 import { PROTECTED_OWNER_EMAIL, AUTHORIZED_TEST_EMAIL, transition, type State, type Actor } from "./seat-engine.ts";
 import { invitationDeadline } from "./queue-estimate.ts";
-import { publicFaultRescue, publicRecoveryProgress, rescueBlocksClaims, type FaultRescueTicket, type RecoveryProgress } from './recovery-control.ts';
+import { publicFaultRescue, publicRecoveryProgress, rescueBlocksClaims, requireRescueExecution, executionRescueAvailability,
+  type FaultRescueTicket, type RecoveryProgress, type RescueExecutionIncident, type RescueExecutionHistory } from './recovery-control.ts';
 
 export const TARGET_WORKSPACE_ID = "cd01c344-8ff9-41fd-a750-f7b30af9a7c9";
 export const TEST_EMAIL = AUTHORIZED_TEST_EMAIL;
@@ -14,6 +15,8 @@ export type Lease = {
   email: string; requestId: string; claimedAt: string; expiresAt: string;
   expectedExpiry?: string; status: "claimed" | "uncertain";
   originalPresence?: "member" | "invite" | "absent";
+  rescueId?:string;rescueFailureId?:string;rescueRequestUpdatedAt?:string;
+  actionAuthorizedAt?:string;actionAuthorizationExpiresAt?:string;
 };
 export const FAILURE_CODES = ["mail_delivery", "member_action", "approval_required",
   "browser_unavailable", "login_expired", "workspace_mismatch", "capacity_mismatch", "role_mismatch", "unknown"] as const;
@@ -35,6 +38,7 @@ export type BridgeState = State & {
     browserUnavailableAt?: string; workspaceReviewedAt?: string;
     operationFailureOrigin?: OperationFailureOrigin;
     recoveryProgress?: RecoveryProgress; faultRescue?: FaultRescueTicket;
+    rescueExecutionIncident?:RescueExecutionIncident;rescueExecutionHistory?:RescueExecutionHistory[];
     receipts: { id: string; kind: string; email: string; at: string; evidence: string }[];
     reviewReceipts?: { failureId: string; targetId: string; operationId: string; workspaceId: string; observedAt: string; reviewedAt: string }[];
   };
@@ -314,7 +318,8 @@ export function workPlan(input: BridgeState, now: string) {
     globalFailureId: b?.globalFailureCode ? latestWorkspaceFailureId(input) : null,
     workspaceReviewedAt: b?.workspaceReviewedAt ?? null,
     officialObservedAt: b?.observation?.observedAt ?? null,
-    recoveryProgress: publicRecoveryProgress(input), faultRescue: publicFaultRescue(input),
+    recoveryProgress: publicRecoveryProgress(input,now), faultRescue: publicFaultRescue(input,{includeTargets:true}),
+    memberRescue:executionRescueAvailability(input,now),
     browserRecovery: b?.globalFailureCode === "browser_unavailable" && b.browserUnavailableAt && !b.lease
       ? { eligible: true, blockedAt: b.browserUnavailableAt } : null,
     blockedOperations: b?.holds ?? [],
@@ -335,12 +340,16 @@ export function workPlan(input: BridgeState, now: string) {
   };
 }
 export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId: string,
-    token: string, now: string): BridgeState {
+    token: string, now: string, rescue?:{rescueId:string;token:string;expectedFailureId:string}): BridgeState {
   const next = structuredClone(input); const b = bridge(next);
   if (!b.enabled) throw new Error("Codex 执行器尚未启用。");
-  if (rescueBlocksClaims(next)) throw new Error("故障诊断尚未交还执行权，禁止新的成员或邮件操作。");
+  const ticket=rescue?requireRescueExecution(next,rescue,now):null;
+  const grant=ticket?.targets?.find(t=>t.kind===kind&&t.targetId===targetId);
+  if(ticket&&(!grant||grant.operationId||kind==='mail'||b.rescueExecutionIncident?.claimedTargets.some(t=>t.kind===kind&&t.targetId===targetId)))
+    throw new Error('目标不在本次冻结范围或已消耗领取额度。');
+  if (rescueBlocksClaims(next)&&!ticket) throw new Error("故障诊断尚未交还执行权，禁止新的成员或邮件操作。");
   if ((b.lastError || b.globalFailureCode) && !b.lease &&
-      !(kind === "mail" && b.globalFailureCode === "browser_unavailable" && b.browserUnavailableAt))
+      !ticket && !(kind === "mail" && b.globalFailureCode === "browser_unavailable" && b.browserUnavailableAt))
     throw new Error("执行器有未解决错误，请先核实。");
   if (b.lease) throw new Error("已有办理未结束；结果不明时必须先核对，不能重试。");
   let email: string, requestId: string, expectedExpiry: string | undefined;
@@ -359,10 +368,12 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
     const r = next.requests.find(r => r.id === targetId);
     if (!r || r.status !== (kind === "invite" ? "pending_invite" : "pending_removal"))
       throw new Error("申请状态已变化，不能执行此操作。");
+    if(grant&&(grant.email!==r.email||grant.requestUpdatedAt!==r.updatedAt))throw new Error('冻结目标的申请已变化，禁止执行旧计划。');
     if (kind === "invite" && !next.config.whitelist.includes(r.email))
       throw new Error("员工白名单授权已撤销，不能发送新的工作空间邀请。");
     if (!b.observation) throw new Error("缺少官方成员证据。");
     const s = validateObservation(b.observation, now);
+    if(ticket)validateRescueInventory(next,s,now);
     const member = s.members.find(p => norm(p.email) === r.email);
     const invitation = s.invites.find(p => norm(p.email) === r.email);
     originalPresence = member ? "member" : invitation ? "invite" : "absent";
@@ -391,21 +402,74 @@ export function claimOperation(input: BridgeState, kind: Lease["kind"], targetId
   if (b.testOnly && email !== TEST_EMAIL) throw new Error("测试模式只能处理指定测试邮箱。");
   b.lease = { id: "op_" + token, token, kind, targetId, email, requestId, claimedAt: now,
     expiresAt: new Date(time(now) + 2 * minute).toISOString(), status: "claimed", expectedExpiry, originalPresence };
+  if(ticket&&grant){b.lease.rescueId=ticket.id;b.lease.rescueFailureId=ticket.failureId;
+    b.lease.rescueRequestUpdatedAt=grant.requestUpdatedAt;grant.operationId=b.lease.id;grant.claimedAt=now;
+    b.rescueExecutionIncident!.claimedTargets.push({kind:kind as 'invite'|'remove',targetId});}
   b.lastRunAt = now;
   record(next, "codex_claim_" + kind, now, requestId);
   return next;
 }
+type RescueCredential={rescueId:string;token:string;expectedFailureId:string};
+function strictRescueArgs(args:unknown,keys:string[]) {
+  if(!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).sort().join(',')!==[...keys].sort().join(',')||
+      Object.values(args).some(v=>typeof v!=='string'||!v||v.length>240))throw new Error('执行型处置参数无效。');
+}
+function validateRescueInventory(input:BridgeState,s:Observation,now:string) {
+  validateObservation(s,now);const entries=[...s.members,...s.invites];
+  if(s.totalSeats!==input.config.totalSeats||entries.length>s.totalSeats||new Set(entries.map(p=>norm(p.email))).size!==entries.length||
+      s.members.some(p=>norm(p.email)===PROTECTED_OWNER_EMAIL?p.role!=='owner':p.role!=='member')||s.invites.some(p=>p.role!=='member'))
+    throw new Error('执行型处置的容量、角色或完整名单异常。');
+}
+export function claimRescueOperation(input:BridgeState,args:RescueCredential&{kind:'invite'|'remove';targetId:string},operationToken:string,now:string) {
+  strictRescueArgs(args,['rescueId','token','expectedFailureId','kind','targetId']);
+  if(!['invite','remove'].includes(args.kind))throw new Error('后备仅可办理已批准成员目标。');
+  return claimOperation(input,args.kind,args.targetId,operationToken,now,args);
+}
+export function authorizeRescueAction(input:BridgeState,args:RescueCredential&{operationId:string;operationToken:string},now:string) {
+  strictRescueArgs(args,['rescueId','token','expectedFailureId','operationId','operationToken']);
+  const next=structuredClone(input),t=requireRescueExecution(next,args,now),b=bridge(next),op=b.lease;
+  if(!op||op.id!==args.operationId||op.token!==args.operationToken||op.rescueId!==t.id||op.rescueFailureId!==t.failureId||op.status!=='claimed'||
+      time(now)>=time(op.expiresAt))throw new Error('原执行租约不匹配、已过期或结果不明。');
+  if(!t.targets?.some(target=>target.operationId===op.id&&target.kind===op.kind&&target.targetId===op.targetId&&target.email===op.email))
+    throw new Error('原租约不在本票据的已领取目标中。');
+  if(op.actionAuthorizedAt)throw new Error('本次租约已授予一次写权限，禁止重复授权。');
+  const r=next.requests.find(r=>r.id===op.requestId);
+  if(!r||r.email!==op.email||r.updatedAt!==op.rescueRequestUpdatedAt||r.status!==(op.kind==='invite'?'pending_invite':'pending_removal')||
+      op.kind==='invite'&&!next.config.whitelist.includes(r.email)||next.config.protectedEmails.includes(r.email)||r.email===PROTECTED_OWNER_EMAIL)
+    throw new Error('写入前的申请、续期或授权状态已变化。');
+  if(!b.observation||time(b.observation.observedAt)<time(op.claimedAt))throw new Error('写入授权需要领取后的新鲜完整官方证据。');
+  validateRescueInventory(next,b.observation,now);
+  const member=b.observation.members.find(p=>norm(p.email)===op.email),invite=b.observation.invites.find(p=>norm(p.email)===op.email);
+  if(op.kind==='invite'&&(member||invite||b.observation.members.length+b.observation.invites.length>=b.observation.totalSeats))throw new Error('目标已存在或实际容量不足，禁止邀请。');
+  if(op.kind==='remove'&&(!member&&!invite||member&&member.role!=='member'||invite&&invite.role!=='member'||
+      ['invitation_expired','whitelist_revoked'].includes(r.removalReason??'')&&!!member))throw new Error('目标状态已变化，禁止此移除。');
+  op.actionAuthorizedAt=now;op.actionAuthorizationExpiresAt=new Date(Math.min(time(op.expiresAt),time(t.expiresAt!))).toISOString();
+  record(next,'codex_rescue_authorize_'+op.kind,now,op.requestId);return next;
+}
 export function completeOperation(input: BridgeState, args: {
-    operationId: string; token: string; outcome: "verified" | "joined" | "uncertain" | "blocked";
+    operationId: string; token: string; outcome: "verified" | "joined" | "uncertain" | "blocked" | 'not_started';
     observation?: Observation; providerMessageId?: string; detail?: string; failureCode?: FailureCode; invitationSentAt?: string;
   }, now: string): BridgeState {
   let next = structuredClone(input); let b = bridge(next);
-  if (!["verified", "joined", "uncertain", "blocked"].includes(args.outcome)) throw new Error("办理结果无效。");
+  if (!["verified", "joined", "uncertain", "blocked",'not_started'].includes(args.outcome)) throw new Error("办理结果无效。");
   const hold = b.holds?.find(h => h.operation.id === args.operationId && h.operation.token === args.token);
   const op = b.lease?.id === args.operationId ? b.lease : hold?.operation;
   if (!op && ["verified", "joined"].includes(args.outcome) && b.receipts.some(r => r.id === args.operationId)) return next;
+  if(!op&&args.outcome==='not_started'&&b.receipts.some(r=>r.id===args.operationId&&r.kind==='not_started'))return next;
   if (!op || op.id !== args.operationId || op.token !== args.token) throw new Error("执行回执不匹配。");
   if (hold && b.lease) throw new Error("其他操作正在办理，请稍后核对隔离记录。");
+  if(args.outcome==='not_started') {
+    if(!op.rescueId||hold||op.status!=='claimed'||op.actionAuthorizedAt||b.faultRescue?.id!==op.rescueId)
+      throw new Error('只能结清从未获得写权限的原执行型租约。');
+    const s=validateObservation(args.observation!,now);if(time(s.observedAt)<time(op.claimedAt))throw new Error('未开始结案需要领取后的完整官方证据。');
+    delete b.lease;next=observeWorkspace(next,s,now);b=bridge(next);
+    b.receipts.push({id:op.id,kind:'not_started',email:op.email,at:now,evidence:s.pageUrl});b.receipts=b.receipts.slice(-500);
+    record(next,'codex_rescue_not_started',now,op.requestId);return next;
+  }
+  if(op.rescueId&&['verified','joined'].includes(args.outcome)&&!op.actionAuthorizedAt)
+    throw new Error('执行型租约未获得写权限；未开始的操作须提交not_started证据。');
+  if(op.rescueId&&op.kind==='invite'&&args.outcome==='verified'&&!args.invitationSentAt)
+    throw new Error('执行型邀请必须提供本次实际提交时间，不能用核对时刻重置加入窗口。');
   if (args.outcome === "joined") {
     if (op.kind !== "remove" || op.originalPresence !== "invite" ||
         !["invitation_expired", "whitelist_revoked"].includes(next.requests.find(r => r.id === op.requestId)?.removalReason ?? ""))
@@ -434,6 +498,11 @@ export function completeOperation(input: BridgeState, args: {
       throw new Error("已取得操作租约，不能归类为未开始操作的浏览器暂不可用；须核对真实结果。");
     const detail = (args.detail ?? "操作结果不明，请先核对真实状态。").slice(0, 500);
     op.status = "uncertain";
+    if(op.rescueId&&!isIsolated(code)&&code==='unknown') {
+      if(b.faultRescue?.id!==op.rescueId)throw new Error('原后备执行票据不匹配。');
+      b.faultRescue.phase='uncertain';b.faultRescue.updatedAt=now;b.faultRescue.operationId=op.id;
+      record(next,'codex_rescue_operation_uncertain',now,op.requestId);return next;
+    }
     if (isIsolated(code)) {
       b.holds ??= [];
       if (hold) { hold.code = code; hold.detail = detail; }
@@ -476,6 +545,8 @@ export function completeOperation(input: BridgeState, args: {
     if (op.kind === "remove" && (member || invited)) throw new Error("目标邮箱仍在成员或邀请列表中。");
     origin = resolvedOperationOrigin(next, op, s);
     if (op.kind === "invite" && args.invitationSentAt) {
+      if (op.rescueId && time(args.invitationSentAt) < time(op.actionAuthorizedAt!))
+        throw new Error("执行型邀请发出时间不得早于本次写入授权。");
       if (time(args.invitationSentAt) < time(op.claimedAt) || time(args.invitationSentAt) > time(s.observedAt))
         throw new Error("邀请发出时间必须位于本次实际办理与核实之间。");
       const r = next.requests.find(r => r.id === op.requestId);

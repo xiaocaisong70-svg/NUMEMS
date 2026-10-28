@@ -9,7 +9,7 @@ import {loadConfig,runtimeDir} from './config.mjs';
 import {readJson,atomicJson} from './journal.mjs';
 import {restartDecision,reviewRetryDecision} from './watchdog-policy.mjs';
 import {browserRetryDecision} from './browser-retry-policy.mjs';
-import {faultRescueGate,faultRescueFile,dispatchPreparedFaultRescue,reconcileFaultRescueDispatch,
+import {faultRescueGate,faultRescueFile,faultRescueDeadline,dispatchPreparedFaultRescue,reconcileFaultRescueDispatch,
   settleFaultRescue} from './fault-rescue.mjs';
 const execute=promisify(execFile);
 const file=path.join(runtimeDir,'watchdog.json');
@@ -84,7 +84,7 @@ export function faultRescueRestartDecision({host,status,journal,adminResult,resc
   if(!rescue||!faultRescueGate(rescue).allowWorker||rescue.outcome!=='recovered'||rescue.phase!=='finished'||
     !faultRescueHostSafe({host,lock:null,stopRequest,processClear:true,now})||host.mode!=='admin'||
     host.adminCommand!=='finish-fault-rescue'||host.state!=='exited'||host.exitCode!==0||
-    journal?.phase!=='settled'||journal.lease!=null||journal.receipt!=null||
+    journal?.phase!=='settled'||journal.lease!=null||journal.receipt!=null||journal.submission!=null||
     status?.mode!=='idle'||status.state!=null||status.failureCode||status.error||status.liveActions!==true||status.modelCalls!==0||
     status.faultRescueEvidence?.rescueId!==rescue.ticket?.id||status.faultRescueEvidence?.failureId!==rescue.failureId||
     adminResult?.command!=='finish-fault-rescue'||adminResult.requestId!==rescue.ticket?.id||adminResult.success!==true||adminResult.modelCalls!==0||
@@ -118,7 +118,7 @@ export async function superviseLocalContextRecovery({directory,config,host,statu
     return report('local_context_cutover_disabled');
   const rescue=await readJson(faultRescueFile(directory));
   if(!faultRescueGate(rescue).allowWorker)return report('fault_rescue_owns_recovery');
-  if(journal?.phase!=='settled'||journal.lease!=null||journal.receipt!=null)
+  if(journal?.phase!=='settled'||journal.lease!=null||journal.receipt!=null||journal.submission!=null)
     return report('local_context_original_operation_unsettled');
   if(!faultRescueHostSafe({host,lock,stopRequest,processClear,now:now().getTime()}))return report('local_context_host_not_closed');
   const retryFile=path.join(directory,'local-context-retry.json'),previous=await readJson(retryFile);
@@ -167,24 +167,40 @@ export async function superviseFaultRescue({directory,config,host,status,journal
     await save(result);return {handled:true,result};
   };
   const active=r&&!faultRescueGate(r).allowWorker;
-  const candidate=config.faultRescue?.enabled===true&&config.faultRescue.scope==='read_only_reconcile'&&
+  const candidate=config.faultRescue?.enabled===true&&['read_only_reconcile','approved_member_ops'].includes(config.faultRescue.scope)&&
     config.liveActions===true&&status?.state==='blocked'&&status.faultRescueEligible===true&&rescueCodes.has(status.failureCode);
   const health=r?.phase==='finished'?await readJson(path.join(directory,'browser-retry.json')):null;
   const newerHealth=health?.version===2&&health.state==='healthy'&&stamp(health.officialObservedAt)&&stamp(r?.createdAt)&&
     Date.parse(health.officialObservedAt)>Date.parse(r.createdAt);
-  const postRetry=r?.phase==='finished'&&r.outcome==='unresolved'&&r.failureCode==='browser_unavailable'&&
-    !newerHealth&&status?.state==='blocked'&&status.failureCode==='browser_unavailable'&&journal?.phase==='settled'&&journal.lease==null&&journal.receipt==null;
+  const postRetry=r?.phase==='finished'&&['unresolved','handled'].includes(r.outcome)&&r.failureCode==='browser_unavailable'&&
+    !newerHealth&&status?.state==='blocked'&&status.failureCode==='browser_unavailable'&&journal?.phase==='settled'&&journal.lease==null&&journal.receipt==null&&journal.submission==null;
   if(!active&&!candidate&&!postRetry)return {handled:false,rescue:r};
   if(config.liveActions!==true||config.browserMode!=='isolated_desktop'||config.headless!==false||config.legacyCheckerDisabled!==true)
     return active?report('fault_rescue_cutover_disabled'):{handled:false,rescue:r};
   if(!faultRescueHostSafe({host,lock,stopRequest,processClear,now:now().getTime()}))return report('fault_rescue_host_not_closed');
+  // Current work, deadlines and server quotas are checked by ordinary code at
+  // least every supervisor minute. Never sleep 30 minutes on stale local work.
+  let planCheck=await readJson(path.join(directory,'fault-rescue-plan.json')),preparedThisTick=false;
+  if(config.faultRescue?.scope==='approved_member_ops'&&!active&&candidate&&
+    (!stamp(planCheck?.checkedAt)||now().getTime()-Date.parse(planCheck.checkedAt)>=60_000)) {
+    try {await runAdmin('prepare-fault-rescue');}catch{}
+    preparedThisTick=true;
+    const proof=await refreshSafety();r=await readJson(faultRescueFile(directory));
+    planCheck=await readJson(path.join(directory,'fault-rescue-plan.json'));
+    if(!faultRescueHostSafe({...proof,now:now().getTime()}))return report('fault_rescue_prepare_host_not_closed');
+    if(!r)return report(planCheck?.pendingCount===0?'no_valid_pending_work':
+      planCheck?.rescueCanBegin===false?'member_rescue_'+planCheck.rescueReason:'fault_rescue_prepare_unavailable');
+  }
+  const pendingWork=Number.isSafeInteger(planCheck?.pendingCount)&&planCheck.pendingCount>0&&stamp(planCheck.checkedAt)&&
+    now().getTime()-Date.parse(planCheck.checkedAt)<=65_000;
   // An ended, unresolved model does not disable finite deterministic recovery.
   // These reads retain backoff across restarts and never create another wake.
-  if(postRetry) {
+  if(postRetry&&r?.phase==='finished') {
     const delays=[60_000,120_000,300_000,600_000,900_000,1_800_000];
     const n=r.readOnlyRetry?.attempts??0,anchor=r.readOnlyRetry?.requestedAt??r.updatedAt;
     if(!Number.isSafeInteger(n)||n<0||!stamp(anchor)||Date.parse(anchor)>now().getTime())return report('fault_rescue_retry_evidence_invalid');
-    const dueAt=new Date(Date.parse(anchor)+delays[Math.min(n,delays.length-1)]).toISOString();
+    const delay=pendingWork?60_000:delays[Math.min(n,delays.length-1)];
+    const dueAt=new Date(Date.parse(anchor)+delay).toISOString();
     if(now().getTime()<Date.parse(dueAt))return report('fault_rescue_read_only_backoff',{dueAt});
     r={...r,readOnlyRetry:{attempts:n+1,requestedAt:now().toISOString()}};await atomicJson(faultRescueFile(directory),r);
     try {await runAdmin('recover-browser');}
@@ -197,22 +213,34 @@ export async function superviseFaultRescue({directory,config,host,status,journal
     try {await runProbe();}catch{return report('fault_rescue_recovery_probe_unavailable');}
     return report('fault_rescue_recovery_probe_exited');
   }
-  if(r?.phase==='finished'&&r.outcome==='unresolved'&&!newerHealth)return {handled:false,rescue:r};
+  if(r?.phase==='finished'&&['unresolved','handled'].includes(r.outcome)&&!newerHealth)return {handled:false,rescue:r};
   if(r?.phase==='finished'&&!candidate)return {handled:false,rescue:r};
-  if(config.faultRescue?.enabled!==true||config.faultRescue.scope!=='read_only_reconcile')return report('fault_rescue_dispatch_disabled');
+  if(config.faultRescue?.enabled!==true||!['read_only_reconcile','approved_member_ops'].includes(config.faultRescue.scope))return report('fault_rescue_dispatch_disabled');
   if(!r||r.phase==='finished'||['preparing','uncertain'].includes(r.phase)&&!r.dispatchStartedAt&&r.reason!=='dispatch_intent_already_exists') {
     try {await runAdmin('prepare-fault-rescue');}catch{}
+    preparedThisTick=true;
     const proof=await refreshSafety();r=await readJson(faultRescueFile(directory));
     if(!faultRescueHostSafe({...proof,now:now().getTime()}))return report('fault_rescue_prepare_host_not_closed');
     if(!r)return report('fault_rescue_prepare_unavailable');
     if(r.phase==='finished')return report('fault_rescue_same_incident_not_repeated');
   }
   if(r.phase==='prepared') {
+    if(r.ticket?.scope==='approved_member_ops'&&!preparedThisTick) {
+      try {await runAdmin('prepare-fault-rescue');}catch{}
+      const proof=await refreshSafety();r=await readJson(faultRescueFile(directory));
+      if(!faultRescueHostSafe({...proof,now:now().getTime()}))return report('fault_rescue_prepare_host_not_closed');
+      if(!r||r.phase!=='prepared')return report('fault_rescue_pre_dispatch_recheck_changed');
+    }
+    const deadline=faultRescueDeadline(r);
+    if(r.pendingCount===0||deadline!==null&&now().getTime()>=deadline) {
+      try {await runAdmin('finish-fault-rescue',r.ticket.id);}catch{}
+      r=await readJson(faultRescueFile(directory));return report('fault_rescue_expired_or_cancelled_before_dispatch');
+    }
     const result=await withClient(client=>dispatchPreparedFaultRescue({directory,client,hostSafe:true,projectRoot,clock:now}));
     r=await readJson(faultRescueFile(directory));return report('fault_rescue_dispatch_'+result.state);
   }
-  if(!r.dispatchStartedAt||r.outcome==='uncertain'&&r.agentStopped===true)return report('fault_rescue_ownership_unresolved');
-  let stopped=false;
+  if(!r.dispatchStartedAt)return report('fault_rescue_ownership_unresolved');
+  let stopped=false,observationReason;
   await withClient(async client=>{
     if(['sending','uncertain'].includes(r.phase))await reconcileFaultRescueDispatch({directory,client,clock:now});
     r=await readJson(faultRescueFile(directory));
@@ -222,11 +250,11 @@ export async function superviseFaultRescue({directory,config,host,status,journal
       proof.stopped===true&&proof.threadId===r.threadId&&proof.clientUserMessageId===r.clientId&&finalTurnStates.has(proof.status)&&
       stamp(proof.observedAt)&&now().getTime()-Date.parse(proof.observedAt)<=60_000&&Date.parse(proof.observedAt)<=now().getTime()+5000;
     if(stopped) {r={...r,watchdogStopProof:proof};await atomicJson(faultRescueFile(directory),r);}
-    else await settleFaultRescue({directory,hostSafe:true,clock:now,
+    else observationReason=(await settleFaultRescue({directory,hostSafe:true,clock:now,
       client:{observeTurnState:async()=>proof,interruptTrackedTurn:(...args)=>client.interruptTrackedTurn(...args)},
-      portal:{call:async()=>{throw new Error('No metadata host may start while the diagnostic turn is active.');}}});
+      portal:{call:async()=>{throw new Error('No metadata host may start while the diagnostic turn is active.');}}})).reason;
   });
-  if(!stopped)return report('fault_rescue_agent_stop_unconfirmed');
+  if(!stopped)return report(observationReason==='agent_deadline_expired_stop_unconfirmed'?observationReason:'fault_rescue_agent_stop_unconfirmed');
   try {await runAdmin('finish-fault-rescue',r.ticket.id);}catch{}
   const proof=await refreshSafety();r=await readJson(faultRescueFile(directory));
   if(!faultRescueHostSafe({...proof,now:now().getTime()}))return report('fault_rescue_finish_host_not_closed');

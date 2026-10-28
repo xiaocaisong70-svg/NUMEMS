@@ -13,8 +13,9 @@ const releases = new Map([
   ['agentless-v11','59a43e80f55d93419c2e8dc010e4ea2e998a8427'],
   ['agentless-v12','aa41d10d4d1481c472d6073a232dcdaaa94b1948'],
   ['agentless-v13','336b98236f694c3ea574e970efaaf29361b0e909'],
+  ['agentless-v14','fa24df3f901368edfa9936ee3ed193d25ab39c76'],
 ]);
-const requested=process.argv[2]??'agentless-v13';
+const requested=process.argv[2]??'agentless-v14';
 if(process.argv.length>3 || !releases.has(requested))throw new Error('Unknown release; use a documented release name.');
 const manifest = JSON.parse(await readFile(path.join(root, `releases/${requested}/manifest.json`), 'utf8'));
 if (manifest.schemaVersion !== 1 || manifest.release !== requested ||

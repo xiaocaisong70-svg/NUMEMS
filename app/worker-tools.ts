@@ -3,6 +3,7 @@ import { useEffect } from "react";
 
 const operations = ["defer_seat_operation", "review_seat_failure", "seat_portal_status", "process_seat_queue", "observe_workspace",
   "prepare_test_request", "claim_seat_operation", "complete_seat_operation",
+  "fault_rescue_status", "begin_fault_rescue", "claim_rescue_operation", "authorize_rescue_action",
   "release_test_request", "set_test_deadline", "set_codex_live", "record_codex_schedule"];
 type Registry = { registerTool(tool: {
   name: string; description: string; inputSchema: object;

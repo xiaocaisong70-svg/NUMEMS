@@ -17,6 +17,7 @@ async function fixture(t) {
     lastError:'sensitive-provider-body-not-for-prompt',removals:[{id:'req_one',email:'private@example.test'}],invites:[],awaitingAcceptance:[]};
   let ticket;
   const portal={async call(name,args){
+    if(name==='refresh_seat_queue')return{mailMode:'in_app'};
     if(name==='seat_portal_status')return{plan};
     if(name==='begin_fault_rescue'){begins++;if(!ticket||ticket.failureId!==plan.globalFailureId)ticket={id:'rescue-fixture-'+begins,token:'fixture-only-token-never-print',failureId:plan.globalFailureId,phase:'pending',scope:'read_only_reconcile'};return{ticket:{...ticket},plan};}
     if(name==='fault_rescue_status')return{ticket:ticket?{...ticket,token:undefined}:null,plan};

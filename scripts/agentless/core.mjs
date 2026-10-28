@@ -27,23 +27,36 @@ const safeCode = error => ['member_action','approval_required','login_expired','
   'capacity_mismatch','role_mismatch','browser_unavailable'].includes(error.failureCode) ? error.failureCode : 'unknown';
 const fatalObservationCodes = new Set(['login_expired','workspace_mismatch','capacity_mismatch','role_mismatch']);
 const incompleteObservation = error => error instanceof InventoryMismatchError || error.failureCode==='browser_unavailable';
+export const MEMBER_OPERATION_BUDGETS=Object.freeze({totalMs:120000,preflightMs:40000,freshMs:25000,actionMs:35000,verificationMs:35000});
+const budgetError=()=>Object.assign(new StopError('本次成员办理的控制预算已用尽；保留原记录，禁止盲目重发。','browser_unavailable'),{code:'OPERATION_BUDGET_EXHAUSTED'});
+function remaining(deadlineAt,now) {const value=Math.floor(deadlineAt-now());if(value<=0)throw budgetError();return value;}
+function readControls(deadlineAt,now,shouldStop) {return {deadlineAt,budgetMs:Math.min(60000,remaining(deadlineAt,now)),now,...(shouldStop?{shouldStop}:{})};}
+async function observeWithin(browser,deadlineAt,now,shouldStop) {
+  const snapshot=await browser.observe(readControls(deadlineAt,now,shouldStop));
+  remaining(deadlineAt,now);return snapshot;
+}
 
 // Called only after the cloud plan and local journal confirm no outstanding
 // lease and strictly before claim_seat_operation. Never use in post-claim
 // reconciliation: a prior external result could be uncertain there.
-export async function observeBeforeClaim(browser, {pause=ms=>new Promise(resolve=>setTimeout(resolve,ms))}={}) {
-  try { return await browser.observe(); }
+export async function observeBeforeClaim(browser, {pause=ms=>new Promise(resolve=>setTimeout(resolve,ms)),
+  deadlineAt=Date.now()+40000,now=Date.now,shouldStop}={}) {
+  try { return await observeWithin(browser,deadlineAt,now,shouldStop); }
   catch (error) {
     if (!(error instanceof InventoryMismatchError)) throw error;
-    await pause(1000);
-    return browser.observe(); // One bounded re-read; preserve the same complete-evidence checks.
+    await pause(Math.min(1000,remaining(deadlineAt,now)));
+    return observeWithin(browser,deadlineAt,now,shouldStop); // One bounded re-read; preserve the same complete-evidence checks.
   }
 }
 
 /** Fresh plan for every item. No API for starting or messaging an Agent exists here. */
 export async function runBatch({ portal, browser, config, journal,
   clock = () => new Date(), maxItems = config.maxItems ?? 6,
-  pause = ms => new Promise(resolve=>setTimeout(resolve,ms)) }) {
+  pause = ms => new Promise(resolve=>setTimeout(resolve,ms)),shouldStop=async()=>false,budgets=MEMBER_OPERATION_BUDGETS }) {
+  budgets={...MEMBER_OPERATION_BUDGETS,...budgets};
+  if(Object.entries(budgets).some(([key,value])=>!Object.hasOwn(MEMBER_OPERATION_BUDGETS,key)||!Number.isInteger(value)||value<1||value>(key==='totalMs'?120000:key==='actionMs'?45000:60000)))
+    throw new Error('Invalid bounded member operation timing.');
+  const now=()=>clock().getTime(),stopped=actions=>({mode:actions.length?'processed':'idle',actions,stopped:true,modelCalls:0});
   let plan = planOf(await portal.call('seat_portal_status'));
   if (!config.liveActions) return { mode: 'dry_run', modelCalls: 0,
     pending: Object.fromEntries(['invites','removals','reminders','awaitingAcceptance']
@@ -56,6 +69,7 @@ export async function runBatch({ portal, browser, config, journal,
   const actions = [], seen = new Set();
   let jobs;
   for (let index = 0; index < maxItems; index++) {
+    if(await shouldStop())return stopped(actions);
     // Production uses the endpoint whose contract excludes mail and all external
     // actions. Legacy/mock adapters retain their existing queue interface.
     jobs = typeof portal.refreshQueue==='function' ? await portal.refreshQueue()
@@ -73,12 +87,14 @@ export async function runBatch({ portal, browser, config, journal,
     const target = next ?? (acceptance ? {kind:'acceptance',item:acceptance} : null);
     if (!target) break;
     const {kind,item} = target;
+    const deadlineAt=now()+budgets.totalMs,preflightDeadline=Math.min(deadlineAt,now()+budgets.preflightMs);
     seen.add(`${kind}:${item.id}`);
     let before;
     try {
-      before = await observeBeforeClaim(browser);
+      before = await observeBeforeClaim(browser,{pause,deadlineAt:preflightDeadline,now,shouldStop});
       await portal.call('observe_workspace', {observation:bridgeObservation(before)});
     } catch (error) {
+      if(error.code==='OFFICIAL_READ_CANCELLED' && await shouldStop())return stopped(actions);
       // The identity GET failed BEFORE observe_workspace was sent. Do not mark
       // an untouched target unknown; main still requires a settled journal.
       if(recoverablePortalError(error) && error.metadata.requestNotSent===true)throw error;
@@ -110,13 +126,22 @@ export async function runBatch({ portal, browser, config, journal,
       throw error;
     }
     if (kind === 'acceptance') { actions.push({kind,targetId:item.id,outcome:'checked'}); continue; }
-    plan = planOf(await portal.call('seat_portal_status'));
+    if(await shouldStop())return stopped(actions);
+    if(now()>=deadlineAt)return {mode:'processed',actions:[...actions,{kind,targetId:item.id,outcome:'not_started',reason:'budget_exhausted'}],modelCalls:0};
+    plan = planOf(await portal.call('seat_portal_status',{},readControls(deadlineAt,now)));
     if(cloudRecoveryOwned(plan))return {mode:'fault_rescue_pending',actions,modelCalls:0};
     if (!guard(plan,config)) break;
     const current = (kind === 'remove' ? plan.removals : plan.invites)
       .find(r => r.id === item.id && r.email === item.email && !held(plan,kind,r));
     if (!current) { actions.push({kind,targetId:item.id,outcome:'state_changed'}); continue; }
+    if(await shouldStop())return stopped(actions);
     await journal?.prepare({kind,targetId:item.id,email:item.email});
+    const cancelled=await shouldStop()?'stop_requested':now()>=deadlineAt?'budget_exhausted':null;
+    if(cancelled) {
+      await journal?.cancelUnsentPreparation?.({kind,targetId:item.id,email:item.email},cancelled);
+      if(cancelled==='stop_requested')return stopped(actions);
+      return {mode:'processed',actions:[...actions,{kind,targetId:item.id,outcome:'not_started',reason:cancelled}],modelCalls:0};
+    }
     let claimed;
     try {claimed=await portal.call('claim_seat_operation', {kind,targetId:item.id});}
     catch(error) {
@@ -134,6 +159,21 @@ export async function runBatch({ portal, browser, config, journal,
     await journal?.claimed(lease);
     let attempted = false, sentAt, finishStarted = false;
     browser.onExternalAction = async () => { attempted = true; await journal?.attempting(); };
+    browser.onExternalActionCommitted=async submission=>{
+      if(!attempted||kind!=='invite'||submission?.kind!=='invite'||submission.email!==lease.email||
+          !Number.isFinite(Date.parse(submission.invitationSentAt))||Date.parse(submission.invitationSentAt)<Date.parse(lease.claimedAt)||
+          Date.parse(submission.invitationSentAt)>now()+5000)
+        throw new StopError('邀请提交时间与原租约不符，保留原记录。');
+      sentAt=submission.invitationSentAt;
+      await journal?.submitted?.({operationId:lease.id,token:lease.token,...submission});
+    };
+    let verificationAttempts=0,verificationDeadline;
+    const verify=async()=>{
+      verificationDeadline??=Math.min(deadlineAt,now()+budgets.verificationMs);
+      if(verificationAttempts>=4)throw budgetError();
+      verificationAttempts++;
+      return observeWithin(browser,verificationDeadline,now);
+    };
     const finish = async (after, outcome = 'verified') => {
       finishStarted = true;
       const args = {operationId:lease.id,token:lease.token,outcome,observation:bridgeObservation(after),
@@ -158,16 +198,17 @@ export async function runBatch({ portal, browser, config, journal,
     };
     try {
       // Recheck after claim, including role. Never revoke a joined member for invite timeout.
-      const fresh = await browser.observe();
+      const fresh = await observeWithin(browser,Math.min(deadlineAt,now()+budgets.freshMs),now);
       assertTarget(fresh);
       if (joined(fresh)) { await finish(fresh,'joined'); continue; }
       if (kind === 'remove' && invitationOnly &&
           presence(fresh,lease.email) === 'member') throw new StopError('邀请超时目标已加入，保留成员并停止。');
       if (!verified(fresh)) {
-        if (kind === 'invite') sentAt = await browser.invite(lease.email,fresh);
-        else await browser.remove(lease.email,fresh);
+        const actionOptions={deadlineAt,budgetMs:Math.min(budgets.actionMs,remaining(deadlineAt,now)),now};
+        if (kind === 'invite') sentAt = (await browser.invite(lease.email,fresh,actionOptions))??sentAt;
+        else await browser.remove(lease.email,fresh,actionOptions);
       }
-      const after = await browser.observe();
+      const after = await verify();
       assertTarget(after);
       if (joined(after)) await finish(after,'joined');
       else if (verified(after)) await finish(after);
@@ -185,16 +226,16 @@ export async function runBatch({ portal, browser, config, journal,
         throw blockedWithDiagnostic('原操作回执写入未确认；保留原租约与本地证据，禁止重复提交。',error);
       }
       if(operationDiagnostic)await journal?.update?.({operationDiagnostic});
-      // Existing reconciliation stays read-only. At most three observations are
-      // allowed, and another one needs an explicitly incomplete prior reading.
-      // No retry resumes an external action, extends a lease, or relaxes evidence.
+      // Preserve the proven reconciliation policy: an immediate catch read,
+      // then at most two further reads after 1s/3s. All four possible readings
+      // share one deadline; none repeats an action or extends the original lease.
       let after,reconcileError;
       if(!fatalObservationCodes.has(safeCode(error))) {
-        for(let attempt=1;attempt<=3;attempt++) {
-          if(attempt>1)await pause(attempt===2?1000:3000);
+        for(let attempt=1;attempt<=3 && now()<Math.min(deadlineAt,verificationDeadline??deadlineAt);attempt++) {
+          if(attempt>1)await pause(Math.max(0,Math.min(attempt===2?1000:3000,Math.min(deadlineAt,verificationDeadline??deadlineAt)-now())));
           await journal?.update?.({postActionReconcile:{stage:'observing',attempt,classification:'read_only'}});
           try {
-            const observed=await browser.observe();
+            const observed=await verify();
             assertTarget(observed);
             await journal?.update?.({postActionReconcile:{stage:'observed',attempt,classification:'complete_read'}});
             after=observed;reconcileError=undefined;
@@ -240,7 +281,7 @@ export async function runBatch({ portal, browser, config, journal,
       }
       await journal?.settled();
       actions.push({kind,targetId:item.id,outcome:'isolated',failureCode:code});
-    } finally { browser.onExternalAction = () => {}; }
+    } finally { browser.onExternalAction = () => {};browser.onExternalActionCommitted=()=>{}; }
   }
   return {mode:actions.length ? 'processed' : 'idle',actions,modelCalls:0,
     mailChannelError:plan.mailChannelError ?? null};

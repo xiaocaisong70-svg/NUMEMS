@@ -128,7 +128,7 @@ export async function portalData() {
       isolatedOperations: user?.isAdmin ? codex?.holds?.length ?? 0 : undefined,
       memberPaused: Boolean(codex?.lastError || codex?.globalFailureCode || rescueBlocksClaims(state as BridgeState)),
       browserRecovering: codex?.globalFailureCode === "browser_unavailable" && Boolean(codex?.browserUnavailableAt),
-      recoveryProgress: publicRecoveryProgress(state as BridgeState),
+      recoveryProgress: publicRecoveryProgress(state as BridgeState,serverNow),
       faultRescue: publicFaultRescue(state as BridgeState),
       officialObservedAt: codex?.observation?.observedAt ?? null,
       officialStale: !codex?.observation?.observedAt || Date.now() - Date.parse(codex.observation.observedAt) > 3 * 60_000,

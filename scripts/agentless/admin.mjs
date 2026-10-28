@@ -35,7 +35,7 @@ export function assertObservationSetup(plan,config,{prepareTest=false,journalSta
     throw new Error('门户身份或工作空间不匹配，不能初始化。');
   if(plan.busy || plan.lease || plan.lastError || plan.globalFailureCode || plan.blockedOperations?.length)
     throw new Error('存在未完成租约或故障；请先核对原办理记录，不能用初始化清除故障。');
-  if(journalState && journalState.phase!=='settled')
+  if(journalState && (journalState.phase!=='settled'||journalState.lease!=null||journalState.receipt!=null||journalState.submission!=null))
     throw new Error('本机有未结案办理日志；请先核对原租约，不能重新初始化。');
   if(prepareTest && plan.testOnly!==true)
     throw new Error('正式执行器不能通过 prepare-test 切回测试模式。');
@@ -121,15 +121,16 @@ const commands={status:['seat_portal_status',{}], 'prepare-test':['prepare_test_
   'release-test':['release_test_request',{requestId:id}], 'test-reminder':['set_test_deadline',{requestId:id,stage:'reminder'}],
   'test-expire':['set_test_deadline',{requestId:id,stage:'expire'}],
   'enable-live':['set_codex_live',{enabled:true}], 'disable':['set_codex_live',{enabled:false}],
-  'rollback-status':['version_rollback_status',{}], 'prepare-v11-rollback':['prepare_v11_rollback',{expectedRevision:Number(id)}]};
-const withId=['release-test','test-reminder','test-expire','prepare-v11-rollback','finish-fault-rescue'];
+  'rollback-status':['version_rollback_status',{}], 'prepare-v11-rollback':['prepare_v11_rollback',{expectedRevision:Number(id)}],
+  'prepare-v13-rollback':['prepare_v13_rollback',{expectedRevision:Number(id)}]};
+const withId=['release-test','test-reminder','test-expire','prepare-v11-rollback','prepare-v13-rollback','finish-fault-rescue'];
 if((!commands[command] && !['observe','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','prepare-fault-rescue','finish-fault-rescue'].includes(command)) || extra.length ||
     (!withId.includes(command) && id!==undefined))
   throw new Error('用法：admin.mjs status|observe|prepare-test|release-test ID|test-reminder ID|test-expire ID|enable-live|disable|reconcile|recover-browser|resolve-alert|resume-test-invite|review-test-workspace|review-live-workspace|review-verified-operation|rollback-status|prepare-v11-rollback REVISION|prepare-fault-rescue|finish-fault-rescue RESCUE_ID');
-if(command==='prepare-v11-rollback' && (!/^\d+$/.test(id??'') || !Number.isSafeInteger(Number(id))))
+if(['prepare-v11-rollback','prepare-v13-rollback'].includes(command) && (!/^\d+$/.test(id??'') || !Number.isSafeInteger(Number(id))))
   throw new Error('必须提供刚读取的 D1 修订号。');
 if(command==='finish-fault-rescue' && !/^rescue_[a-zA-Z0-9_-]{16,100}$/.test(id??''))throw new Error('必须提供原故障处置 ID。');
-if(withId.includes(command) && !['prepare-v11-rollback','finish-fault-rescue'].includes(command) && !/^req_[a-zA-Z0-9_]+$/.test(id??''))
+if(withId.includes(command) && !['prepare-v11-rollback','prepare-v13-rollback','finish-fault-rescue'].includes(command) && !/^req_[a-zA-Z0-9_]+$/.test(id??''))
   throw new Error('必须提供已登记测试申请的 ID。');
 const config=await loadConfig();
 if(command!=='status') await assertExclusive({...config,liveActions:true});
@@ -141,34 +142,46 @@ try {
   await browser.open();
   const portal=new PortalClient(browser.context,config,['prepare_test_request','release_test_request',
     'set_test_deadline','set_codex_live','review_seat_failure','verified_review_receipt','version_rollback_status','prepare_v11_rollback',
-    'begin_fault_rescue','finish_fault_rescue','fault_rescue_status','record_recovery_progress']);
+    'begin_fault_rescue','finish_fault_rescue','fault_rescue_status','record_recovery_progress','prepare_v13_rollback']);
   if(command==='prepare-fault-rescue') {
     const {prepareFaultRescue}=await import('./fault-rescue.mjs');
     report.result=await prepareFaultRescue({directory:runtimeDir,config,portal,hostSafe:true,
       journalState:await readJson(path.join(runtimeDir,'operation.json'))});
   } else if(command==='finish-fault-rescue') {
-    const {settleFaultRescue,faultRescueFile}=await import('./fault-rescue.mjs');
+    const {settleFaultRescue,settleUndispatchedFaultRescue,faultRescueFile}=await import('./fault-rescue.mjs');
     const {FaultRescueClient}=await import('./fault-rescue-client.mjs');
     const {resolveCodexCli}=await import('../codex-cli-resolver.mjs');
     const ticket=await readJson(faultRescueFile(runtimeDir));
     if(ticket?.ticket?.id!==id)throw new Error('故障处置 ID 与本机记录不符。');
+    const unsent=await settleUndispatchedFaultRescue({directory:runtimeDir,portal,hostSafe:true});
+    if(unsent)report.result=unsent;
+    else {
     const client=new FaultRescueClient(await resolveCodexCli(config.faultRescue?.cliPath),{cwd:root,timeoutMs:30000});
     try {
       await client.initialize();
       const proof=await client.observeTurnState({threadId:ticket.threadId,clientUserMessageId:ticket.clientId,queuedId:ticket.queuedId??null});
       if(proof.confirmed!==true || proof.stopped!==true)throw new Error('尚未确认故障诊断会话结束，不能交还执行权。');
       let verifiedRecovery=false,diagnostic,officialResult;
-      try {
+      const current=(await portal.call('seat_portal_status')).plan;
+      const verifiedHandled=ticket.ticket.scope==='approved_member_ops'&&current.faultRescue?.id===id&&
+        current.globalFailureId===ticket.failureId&&current.globalFailureCode==='browser_unavailable'&&
+        !current.busy&&!current.lease&&current.faultRescue?.settlement?.canHandle===true;
+      try {if(!verifiedHandled) {
         officialResult=await reconcileRescueReadOnly({portal,browser,config,journalFile:path.join(runtimeDir,'operation.json'),ticket});
         verifiedRecovery=officialResult.healthy;
-      } catch(error) {diagnostic=safeOfficialDiagnostic(error);}
-      report.result=await settleFaultRescue({directory:runtimeDir,portal,client,hostSafe:true,verifiedRecovery,
+      }} catch(error) {diagnostic=safeOfficialDiagnostic(error);}
+      const latest=(await portal.call('seat_portal_status')).plan;
+      const handled=verifiedHandled||ticket.ticket.scope==='approved_member_ops'&&latest.faultRescue?.id===id&&
+        latest.globalFailureId===ticket.failureId&&latest.globalFailureCode==='browser_unavailable'&&!latest.busy&&!latest.lease&&
+        latest.faultRescue?.settlement?.canHandle===true;
+      report.result=await settleFaultRescue({directory:runtimeDir,portal,client,hostSafe:true,verifiedRecovery,verifiedHandled:handled,
         readDiagnostic:async()=>diagnostic});
       if(report.result.state==='finished' && report.result.outcome==='recovered' && verifiedRecovery) {
         const plan=(await portal.call('seat_portal_status')).plan;
         await recordReadOnlyHealth({directory:runtimeDir,config,plan,snapshot:officialResult.snapshot,ticket});
       }
     } finally {await client.close();}
+    }
   } else if(command==='review-verified-operation') {
     const rawRetry=process.env.NUMEMS_REVIEW_RETRY_EXPECTED;
     const expectedStopDigest=process.env.NUMEMS_REVIEW_STOP_DIGEST;
@@ -204,7 +217,7 @@ try {
       const [name,arguments_]=commands[command];response=await portal.call(name,arguments_);
     }
     const p=response.plan??response;
-    report.result=['rollback-status','prepare-v11-rollback'].includes(command)?p:{enabled:p.enabled,testOnly:p.testOnly,busy:p.busy,
+    report.result=['rollback-status','prepare-v11-rollback','prepare-v13-rollback'].includes(command)?p:{enabled:p.enabled,testOnly:p.testOnly,busy:p.busy,
       pendingInvites:p.invites?.length,pendingRemovals:p.removals?.length,held:p.blockedOperations?.length,
       testRequests:[...(p.invites??[]),...(p.awaitingAcceptance??[]),...(p.removals??[])].filter(r=>r.isTest).map(r=>r.id)};
     if(['status','observe'].includes(command))Object.assign(report.result,await readTestSummary(portal,config));
@@ -245,7 +258,7 @@ try {
       // Server additionally validates invitation_expired before accepting joined.
       await portal.call('complete_seat_operation',{operationId:lease.id,token:lease.token,
         outcome:joined?'joined':'verified',observation:bridgeObservation(snap),
-        ...(j.receipt?.invitationSentAt?{invitationSentAt:j.receipt.invitationSentAt}:{})});
+        ...((j.receipt?.invitationSentAt??j.submission?.invitationSentAt)?{invitationSentAt:j.receipt?.invitationSentAt??j.submission?.invitationSentAt}:{})});
       await new Journal(file).settled();
     }
     console.log('已按原租约和真实证据结案；没有重复执行外部动作。');

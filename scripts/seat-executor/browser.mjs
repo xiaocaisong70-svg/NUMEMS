@@ -67,17 +67,18 @@ async function only(locator, label) {
 }
 // Opening a modal/menu is asynchronous in the official UI. Wait for that new
 // surface, then retain the same strict uniqueness and visibility checks.
-async function readyOnly(locator, label) {
-  await locator.filter({ visible: true }).waitFor({ state: "visible", timeout: 20_000 });
+async function readyOnly(locator, label, timeout=20000) {
+  await locator.filter({ visible: true }).waitFor({ state: "visible", timeout });
   return only(locator, label);
 }
 export class BrowserAdapter {
-  constructor(config, { page, fixtureOrigin, onExternalAction = () => {} } = {}) {
+  constructor(config, { page, fixtureOrigin, onExternalAction = () => {},onExternalActionCommitted=()=>{} } = {}) {
     this.config = config;
     // Test injection is unavailable to HTTP routes or .env. Tests use only a loopback fixture.
     if (fixtureOrigin && (!page || !/^http:\/\/127\.0\.0\.1:\d+$/.test(fixtureOrigin))) throw new Error("Invalid fixture.");
     this.page = page; this.fixtureOrigin = fixtureOrigin;
     this.onExternalAction = onExternalAction;
+    this.onExternalActionCommitted=onExternalActionCommitted;
   }
   async open({timeoutMs=30000}={}) {
     if (this.page) return this.page;
@@ -104,12 +105,23 @@ export class BrowserAdapter {
     if(await controls?.shouldStop?.())throw new OfficialReadCancelled();
     if(controls?.deadlineAt!==undefined) {
       const remaining=controls.deadlineAt-(controls.now??Date.now)();
-      if(remaining<=0)throw new OfficialPageError('官方完整核对已达到本次只读时间预算；未采纳部分名单。','browser_unavailable',
+      if(remaining<=0)throw new OfficialPageError(controls.actionKind?'成员操作的控制预算已用尽；必须核对原操作结果，禁止重发。':'官方完整核对已达到本次只读时间预算；未采纳部分名单。','browser_unavailable',
         officialDiagnostic({stage,state:'loading',expectedUrl:this.url()}));
       if(this.context)this.page?.setDefaultTimeout?.(Math.max(1,Math.min(12000,remaining)));
       return remaining;
     }
     return 30000;
+  }
+  async boundedTimeout(cap=12000,stage='page') {
+    return Math.max(1,Math.min(cap,await this.beforeOfficialRead(stage)));
+  }
+  async withActionBudget(kind,{deadlineAt,budgetMs=35000,now=Date.now}={},run) {
+    if(!['invite','remove'].includes(kind)||!Number.isInteger(budgetMs)||budgetMs<1||budgetMs>45000 ||
+        (deadlineAt!==undefined&&!Number.isFinite(deadlineAt))||typeof now!=='function')throw new Error('Invalid member action budget.');
+    const previous=this.readOnlyWaitControls;
+    this.readOnlyWaitControls={actionKind:kind,now,deadlineAt:Math.min(deadlineAt??Infinity,now()+budgetMs),challengeTimeoutMs:20000};
+    try {await this.beforeOfficialRead('page');const value=await run();await this.beforeOfficialRead('page');return value;}
+    finally {this.readOnlyWaitControls=previous;if(this.context)this.page?.setDefaultTimeout?.(12000);}
   }
   async challengeInteraction(body) {
     const p=this.page;
@@ -173,12 +185,12 @@ export class BrowserAdapter {
     await this.guard();
     const tabControl = await only(selected, "成员标签页");
     if (await tabControl.getAttribute("aria-selected") !== "true") {
-      await tabControl.click();
-      await p.waitForFunction(el => el.getAttribute("aria-selected") === "true", await tabControl.elementHandle());
+      await tabControl.click({timeout:await this.boundedTimeout()});
+      await p.waitForFunction(el => el.getAttribute("aria-selected") === "true", await tabControl.elementHandle(),{timeout:await this.boundedTimeout()});
     }
     const searches = p.getByRole("searchbox").or(p.getByRole("textbox", { name: /搜索|筛选|Search|Filter/i })).filter({ visible: true });
     for (const search of await searches.all()) {
-      if (await search.inputValue()) { await search.fill(""); await p.waitForTimeout(300); }
+      if (await search.inputValue()) { await search.fill("",{timeout:await this.boundedTimeout()}); await p.waitForTimeout(await this.boundedTimeout(300)); }
     }
     const filter = p.getByRole("combobox", { name: /^(角色|Role)$/i }).filter({ visible: true });
     if (await filter.count() && !/^(角色|所有角色|全部|Role|All roles|All)$/i.test((await filter.innerText()).trim()))
@@ -356,7 +368,7 @@ export class BrowserAdapter {
       }
       const oldText = await table.innerText();
       const remaining=await this.beforeOfficialRead(this.listTab==='invites'?'invites_rows':'members_rows');
-      await next.click();
+      await next.click({timeout:Math.max(1,Math.min(12000,remaining))});
       // Bounded wait for the visible table to change; never an unbounded polling loop.
       await p.waitForFunction(({ selector, old }) => {
         const t = document.querySelector(selector); return t && t.innerText !== old;
@@ -421,32 +433,33 @@ export class BrowserAdapter {
     validateObservation(before, this.config);
     assertOrdinary(before, email, { config: { protectedEmails: [this.config.adminEmail] } });
   }
-  async invite(email, before) {
+  async invite(email,before,options) {return this.withActionBudget('invite',options,()=>this.inviteOnce(email,before));}
+  async inviteOnce(email, before) {
     this.permit(email, before);
     if (presence(before, email) !== "absent") return;
     if (before.members.length + before.invites.length >= this.config.totalSeats) throw new Error("容量已满。");
     await this.load("members"); const p = this.page;
     const current = await this.capacity();
     if (current.total !== this.config.totalSeats || current.available < 1) throw new Error("没有已购可用席位。");
-    await (await only(p.getByRole("button", { name: ui.invite }), "邀请成员按钮")).click();
+    await (await only(p.getByRole("button", { name: ui.invite }), "邀请成员按钮")).click({timeout:await this.boundedTimeout()});
     // Seat pickers also use role=dialog and remain visible during close animation.
     // Bind the invitation surface to its email field, not every dialog on the page.
     const dialog = await readyOnly(p.getByRole("dialog").filter({
-      has: p.getByRole("textbox", { name: /电子邮箱|Email/i }) }), "邀请对话框");
+      has: p.getByRole("textbox", { name: /电子邮箱|Email/i }) }), "邀请对话框",await this.boundedTimeout(20000));
     const invitationText = await dialog.innerText();
     // Current console uses the generic title "邀请团队成员". In that variant,
     // the exact URL and global workspace selector provide workspace identity.
     if (!invitationText.includes(this.config.workspaceName) &&
         invitationText.split(/\r?\n/)[0].trim() !== "邀请团队成员") throw new Error("邀请工作空间不匹配。");
     await this.guard();
-    await (await only(dialog.getByRole("textbox", { name: /电子邮箱|Email/i }), "邀请邮箱")).fill(email);
+    await (await only(dialog.getByRole("textbox", { name: /电子邮箱|Email/i }), "邀请邮箱")).fill(email,{timeout:await this.boundedTimeout()});
     // Select the already-paid configured pool. Never change an existing member's seat.
     const seats = dialog.getByRole("combobox", { name: /席位类型|Seat type/i })
       .or(dialog.getByRole("button", { name: /席位类型|Seat type/i }));
     const seat = await only(seats, "席位类型选择器");
     if (!(await seat.innerText()).includes(this.config.seatLabel)) {
-      await seat.click();
-      await (await readyOnly(p.getByRole("option", { name: new RegExp(`^${escape(this.config.seatLabel)}(?:\\s|$)`) }), "已购席位类型")).click();
+      await seat.click({timeout:await this.boundedTimeout()});
+      await (await readyOnly(p.getByRole("option", { name: new RegExp(`^${escape(this.config.seatLabel)}(?:\\s|$)`) }), "已购席位类型",await this.boundedTimeout(20000))).click({timeout:await this.boundedTimeout()});
     }
     const role = dialog.getByRole("combobox", { name: /角色|Role/i })
       .or(dialog.getByRole("button", { name: /^(?:角色(?:类型)?|Role(?: type)?)(?:\s|$)/i }));
@@ -460,18 +473,22 @@ export class BrowserAdapter {
     if ((await dialog.getByRole("textbox", { name: /电子邮箱|Email/i }).inputValue()).trim().toLowerCase() !== email)
       throw new Error("邀请邮箱发生变化。");
     await this.guard();
+    const send=await only(dialog.getByRole("button", { name: ui.send }), "发送邀请按钮");
+    await this.beforeOfficialRead('page');
     await this.onExternalAction("invite", email);
-    await (await only(dialog.getByRole("button", { name: ui.send }), "发送邀请按钮")).click();
+    await send.click({timeout:await this.boundedTimeout()});
     // Capture the completed click before waiting for the dialog to disappear.
     // The UI exposes no authoritative server send timestamp.
-    const invitationSentAt = new Date().toISOString();
-    await dialog.waitFor({ state: "hidden", timeout: 20_000 });
+    const invitationSentAt = new Date((this.readOnlyWaitControls?.now??Date.now)()).toISOString();
+    await this.onExternalActionCommitted?.({kind:'invite',email,invitationSentAt});
+    await dialog.waitFor({ state: "hidden", timeout:await this.boundedTimeout(20000) });
     // Worker performs a fresh, full observation before acknowledging success.
     return invitationSentAt;
   }
   async locateRow(email) {
     const p = this.page;
     for (let i = 0; i < 100; i++) {
+      await this.beforeOfficialRead(this.listTab==='invites'?'invites_rows':'members_rows');
       await this.waitForRows();
       const table = await only(p.getByRole("table"), "成员表");
       // DOM textContent does not preserve visual cell boundaries; parseRow below checks exact identity.
@@ -480,12 +497,13 @@ export class BrowserAdapter {
       if (await rows.count() > 1) throw new Error("目标邮箱重复。");
       const next = p.getByRole("button", { name: ui.next }).filter({ visible: true });
       if (!await next.count() || !await next.isEnabled()) break;
-      await (await only(next, "下一页")).click();
-      await p.waitForTimeout(400);
+      await (await only(next, "下一页")).click({timeout:await this.boundedTimeout()});
+      await p.waitForTimeout(await this.boundedTimeout(400));
     }
     throw new Error("未定位到确切目标邮箱。");
   }
-  async remove(email, before) {
+  async remove(email,before,options) {return this.withActionBudget('remove',options,()=>this.removeOnce(email,before));}
+  async removeOnce(email, before) {
     let stage='permission';
     try {
       this.permit(email, before);
@@ -497,20 +515,21 @@ export class BrowserAdapter {
       const parsed = parseRow(await row.getByRole("cell").allInnerTexts(), this.config.seatLabel);
       if (parsed.email !== email || parsed.role !== "member" || parsed.self) throw new Error("目标身份或角色不安全。");
       stage='menu_open';
-      await (await only(row.getByRole("button", { name: /打开.+的操作|Open .+ actions|Actions for/i }), "成员操作菜单")).click();
+      await (await only(row.getByRole("button", { name: /打开.+的操作|Open .+ actions|Actions for/i }), "成员操作菜单")).click({timeout:await this.boundedTimeout()});
       // Some UI variants apply invite revocation directly from the menu. Mark the
       // outcome as potentially external before that click so an unexpected UI
       // transition cannot be recorded as an operation that never started.
       stage='menu_action';
       const menuAction = await readyOnly(p.getByRole("menuitem", {
         name: original === "member" ? ui.removeMenu : ui.revoke,
-      }), "成员移除或撤销邀请菜单");
+      }), "成员移除或撤销邀请菜单",await this.boundedTimeout(20000));
+      await this.beforeOfficialRead('page');
       await this.onExternalAction("remove", email);
-      await menuAction.click();
+      await menuAction.click({timeout:await this.boundedTimeout()});
       stage='confirmation_wait';
       const confirmName = original === "member" ? ui.removeConfirm : ui.revoke;
       const dialog = await readyOnly(p.getByRole("dialog").filter({
-        has: p.getByRole("button", { name: confirmName }) }), "移除确认对话框");
+        has: p.getByRole("button", { name: confirmName }) }), "移除确认对话框",await this.boundedTimeout(20000));
       stage='confirmation_validate';
       const dialogText = await dialog.innerText();
       // The official dialog may show display name rather than email; retain exact row identity and workspace.
@@ -518,7 +537,7 @@ export class BrowserAdapter {
       if (/删除数据|Delete data|permanently delete/i.test(dialogText)) throw new Error("检测到删除数据流程，禁止操作。");
       await this.guard();
       stage='confirmation_click';
-      await (await only(dialog.getByRole("button", { name: confirmName }), "最终确认按钮")).click();
+      await (await only(dialog.getByRole("button", { name: confirmName }), "最终确认按钮")).click({timeout:await this.boundedTimeout()});
       if (original === "member") {
         const keep = p.getByRole("button", { name: ui.keepSeats });
         stage='retention_wait';
@@ -527,16 +546,16 @@ export class BrowserAdapter {
         // interval between dialogs, and never choose a purchase/reduction action.
         // A UI variant with no retention prompt fails closed here; core may only
         // reconcile it with fresh complete official evidence, without a re-click.
-        await keep.filter({visible:true}).waitFor({state:'visible',timeout:25_000});
+        await keep.filter({visible:true}).waitFor({state:'visible',timeout:await this.boundedTimeout(25000)});
         stage='retention_validate';
         await this.guard();
         const keepControl=await only(keep,"保留付费席位");
         stage='retention_click';
-        await keepControl.click();
+        await keepControl.click({timeout:await this.boundedTimeout()});
       }
       stage='dialogs_closed';
       await p.waitForFunction(() => ![...document.querySelectorAll('dialog,[role="dialog"]')]
-        .some(e => e.getClientRects().length), null, { timeout: 20_000 });
+        .some(e => e.getClientRects().length), null, { timeout:await this.boundedTimeout(20000) });
     } catch(error) {
       // Fixed diagnostic fields only. Preserve the original exception and its
       // failure policy; no page text, selectors, URLs, credentials, or messages.

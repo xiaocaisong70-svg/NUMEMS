@@ -7,6 +7,8 @@ import {markRuntimeHealthy} from '../scripts/agentless/health-cycle.mjs';
 import {atomicJson,readJson} from '../scripts/agentless/journal.mjs';
 import {prepareFaultRescue,faultRescueFile} from '../scripts/agentless/fault-rescue.mjs';
 import {validateConfig} from '../scripts/agentless/config.mjs';
+import {AgentlessBrowser,isDedicatedObservation} from '../scripts/agentless/browser.mjs';
+import {recordReadOnlyHealth} from '../scripts/agentless/admin.mjs';
 
 const base=Date.parse('2026-10-28T15:00:00Z'),at=ms=>new Date(base+ms).toISOString();
 const config=validateConfig({liveActions:true,faultRescue:{enabled:true,scope:'read_only_reconcile',threadId:'thread-fixture',timeoutSeconds:300}});
@@ -69,8 +71,8 @@ test('unmatched, unclosed or future rescue metadata cannot reset a valid retaine
 test('rotated official health re-arms only a later independent fault, without starting a model',async t=>{
   const f=await fixture(t);await markRuntimeHealthy(f.args);let begins=0;
   const nextPlan={...f.plan,globalFailureCode:'browser_unavailable',globalFailureId:'codex_failure_two',lastError:'new real fault',
-    removals:[],invites:[],awaitingAcceptance:[]};
-  const portal={async call(name,args){if(name==='seat_portal_status')return {plan:nextPlan};
+    removals:[{id:'req_new_independent',email:'fixture@example.com'}],invites:[],awaitingAcceptance:[]};
+  const portal={async call(name,args){if(['seat_portal_status','refresh_seat_queue'].includes(name))return {plan:nextPlan};
     assert.equal(name,'begin_fault_rescue');begins++;assert.equal(args.expectedFailureId,'codex_failure_two');
     return {ticket:{id:'rescue_ffffffffffffffffffffffffffffffff',token:'fixture-protected-new-token',failureId:'codex_failure_two',phase:'pending',scope:'read_only_reconcile'}};}};
   const result=await prepareFaultRescue({directory:f.directory,config,portal,hostSafe:true,journalState:{phase:'settled'},
@@ -90,4 +92,39 @@ test('a second closed independent rescue can rotate again, while the same old ti
   const result=await markRuntimeHealthy({...f.args,clock:()=>new Date(at(92000))});
   assert.equal(result.healthEpochRotated,true);assert.equal((await readJson(f.retry)).healthyAt,at(92000));
   assert.equal((await readJson(f.retry)).faultRescueHealth.failureId,'codex_failure_two');
+});
+
+test('approved execution rescue closure rotates only through the exact dedicated observation object',async t=>{
+  const f=await fixture(t);
+  f.rescue.scope='approved_member_ops';f.rescue.ticket.scope='approved_member_ops';f.rescue.outcome='handled';
+  Object.assign(f.plan.faultRescue,{scope:'approved_member_ops',outcome:'handled'});
+  await atomicJson(faultRescueFile(f.directory),f.rescue);
+  const reader=new AgentlessBrowser(config);reader.observeStable=async()=>f.snapshot;
+  const dedicated=await reader.observe({now:()=>Date.parse(f.snapshot.observedAt),budgetMs:1000});
+  assert.equal(dedicated,f.snapshot);assert.equal(isDedicatedObservation(dedicated),true);
+  const copy=JSON.parse(JSON.stringify(dedicated));assert.equal(isDedicatedObservation(copy),false);
+  const before=await readFile(f.retry,'utf8');
+  await assert.rejects(markRuntimeHealthy({...f.args,snapshot:copy}),error=>error.healthDiagnostic?.reason==='dedicated_channel_proof_missing');
+  assert.equal(await readFile(f.retry,'utf8'),before);
+  const result=await markRuntimeHealthy({...f.args,snapshot:dedicated});assert.equal(result.healthEpochRotated,true);
+  assert.equal((await readJson(f.retry)).faultRescueHealth.rescueId,f.rescue.ticket.id);
+  assert.equal((await markRuntimeHealthy({...f.args,snapshot:dedicated})).healthEpochRotated,false);
+});
+
+test('administrator finish health entry preserves dedicated provenance and cannot accept a serialized substitute',async t=>{
+  const f=await fixture(t),atNow=new Date().toISOString(),createdAt=new Date(Date.now()-2000).toISOString();
+  f.rescue.scope='approved_member_ops';f.rescue.ticket.scope='approved_member_ops';f.rescue.outcome='handled';
+  Object.assign(f.rescue,{createdAt,updatedAt:createdAt});
+  Object.assign(f.plan.faultRescue,{scope:'approved_member_ops',outcome:'handled',createdAt,updatedAt:createdAt});
+  f.snapshot.observedAt=atNow;f.plan.officialObservedAt=atNow;f.plan.checkedAt=atNow;
+  await atomicJson(f.retry,{version:2,state:'healthy',healthyAt:new Date(Date.now()-10000).toISOString(),
+    officialObservedAt:new Date(Date.now()-11000).toISOString(),workspaceId:config.workspaceId,administrator:config.adminEmail});
+  await atomicJson(faultRescueFile(f.directory),f.rescue);
+  const reader=new AgentlessBrowser(config);reader.observeStable=async()=>f.snapshot;
+  const observed=await reader.observe();
+  await recordReadOnlyHealth({directory:f.directory,config,plan:f.plan,snapshot:observed,ticket:f.rescue});
+  assert.equal((await readJson(f.retry)).faultRescueHealth.rescueId,f.rescue.ticket.id);
+  assert.equal((await readJson(path.join(f.directory,'status.json'))).mode,'idle');
+  await assert.rejects(recordReadOnlyHealth({directory:f.directory,config,plan:f.plan,snapshot:structuredClone(observed),ticket:f.rescue}),
+    error=>error.healthDiagnostic?.reason==='dedicated_channel_proof_missing');
 });

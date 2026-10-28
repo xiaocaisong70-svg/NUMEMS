@@ -3,7 +3,7 @@ import {InventoryMismatchError} from '../seat-executor/browser.mjs';
 import {cloudRecoveryOwned} from './recovery-fence.mjs';
 
 const planOf = value => value.plan ?? value;
-const settled = j => !j || j.phase === 'settled' && j.lease == null && j.receipt == null;
+const settled = j => !j || j.phase === 'settled' && j.lease == null && j.receipt == null && j.submission == null;
 const safe = (p,c) => p?.workspaceId === c.workspaceId && p.administrator === c.adminEmail &&
   p.enabled === true && p.testOnly === false && !p.busy && !p.lease && !p.lastError && !p.globalFailureCode && !cloudRecoveryOwned(p);
 const codeOf = e => e instanceof InventoryMismatchError ? 'browser_unavailable' :

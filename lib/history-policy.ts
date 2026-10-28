@@ -29,6 +29,7 @@ export function compactHistory(previous: State, input: State) {
   }
   if (bridge?.operationFailureOrigin?.requestId) protectedRequests.add(bridge.operationFailureOrigin.requestId);
   const activeRescue=bridge?.faultRescue && ['pending','uncertain'].includes(bridge.faultRescue.phase)?bridge.faultRescue:null;
+  for(const target of activeRescue?.targets??[])protectedRequests.add(target.targetId);
   const rescueFailure=activeRescue?state.audit.find(a=>a.id===activeRescue.failureId):undefined;
   if(rescueFailure?.requestId)protectedRequests.add(rescueFailure.requestId);
   const latestFailure = [...state.audit].reverse().find(a => a.action === "codex_workspace_blocked");

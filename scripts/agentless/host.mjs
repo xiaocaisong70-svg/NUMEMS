@@ -6,9 +6,9 @@ import {spawn} from 'node:child_process';
 export function hostArguments(args,node=process.execPath) {
   const [mode,command,id,...extra]=args;
   const commands=['status','observe','prepare-test','release-test','test-reminder','test-expire',
-    'enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','rollback-status','prepare-v11-rollback','prepare-fault-rescue','finish-fault-rescue'];
-  const withId=['release-test','test-reminder','test-expire','prepare-v11-rollback','finish-fault-rescue'];
-  const validId=command==='prepare-v11-rollback' ? /^\d{1,15}$/.test(id??'') && Number.isSafeInteger(Number(id)) :
+    'enable-live','disable','reconcile','recover-browser','resolve-alert','resume-test-invite','review-test-workspace','review-live-workspace','review-verified-operation','rollback-status','prepare-v11-rollback','prepare-v13-rollback','prepare-fault-rescue','finish-fault-rescue'];
+  const withId=['release-test','test-reminder','test-expire','prepare-v11-rollback','prepare-v13-rollback','finish-fault-rescue'];
+  const validId=['prepare-v11-rollback','prepare-v13-rollback'].includes(command) ? /^\d{1,15}$/.test(id??'') && Number.isSafeInteger(Number(id)) :
     command==='finish-fault-rescue'?/^rescue_[a-zA-Z0-9_-]{16,100}$/.test(id??''):/^req_[a-zA-Z0-9_]+$/.test(id??'');
   if(!['probe','once','run','admin'].includes(mode) || extra.length ||
     (mode!=='admin' && (command!==undefined || id!==undefined)) ||

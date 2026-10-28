@@ -18,9 +18,10 @@ export function validateConfig(input = {}) {
     pollSeconds: 15, officialReconcileSeconds: 120, maxItems: 6, mailMode: 'in_app', liveActions: false,
     legacyCheckerDisabled: false, ...input };
   if(c.faultRescue!==undefined && (typeof c.faultRescue!=='object' || c.faultRescue===null ||
-      typeof c.faultRescue.enabled!=='boolean' || c.faultRescue.scope!=='read_only_reconcile' ||
+      typeof c.faultRescue.enabled!=='boolean' || !['read_only_reconcile','approved_member_ops'].includes(c.faultRescue.scope) ||
       !/^[a-zA-Z0-9:_-]{1,240}$/.test(c.faultRescue.threadId??'') ||
-      !Number.isInteger(c.faultRescue.timeoutSeconds) || c.faultRescue.timeoutSeconds<30 || c.faultRescue.timeoutSeconds>600))
+      !Number.isInteger(c.faultRescue.timeoutSeconds) || c.faultRescue.timeoutSeconds<30 || c.faultRescue.timeoutSeconds>600 ||
+      c.faultRescue.scope==='approved_member_ops'&&c.faultRescue.timeoutSeconds!==300))
     throw new Error('一次性故障诊断配置无效。');
   if (new URL(c.siteUrl).href !== SITE_URL || c.adminEmail !== ADMIN ||
       c.workspaceId !== WORKSPACE || c.workspaceName !== 'My Workspace' ||
