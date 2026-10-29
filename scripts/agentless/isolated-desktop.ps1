@@ -45,6 +45,43 @@ function Assert-DesktopAudit {
   $report.checkedAt = [DateTime]::UtcNow.ToString('o')
   if (-not $audit.isolated) { throw 'Desktop isolation audit failed; stopping only this worker and its descendants.' }
 }
+function Test-FaultRescueTerminalProof($Proof, $Rescue) {
+  # Native restart independently checks the same persisted data-only contract
+  # as fault-rescue-proof.mjs; interrupted/failed without a completion timestamp
+  # is never treated as an ended desktop model turn.
+  if ($null -eq $Proof -or $Proof.kind -cne 'codex_turn_state' -or $Proof.source -cne 'app_server_thread_read' -or
+      $Proof.confirmed -isnot [bool] -or $Proof.stopped -isnot [bool] -or $Proof.confirmed -ne $true -or $Proof.stopped -ne $true -or $Proof.terminalEvidence -cne 'status_and_completed_at' -or
+      $Proof.threadId -cne $Rescue.threadId -or $Proof.clientUserMessageId -cne $Rescue.clientId -or
+      ($Rescue.queuedId -and $Proof.queuedId -cne $Rescue.queuedId) -or
+      $Proof.turnId -isnot [string] -or $Proof.linkedTurnId -isnot [string] -or
+      $Proof.turnId -cnotmatch '\A[a-zA-Z0-9:_-]{1,240}\z' -or $Proof.linkedTurnId -cnotmatch '\A[a-zA-Z0-9:_-]{1,240}\z' -or
+      $Proof.terminalChain -isnot [Array] -or $Proof.terminalFamily -isnot [Array] -or
+      ($Proof.readMethod -ceq 'thread/turns/list' -and ($Proof.headRevalidated -isnot [bool] -or $Proof.headRevalidated -ne $true))) { return $false }
+  $observed = [DateTimeOffset]::MinValue
+  if ($Proof.observedAt -isnot [string] -or -not [DateTimeOffset]::TryParse($Proof.observedAt, [ref]$observed) -or $observed -gt [DateTimeOffset]::UtcNow) { return $false }
+  $chain = @($Proof.terminalChain); $family = @($Proof.terminalFamily)
+  if ($chain.Count -lt 1 -or $chain.Count -gt 9 -or $family.Count -lt $chain.Count -or $family.Count -gt 1000 -or
+      $chain[0].turnId -cne $Proof.linkedTurnId -or $chain[-1].turnId -cne $Proof.turnId) { return $false }
+  $familyById = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::Ordinal)
+  foreach ($node in $family) {
+    $started = [DateTimeOffset]::MinValue; $completed = [DateTimeOffset]::MinValue
+    if ($null -eq $node -or $node.turnId -isnot [string] -or $node.turnId -cnotmatch '\A[a-zA-Z0-9:_-]{1,240}\z' -or $familyById.ContainsKey($node.turnId) -or
+        $node.ended -isnot [bool] -or $node.ended -ne $true -or @('completed','failed','interrupted') -cnotcontains $node.status -or
+        $node.startedAt -isnot [string] -or $node.completedAt -isnot [string] -or
+        -not [DateTimeOffset]::TryParse($node.startedAt,[ref]$started) -or -not [DateTimeOffset]::TryParse($node.completedAt,[ref]$completed) -or
+        $completed -lt $started -or $completed -gt $observed) { return $false }
+    $familyById.Add($node.turnId,$node)
+  }
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+  foreach ($node in $chain) {
+    if ($null -eq $node -or $node.turnId -isnot [string] -or $node.ended -isnot [bool] -or
+        -not $seen.Add([string]$node.turnId) -or -not $familyById.ContainsKey([string]$node.turnId)) { return $false }
+    $matched = $familyById[[string]$node.turnId]
+    foreach ($name in @('status','startedAt','completedAt','ended')) { if ($node.$name -cne $matched.$name) { return $false } }
+  }
+  $last = $chain[-1]
+  return $Proof.status -ceq $last.status -and $Proof.startedAt -ceq $last.startedAt -and $Proof.completedAt -ceq $last.completedAt
+}
 function Restore-SettledWorkerLock {
   # Caller owns the project host mutex. Preserve the journal and every old lock.
   # This only allows the worker to reach its existing fresh-cloud preflight;
@@ -137,11 +174,11 @@ function Assert-WatchdogStart {
     $status = [IO.File]::ReadAllText((Join-Path $runtimePath 'status.json')) | ConvertFrom-Json
     $journal = [IO.File]::ReadAllText((Join-Path $runtimePath 'operation.json')) | ConvertFrom-Json
     $admin = [IO.File]::ReadAllText((Join-Path $runtimePath 'admin-result.json')) | ConvertFrom-Json
+    $terminalProof = $rescue.agentProof
+    if ($rescue.PSObject.Properties.Name -ccontains 'terminalRevalidationProof') { $terminalProof = $rescue.terminalRevalidationProof }
     if ($rescue.phase -cne 'finished' -or $rescue.outcome -cne 'recovered' -or $rescue.agentStopped -ne $true -or
         $rescue.ticket.id -cne $expectedRescue.rescueId -or $rescue.failureId -cne $expectedRescue.failureId -or
-        $rescue.agentProof.source -cne 'app_server_thread_read' -or $rescue.agentProof.confirmed -ne $true -or
-        $rescue.agentProof.stopped -ne $true -or $rescue.agentProof.threadId -cne $rescue.threadId -or
-        $rescue.agentProof.clientUserMessageId -cne $rescue.clientId -or
+        -not (Test-FaultRescueTerminalProof $terminalProof $rescue) -or
         $journal.phase -cne 'settled' -or $null -ne $journal.lease -or $null -ne $journal.receipt -or $null -ne $journal.submission -or
         $admin.command -cne 'finish-fault-rescue' -or $admin.requestId -cne $expectedRescue.rescueId -or $admin.success -ne $true -or
         $status.faultRescueEvidence.rescueId -cne $expectedRescue.rescueId -or

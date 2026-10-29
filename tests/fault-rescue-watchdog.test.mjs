@@ -3,6 +3,7 @@ import {mkdtemp,rm} from 'node:fs/promises';import path from 'node:path';import 
 import {readJson,atomicJson} from '../scripts/agentless/journal.mjs';
 import {faultRescueFile,dispatchPreparedFaultRescue} from '../scripts/agentless/fault-rescue.mjs';
 import {superviseFaultRescue,supervise,superviseLocalContextRecovery,faultRescueHostSafe,faultRescueRestartDecision} from '../scripts/agentless/watchdog.mjs';
+import {completedRescueProof} from './helpers/completed-rescue-proof.mjs';
 
 const at=n=>new Date(Date.parse('2026-10-28T10:00:00Z')+n).toISOString();
 const host={mode:'run',state:'blocked',exitCode:1,processId:1234,checkedAt:at(0),modelCalls:0,audits:3,
@@ -13,7 +14,7 @@ const config={liveActions:true,browserMode:'isolated_desktop',headless:false,leg
 const ticket={id:'rescue_fixture_1234567890123456',failureId:'fault-fixture',token:'fixture-only-secret-never-print',phase:'pending',scope:'read_only_reconcile'};
 const pending=()=>({version:1,phase:'prepared',failureId:ticket.failureId,failureCode:'browser_unavailable',clientId:'client-fixture',
   threadId:'thread-fixture',createdAt:at(0),updatedAt:at(0),targetIds:[],ticket:{...ticket}});
-const turn=(r,stopped=false)=>({kind:'codex_turn_state',source:'app_server_thread_read',confirmed:true,stopped,
+const turn=(r,stopped=false)=>stopped?completedRescueProof(r,{startedAt:at(0),completedAt:at(10_000),observedAt:at(20_000),exclusiveTurn:true}):({kind:'codex_turn_state',source:'app_server_thread_read',confirmed:true,stopped,
   threadId:r.threadId,clientUserMessageId:r.clientId,queuedId:r.queuedId??null,turnId:'turn-fixture',linkedTurnId:'turn-fixture',
   status:stopped?'completed':'inProgress',startedAt:at(0),observedAt:at(20_000),exclusiveTurn:true});
 async function fixture(t) {
@@ -30,7 +31,8 @@ async function fixture(t) {
       if(command==='prepare-fault-rescue')await atomicJson(faultRescueFile(directory),pending());
       if(command==='finish-fault-rescue') {
         const r=await readJson(faultRescueFile(directory));assert.equal(r.ticket.id,id);assert.equal(r.watchdogStopProof.stopped,true);
-        await atomicJson(faultRescueFile(directory),{...r,phase:'finished',outcome:'unresolved',agentStopped:true,updatedAt:at(ms)});
+        await atomicJson(faultRescueFile(directory),{...r,phase:'finished',outcome:'unresolved',agentStopped:true,
+          ...(r.agentProof?{terminalRevalidationProof:r.watchdogStopProof}:{agentProof:r.watchdogStopProof}),updatedAt:at(ms)});
       }
     },runProbe:async()=>{calls.push('probe');},
     refreshSafety:async()=>({host:currentHost,adminResult:currentAdmin,lock:null,stopRequest:null,processClear:true}),
@@ -73,15 +75,26 @@ test('active ticket blocks ordinary worker even when fault-only dispatch has bee
     faultRescueRecord:pending(),save:async()=>{},run:async()=>{launches++;}});
   assert.equal(r.reason,'fault_rescue_owns_recovery');assert.equal(launches,0);
 });
+
+test('a legacy prematurely finished record cannot launch recovery before a freshly completed turn family',async t=>{
+  const f=await fixture(t);await f.run();const r=await readJson(faultRescueFile(f.directory));
+  const old={...turn(r,true),status:'interrupted',completedAt:null};delete old.terminalEvidence;
+  await atomicJson(faultRescueFile(f.directory),{...r,phase:'finished',outcome:'unresolved',agentStopped:true,agentProof:old});
+  f.calls.length=0;assert.equal((await f.run()).result.reason,'fault_rescue_agent_stop_unconfirmed');
+  assert.deepEqual(f.calls,['client','read-turn']);
+  f.calls.length=0;f.stopped();assert.equal((await f.run()).result.reason,'fault_rescue_finished');
+  assert.deepEqual(f.calls,['client','read-turn','finish-fault-rescue']);
+  assert.deepEqual((await readJson(faultRescueFile(f.directory))).agentProof,old);
+});
 test('ended unresolved browser incident retries only deterministic read-only recovery with durable backoff',async t=>{
-  const f=await fixture(t);await atomicJson(faultRescueFile(f.directory),{...pending(),phase:'finished',outcome:'unresolved',agentStopped:true});
+  const f=await fixture(t);await atomicJson(faultRescueFile(f.directory),{...pending(),phase:'finished',outcome:'unresolved',agentStopped:true,agentProof:turn(pending(),true)});
   assert.equal((await f.run()).result.reason,'fault_rescue_read_only_backoff');f.advance(41_000);
   assert.equal((await f.run()).result.reason,'fault_rescue_recovery_probe_exited');assert.deepEqual(f.calls,['recover-browser','probe']);
   f.calls.length=0;assert.equal((await f.run()).result.reason,'fault_rescue_read_only_backoff');assert.deepEqual(f.calls,[]);
   assert.equal((await readJson(faultRescueFile(f.directory))).readOnlyRetry.attempts,1);
 });
 test('unsettled original action cannot be retried by post-rescue deterministic recovery',async t=>{
-  const f=await fixture(t);await atomicJson(faultRescueFile(f.directory),{...pending(),phase:'finished',outcome:'unresolved',agentStopped:true});
+  const f=await fixture(t);await atomicJson(faultRescueFile(f.directory),{...pending(),phase:'finished',outcome:'unresolved',agentStopped:true,agentProof:turn(pending(),true)});
   f.state.journal={phase:'attempting',lease:{id:'original'}};f.advance(60_000);
   assert.equal((await f.run()).handled,false);assert.deepEqual(f.calls,[]);
 });
@@ -102,6 +115,8 @@ test('only exact finished recovery, fresh metadata and a zero-window isolated ex
   const data={host:h,status,journal:{phase:'settled'},adminResult,rescue,now:Date.parse(at(20_000))};
   assert.equal(faultRescueRestartDecision(data).allowed,true);
   for(const change of [{rescue:{...rescue,agentStopped:false}},{rescue:{...rescue,agentProof:{...rescue.agentProof,confirmed:false}}},
+    {rescue:{...rescue,agentProof:{...rescue.agentProof,terminalEvidence:undefined}}},
+    {rescue:{...rescue,agentProof:{...rescue.agentProof,completedAt:null}}},
     {status:{...status,state:'blocked'}},{adminResult:{...adminResult,success:false}},
     {journal:{phase:'settled',receipt:{}}},{host:{...h,maxOwnedWindowsOnInputDesktop:1}}])
     assert.equal(faultRescueRestartDecision({...data,...change}).allowed,false);

@@ -13,11 +13,14 @@ import {reviewVerifiedOperation} from './review-verified-operation.mjs';
 import {safeOfficialDiagnostic} from '../seat-executor/official-readiness.mjs';
 import {reconcileRescueReadOnly} from './rescue-readonly.mjs';
 import {markRuntimeHealthy,verifiedHealthEvidence} from './health-cycle.mjs';
+import {localRecoveryOwned} from './recovery-fence.mjs';
 const TEST_EMAIL='hit_wangning@outlook.com';
 
 // A new installation may have no journal yet. Create a settled marker only
 // after independent cloud + official validation proves no operation exists.
 export async function recordReadOnlyHealth({directory,config,plan,snapshot,ticket=null}) {
+  if(await localRecoveryOwned(path.join(directory,'fault-rescue.json')))
+    throw new Error('Local fault rescue termination is not verified; no empty journal or health marker may be created.');
   const journalFile=path.join(directory,'operation.json');let journalState=await readJson(journalFile);
   verifiedHealthEvidence({config,plan,snapshot,journalState,checkedAt:new Date().toISOString()});
   if(journalState===null) {
@@ -160,7 +163,9 @@ try {
     try {
       await client.initialize();
       const proof=await client.observeTurnState({threadId:ticket.threadId,clientUserMessageId:ticket.clientId,queuedId:ticket.queuedId??null});
-      if(proof.confirmed!==true || proof.stopped!==true)throw new Error('尚未确认故障诊断会话结束，不能交还执行权。');
+      const {isStoppedFaultRescueProof}=await import('./fault-rescue-proof.mjs');
+      if(!isStoppedFaultRescueProof(proof,{threadId:ticket.threadId,clientUserMessageId:ticket.clientId,queuedId:ticket.queuedId??null},
+        {now:Date.now(),maxAgeMs:60_000}))throw new Error('尚未确认故障诊断会话结束，不能交还执行权。');
       let verifiedRecovery=false,diagnostic,officialResult;
       const current=(await portal.call('seat_portal_status')).plan;
       const verifiedHandled=ticket.ticket.scope==='approved_member_ops'&&current.faultRescue?.id===id&&

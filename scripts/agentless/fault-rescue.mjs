@@ -3,6 +3,8 @@ import {randomUUID,createHash} from 'node:crypto';
 import {open} from 'node:fs/promises';
 import {readJson,atomicJson} from './journal.mjs';
 import {acceptanceDue} from '../seat-executor/core.mjs';
+import {isStoppedFaultRescueProof} from './fault-rescue-proof.mjs';
+import {finishedFaultRescueEvidence,stoppedFaultRescueEvidence,faultRescueIdentity} from './fault-rescue-ownership.mjs';
 
 const codes=new Set(['browser_unavailable','login_expired','unknown']);
 const scopes=new Set(['read_only_reconcile','approved_member_ops']);
@@ -62,11 +64,11 @@ export async function settleUndispatchedFaultRescue({directory,portal,hostSafe,c
   await atomicJson(file,r);return summary(r);
 }
 
-export function faultRescueGate(record) {
+export function faultRescueGate(record,{now=Date.now()}={}) {
   if(record===null||record===undefined)return {allowWorker:true,reason:'no_fault_rescue'};
   if(!validRecord(record))
     return {allowWorker:false,reason:'fault_rescue_evidence_invalid'};
-  if(record.phase==='finished'&&finalOutcomes.has(record.outcome)&&record.agentStopped===true)
+  if(finishedFaultRescueEvidence(record,{now}))
     return {allowWorker:true,reason:'fault_rescue_finished'};
   return {allowWorker:false,reason:'fault_rescue_owns_recovery'};
 }
@@ -150,7 +152,7 @@ export async function prepareFaultRescue({directory,config,portal,hostSafe,journ
   const wantsMember=c.scope==='approved_member_ops'&&p.globalFailureCode==='browser_unavailable'&&!p.lease&&!p.busy&&work.actions.length>0;
   const memberScope=wantsMember&&(p.memberRescue?.canBegin===true||!(p.blockedOperations??[]).length);
   const desiredScope=memberScope?'approved_member_ops':'read_only_reconcile';
-  const existingOwn=previous&&previous.failureId===p.globalFailureId&&!faultRescueGate(previous).allowWorker;
+  const existingOwn=previous&&previous.failureId===p.globalFailureId&&!faultRescueGate(previous,{now:clock().getTime()}).allowWorker;
   if(wantsMember&&p.memberRescue?.canBegin===false&&!restoring&&!existingOwn)
     return {state:'suppressed',reason:'member_rescue_'+p.memberRescue.reason,pendingCount:work.pendingCount,modelCalls:0};
   if(previous) {
@@ -161,7 +163,7 @@ export async function prepareFaultRescue({directory,config,portal,hostSafe,journ
       const checked={...previous,pendingCount:available.length,updatedAt:clock().toISOString()};
       await atomicJson(file,checked);return {...summary(checked),...(available.length?{}:{reason:'pending_work_cancelled'})};
     }
-    const repeatMember=previous.failureId===p.globalFailureId&&faultRescueGate(previous).allowWorker&&memberScope&&
+    const repeatMember=previous.failureId===p.globalFailureId&&faultRescueGate(previous,{now:clock().getTime()}).allowWorker&&memberScope&&
       ['handled','unresolved','needs_human'].includes(previous.outcome)&&
       ((previous.history??[]).filter(x=>x.ticketId&&x.scope==='approved_member_ops'&&x.failureId===p.globalFailureId).length+
         (previous.ticket?.scope==='approved_member_ops'?1:0))<2;
@@ -183,7 +185,7 @@ export async function prepareFaultRescue({directory,config,portal,hostSafe,journ
       const restored={...previous,phase:'prepared',ticket,pendingCount:work.pendingCount,updatedAt:clock().toISOString()};delete restored.reason;
       await atomicJson(file,restored);return summary(restored);
     }
-    if(!faultRescueGate(previous).allowWorker)throw new Error('A previous rescue still owns recovery.');
+    if(!faultRescueGate(previous,{now:clock().getTime()}).allowWorker)throw new Error('A previous rescue still owns recovery.');
     // Only a verified health epoch may authorize a new incident. A changed
     // failure ID or process restart alone cannot produce a wake storm.
     const health=await readJson(path.join(directory,'browser-retry.json'));
@@ -308,7 +310,7 @@ export async function dispatchPreparedFaultRescue({directory,client,hostSafe,pro
 /** Queue absence never permits resending an interrupted/ambiguous dispatch. */
 export async function reconcileFaultRescueDispatch({directory,client,clock=()=>new Date()}) {
   const file=faultRescueFile(directory);let r=await readJson(file);
-  if(!r||!['sending','uncertain'].includes(r.phase)||!r.dispatchStartedAt||r.finishIntent||r.agentStopped===true)return summary(r);
+  if(!r||!['sending','uncertain'].includes(r.phase)||!r.dispatchStartedAt||r.finishIntent||stoppedFaultRescueEvidence(r)!==null)return summary(r);
   let entries;
   try {entries=await client.queued(r.threadId);}catch{return summary(r);}
   const matches=entries.filter(x=>x.clientUserMessageId===r.clientId||x.clientId===r.clientId);
@@ -335,10 +337,7 @@ export async function requestFaultRescueAck({directory,rescueId,outcome,clock=()
 }
 
 function stoppedProof(proof,r,now) {
-  return proof?.kind==='codex_turn_state'&&proof.confirmed===true&&proof.stopped===true&&
-    proof.source==='app_server_thread_read'&&proof.threadId===r.threadId&&proof.clientUserMessageId===r.clientId&&
-    safeId(proof.turnId)&&safeId(proof.linkedTurnId)&&['completed','failed','interrupted'].includes(proof.status)&&
-    fresh(proof.observedAt,now)&&(!r.queuedId||proof.queuedId===r.queuedId);
+  return isStoppedFaultRescueProof(proof,faultRescueIdentity(r),{now,maxAgeMs:60_000});
 }
 function explicitHumanDiagnostic(d,now) {
   if(!d||Object.keys(d).sort().join(',')!=='expectedUrl,observedAt,stage,state,version'||d.version!==1||
@@ -355,18 +354,9 @@ export async function settleFaultRescue({directory,portal,client,hostSafe,verifi
   clock=()=>new Date()}) {
   if(hostSafe!==true)throw new Error('Cannot settle while a routine executor is alive.');
   const file=faultRescueFile(directory);let r=await readJson(file);
-  if(!r||r.phase==='finished'||r.outcome==='uncertain'&&r.agentStopped===true&&verifiedRecovery!==true&&verifiedHandled!==true)return summary(r);
+  if(!r||r.phase==='finished'&&finishedFaultRescueEvidence(r,{now:clock().getTime()})||
+      r.outcome==='uncertain'&&stoppedFaultRescueEvidence(r,{now:clock().getTime()})!==null&&verifiedRecovery!==true&&verifiedHandled!==true)return summary(r);
   if(!validRecord(r))throw new Error('Fault rescue evidence is invalid; preserve it for review.');
-  if(r.phase==='finishing'||r.reason==='finish_result_unknown') {
-    const response=await portal.call('fault_rescue_status');
-    const t=response.ticket;
-    if(t?.id===r.ticket?.id&&(t.phase==='finished'&&t.outcome===r.finishIntent?.outcome||
-        t.phase==='uncertain'&&r.finishIntent?.outcome==='uncertain')) {
-      r={...r,phase:t.phase,outcome:r.finishIntent.outcome,agentStopped:true,updatedAt:clock().toISOString()};delete r.reason;
-      await atomicJson(file,r);
-    }
-    return summary(r);
-  }
   if(!r.ticket||!r.dispatchStartedAt)return summary(r);
   const identity={threadId:r.threadId,clientUserMessageId:r.clientId,queuedId:r.queuedId??null};
   const proof=await client.observeTurnState(identity);
@@ -391,6 +381,19 @@ export async function settleFaultRescue({directory,portal,client,hostSafe,verifi
       return {...summary(r),reason:'agent_budget_exceeded_stop_unconfirmed'};
     }
     return {...summary(r),reason:'agent_stop_unconfirmed'};
+  }
+  // Old versions could persist a finished/finishing record from a reconstructed
+  // interrupted enum without completedAt. Preserve that original evidence;
+  // only a fresh, fully completed family may certify it for future consumers.
+  if(r.phase==='finished'||r.phase==='finishing'||r.reason==='finish_result_unknown') {
+    const response=await portal.call('fault_rescue_status'),t=response.ticket;
+    const intended=r.phase==='finished'?r.outcome:r.finishIntent?.outcome;
+    if(t?.id===r.ticket?.id&&t.failureId===r.failureId&&
+        (t.phase==='finished'&&t.outcome===intended||t.phase==='uncertain'&&intended==='uncertain')) {
+      r={...r,phase:t.phase,outcome:intended,agentStopped:true,terminalRevalidationProof:proof,updatedAt:clock().toISOString()};
+      delete r.reason;await atomicJson(file,r);
+    }
+    return summary(r);
   }
   const ack=await readJson(ackFile(directory));
   const matchingAck=ack?.rescueId===r.ticket.id&&ack.clientId===r.clientId&&outcomes.has(ack.outcome);

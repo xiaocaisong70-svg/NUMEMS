@@ -1,11 +1,37 @@
 import { readFile,writeFile,rename,mkdir,open,unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-export async function atomicJson(file,value) {
+import {performance} from 'node:perf_hooks';
+
+const WINDOWS_RENAME_BUSY_CODES=new Set(['EPERM','EACCES','EBUSY']);
+const WINDOWS_RENAME_RETRY_DELAYS=[10,20,40,80,120,160];
+const WINDOWS_RENAME_RETRY_BUDGET_MS=500;
+const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+
+/** Windows may briefly deny an atomic replace while a reader holds the target.
+ * Retry only this immutable temp-file commit, never the producer/business
+ * operation. This is not CAS: callers still need their existing ownership
+ * guards. A permanent failure retains both the old file and original temp. */
+async function commitJson(tmp,file,{platform=process.platform,renameFile=rename,sleep=pause,now=()=>performance.now()}={}) {
+  const started=now();let attempts=0;
+  for(;;) {
+    try {await renameFile(tmp,file);return;}
+    catch(error) {
+      if(platform!=='win32'||!WINDOWS_RENAME_BUSY_CODES.has(error.code)||attempts>=WINDOWS_RENAME_RETRY_DELAYS.length)throw error;
+      const elapsed=now()-started,delay=WINDOWS_RENAME_RETRY_DELAYS[attempts++];
+      if(!Number.isFinite(elapsed)||elapsed<0||elapsed+delay>=WINDOWS_RENAME_RETRY_BUDGET_MS)throw error;
+      await sleep(delay);
+      const afterWait=now()-started;
+      if(!Number.isFinite(afterWait)||afterWait<0||afterWait>=WINDOWS_RENAME_RETRY_BUDGET_MS)throw error;
+    }
+  }
+}
+
+export async function atomicJson(file,value,commitOptions) {
   await mkdir(path.dirname(file),{recursive:true});
   const tmp=`${file}.${randomUUID()}.tmp`;
   await writeFile(tmp,JSON.stringify(value,null,2)+'\n',{mode:0o600});
-  await rename(tmp,file);
+  await commitJson(tmp,file,commitOptions);
 }
 export async function readJson(file) {
   try { return JSON.parse(await readFile(file,'utf8')); }

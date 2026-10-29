@@ -2,9 +2,11 @@ import test from 'node:test';import assert from 'node:assert/strict';
 import path from 'node:path';import os from 'node:os';
 import {mkdtemp,mkdir,copyFile,writeFile,readFile,rm,lstat} from 'node:fs/promises';
 import {createHash} from 'node:crypto';
+import {completedRescueProof} from './helpers/completed-rescue-proof.mjs';
 import {verifyBackup,rollbackV13,optionsFromArgs,localRollbackGate,nativeRollbackGate,cloudRollbackGate,V13_BACKUP} from '../scripts/agentless/rollback-v13.mjs';
 const backup='D:/codexspace/reports/agentless-before-v14-20261028',now=Date.now();
 const at=new Date(now).toISOString(),hash=b=>createHash('sha256').update(b).digest('hex');
+function closedRescue(outcome='unresolved'){const r={version:1,phase:'finished',agentStopped:true,outcome,failureId:'failure-fixture',clientId:'client-fixture',threadId:'thread-fixture',createdAt:at,updatedAt:at,ticket:{id:'rescue_test',token:'synthetic-preserved-secret'}};return {...r,agentProof:completedRescueProof(r)};}
 const native=async()=>({supported:true,processes:[],tasks:[{name:'NUMEMS-Agentless',state:'Disabled'}]});
 const cloudReport=()=>({command:'rollback-status',startedAt:at,finishedAt:at,success:true,modelCalls:0,
   result:{revision:10,schedulerEnabled:false,memberEnabled:false,busy:false,holds:0,faultRescue:null,incompatiblePending:1}});
@@ -18,7 +20,7 @@ async function fixture() {
   const save=async(name,value)=>writeFile(path.join(runtime,name),JSON.stringify(value));
   await save('config.json',config);await save('stop-result.json',{state:'stopped',modelCalls:0,startedAt:at,finishedAt:at});
   await save('operation.json',{phase:'settled',updatedAt:at});await save('host-desktop.json',{state:'exited',processId:12345});
-  await save('fault-rescue.json',{version:1,phase:'finished',agentStopped:true,outcome:'unresolved',ticket:{id:'rescue_test',token:'synthetic-preserved-secret'}});
+  await save('fault-rescue.json',closedRescue());
   await writeFile(path.join(runtime,'browser','synthetic-cookie.dat'),'fabricated-cookie-bytes');
   const options={targetRoot:target,backupDir:path.resolve(backup),archiveDir:archive,apply:true,verifyCloud:true};
   const deps={native,cloud:async()=>cloudReport(),now:()=>now};
@@ -95,7 +97,7 @@ test('interrupted file replacement stays stopped, retains full staging/preimages
 });
 test('handled fallback requires verified cloud downgrade before source restore and archives original outcome',async()=>{
   const f=await fixture();try {
-    const rescue={version:1,phase:'finished',agentStopped:true,outcome:'handled',ticket:{id:'rescue_test'}};
+    const rescue=closedRescue('handled');
     await f.save('fault-rescue.json',rescue);let prepared=0;
     const deps={...f.deps,cloud:async()=>({...cloudReport(),result:{...cloudReport().result,
       faultRescue:{phase:'finished',outcome:prepared?'unresolved':'handled'}}}),prepareCloud:async(root,revision)=>{

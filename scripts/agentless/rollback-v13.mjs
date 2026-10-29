@@ -6,6 +6,7 @@ import {readFile,writeFile,mkdir,lstat,readdir,copyFile,rename,open,unlink} from
 import {createHash,randomUUID} from 'node:crypto';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {finishedFaultRescueEvidence} from './fault-rescue-ownership.mjs';
 const exec=promisify(execFile);
 export const V13_BACKUP={commit:'336b98236f694c3ea574e970efaaf29361b0e909',count:300,
   manifestSha256:'31675c9c1ff19fff7ce872154617b343083b73412f2b4571407e446d577fd0d0',
@@ -55,7 +56,7 @@ export async function localRollbackGate(targetRoot,now=Date.now()) {
   const journal=await json(path.join(runtime,'operation.json'));
   if(journal&&(journal.phase!=='settled'||journal.lease!=null||journal.receipt!=null||journal.submission!=null))throw new Error('Unsettled operation journal; no rollback or evidence deletion.');
   const rescue=await json(path.join(runtime,'fault-rescue.json'));
-  if(rescue&&!(rescue.version===1&&rescue.phase==='finished'&&rescue.agentStopped===true&&['recovered','unresolved','needs_human','handled'].includes(rescue.outcome)&&typeof rescue.ticket?.id==='string'))
+  if(rescue&&!finishedFaultRescueEvidence(rescue,{now}))
     throw new Error('A pending, active, invalid or uncertain fault rescue still owns recovery.');
   const config=await json(path.join(runtime,'config.json'));
   if(config?.siteUrl!=='https://numems-seat-portal-agentless.workspace-026021.chatgpt.site/'||config.adminEmail!=='xiaocaisong70@gmail.com'||

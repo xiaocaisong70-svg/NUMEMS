@@ -8,6 +8,7 @@ import {readJson,atomicJson} from '../scripts/agentless/journal.mjs';
 import {localRecoveryOwned} from '../scripts/agentless/recovery-fence.mjs';
 import {PortalClient,PortalOperationRejected} from '../scripts/seat-executor/portal-client.mjs';
 import {validateConfig} from '../scripts/agentless/config.mjs';
+import {completedRescueProof} from './helpers/completed-rescue-proof.mjs';
 const base=Date.parse('2026-10-28T10:00:00Z'),iso=n=>new Date(base+n).toISOString();
 async function fixture(t) {
   const directory=await mkdtemp(path.join(os.tmpdir(),'numems-v14-broker-'));
@@ -44,8 +45,8 @@ async function fixture(t) {
     throw new Error('Unexpected operation '+name);
   }};
   const client={async enqueue(threadId,clientId,prompt){wakes++;assert.ok(!prompt.includes(ticket.token));return{queuedSubmission:{id:'queue-'+wakes}};},
-    async observeTurnState(identity){return{kind:'codex_turn_state',source:'app_server_thread_read',confirmed:true,stopped:true,
-      ...identity,turnId:'turn-fixture',linkedTurnId:'turn-fixture',status:'completed',observedAt:clock().toISOString()};}};
+    async observeTurnState(identity){return completedRescueProof({threadId:identity.threadId,clientId:identity.clientUserMessageId,
+      queuedId:identity.queuedId,createdAt:iso(0),updatedAt:clock().toISOString()});}};
   const args={directory,config,portal,hostSafe:true,journalState:{phase:'settled'},clock,newId:()=> 'uuid-'+(++sequence)};
   return {directory,config,plan,portal,client,args,calls,clock,advance(n){ms+=n;},get ticket(){return ticket;},
     get counts(){return {wakes,finishes,begins:calls.filter(x=>x[0]==='begin_fault_rescue').length};},

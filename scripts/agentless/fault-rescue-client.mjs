@@ -6,6 +6,16 @@ function iso(value) {
   const milliseconds=typeof value==='number'&&Number.isFinite(value)?value*(value<1e12?1000:1):Date.parse(value);
   return Number.isFinite(milliseconds)?new Date(milliseconds).toISOString():null;
 }
+function terminalTurnEvidence(turn,observedAt) {
+  const startedAt=iso(turn.startedAt),completedAt=iso(turn.completedAt);
+  // A separately connected App Server can reconstruct an actively executing
+  // desktop turn as `interrupted` with no completedAt. The status enum alone
+  // is not a termination receipt. Require the persisted completion timestamp
+  // on every linked turn, never infer it from thread/notLoaded or queue absence.
+  const ended=finalStates.has(turn.status)&&startedAt!==null&&completedAt!==null&&
+    Date.parse(completedAt)>=Date.parse(startedAt)&&Date.parse(completedAt)<=observedAt;
+  return {turnId:turn.id,status:turn.status,startedAt,completedAt,ended};
+}
 
 /** Only server-returned userMessage.clientId binds a queued submission to a
  * turn. Missing queue entries, thread.status and an agent-authored ACK are not
@@ -30,10 +40,18 @@ export function faultRescueTurnProof(response,{threadId,clientUserMessageId,queu
   if(!safeId(turn.id)||!safeId(linkedTurnId)||typeof turn.status!=='string')
     return {confirmed:false,reason:'turn_evidence_invalid'};
   const users=(turn.items??[]).filter(x=>x.type==='userMessage');
-  return {kind:'codex_turn_state',confirmed:true,stopped:chain.every(value=>finalStates.has(value.status)),
+  const terminalChain=chain.map(value=>terminalTurnEvidence(value,now.getTime()));
+  // Continuations can keep the same root while the original client-bearing
+  // turn already has a completion receipt. Include every observed descendant.
+  const familyIds=new Set(chain.map(value=>value.id));let changed=true;
+  while(changed) {changed=false;for(const candidate of thread.turns)if(!familyIds.has(candidate.id)&&
+    familyIds.has(candidate.rootTurnId)){familyIds.add(candidate.id);changed=true;}}
+  const terminalFamily=thread.turns.filter(value=>familyIds.has(value.id)).map(value=>terminalTurnEvidence(value,now.getTime()));
+  return {kind:'codex_turn_state',confirmed:true,stopped:terminalFamily.every(value=>value.ended),
     threadId,clientUserMessageId,queuedId:queuedId??null,turnId:turn.id,linkedTurnId,
     status:turn.status,observedAt:now.toISOString(),source:'app_server_thread_read',
     startedAt:iso(turn.startedAt),completedAt:iso(turn.completedAt),
+    terminalEvidence:'status_and_completed_at',terminalChain,terminalFamily,
     exclusiveTurn:turn.itemsView!=='summary'&&turn.itemsView!=='notLoaded'&&turn.id===linkedTurnId&&
       users.length===1&&users[0].clientId===clientUserMessageId};
 }
@@ -52,12 +70,16 @@ export async function readFaultRescueTurnProof(request,identity,{pageSize=8,maxP
   const meta=await request('thread/read',{threadId:identity.threadId,includeTurns:false});
   if(meta?.thread?.id!==identity.threadId||(meta.thread.turns?.length??0)!==0)
     return {confirmed:false,reason:'thread_metadata_invalid'};
-  const turns=[],ids=new Set(),cursors=new Set();let cursor;
+  const turns=[],ids=new Set(),cursors=new Set();let cursor,firstPageFingerprint;
+  const fingerprint=page=>JSON.stringify(page.data.map(t=>({id:t.id,rootTurnId:t.rootTurnId,status:t.status,
+    startedAt:t.startedAt,completedAt:t.completedAt,itemsView:t.itemsView,
+    users:t.items?.filter(i=>i.type==='userMessage').map(i=>({id:i.id,clientId:i.clientId,rootTurnId:i.rootTurnId}))})));
   for(let pages=1;pages<=maxPages;pages++) {
     const page=await request('thread/turns/list',{threadId:identity.threadId,limit:pageSize,
       itemsView:'summary',sortDirection:'desc',...(cursor?{cursor}:{})});
     if(!page||!Array.isArray(page.data)||page.data.length>pageSize)
       return {confirmed:false,reason:'turn_page_invalid'};
+    if(pages===1)firstPageFingerprint=fingerprint(page);
     for(const turn of page.data) {
       if(!safeId(turn?.id)||ids.has(turn.id)||turn.itemsView!=='summary'||!Array.isArray(turn.items))
         return {confirmed:false,reason:'turn_summary_invalid'};
@@ -73,8 +95,14 @@ export async function readFaultRescueTurnProof(request,identity,{pageSize=8,maxP
     if(Buffer.byteLength(JSON.stringify(turns))>maxMetadataBytes)
       return {confirmed:false,reason:'turn_metadata_budget_exceeded'};
     const proof=faultRescueTurnProof({thread:{id:identity.threadId,turns}},identity,clock());
-    if(proof.confirmed||!['client_message_not_found','root_turn_not_found'].includes(proof.reason))
-      return {...proof,readMethod:'thread/turns/list',itemsCoverage:'summary',pagesRead:pages};
+    if(proof.confirmed||!['client_message_not_found','root_turn_not_found'].includes(proof.reason)) {
+      if(proof.stopped) {
+        const head=await request('thread/turns/list',{threadId:identity.threadId,limit:pageSize,itemsView:'summary',sortDirection:'desc'});
+        if(!Array.isArray(head?.data)||head.data.length>pageSize||fingerprint(head)!==firstPageFingerprint)
+          return {...proof,stopped:false,reason:'turn_head_changed',readMethod:'thread/turns/list',itemsCoverage:'summary',pagesRead:pages};
+      }
+      return {...proof,headRevalidated:proof.stopped===true,readMethod:'thread/turns/list',itemsCoverage:'summary',pagesRead:pages};
+    }
     if(page.nextCursor==null)return {...proof,readMethod:'thread/turns/list',pagesRead:pages};
     if(typeof page.nextCursor!=='string'||!page.nextCursor||page.nextCursor.length>10_000||cursors.has(page.nextCursor))
       return {confirmed:false,reason:'turn_cursor_invalid'};

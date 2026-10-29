@@ -9,6 +9,7 @@ import {prepareFaultRescue,faultRescueFile} from '../scripts/agentless/fault-res
 import {validateConfig} from '../scripts/agentless/config.mjs';
 import {AgentlessBrowser,isDedicatedObservation} from '../scripts/agentless/browser.mjs';
 import {recordReadOnlyHealth} from '../scripts/agentless/admin.mjs';
+import {completedRescueProof} from './helpers/completed-rescue-proof.mjs';
 
 const base=Date.parse('2026-10-28T15:00:00Z'),at=ms=>new Date(base+ms).toISOString();
 const config=validateConfig({liveActions:true,faultRescue:{enabled:true,scope:'read_only_reconcile',threadId:'thread-fixture',timeoutSeconds:300}});
@@ -23,6 +24,7 @@ async function fixture(t) {
     clientId:'numems-fault:client-one',threadId:'thread-fixture',createdAt:at(30000),updatedAt:at(40000),
     ticket:{id:'rescue_0123456789abcdef0123456789abcdef',failureId:'codex_failure_one',token:'fixture-only-protected-token',
       phase:'pending',scope:'read_only_reconcile'}};
+  rescue.agentProof=completedRescueProof(rescue);
   const snapshot={complete:true,workspaceId:config.workspaceId,workspaceName:config.workspaceName,accountEmail:config.adminEmail,
     totalSeats:config.totalSeats,seatLabel:config.seatLabel,observedAt:at(50000),pageUrl:`https://admin.openai.com/workspace/${config.workspaceId}/members`,
     members:[{email:config.adminEmail,role:'owner',seatLabel:config.seatLabel}],invites:[]};
@@ -58,13 +60,25 @@ test('a ticket alone, stale/missing official evidence or an ongoing fault cannot
 });
 
 test('unmatched, unclosed or future rescue metadata cannot reset a valid retained health epoch',async t=>{
-  for(const change of [f=>{f.rescue.phase='queued';},f=>{f.rescue.agentStopped=false;},f=>{f.plan.faultRescue.id='rescue_ffffffffffffffffffffffffffffffff';},
+  for(const change of [f=>{f.plan.faultRescue.id='rescue_ffffffffffffffffffffffffffffffff';},
     f=>{f.plan.faultRescue.failureId='codex_another_failure';},f=>{f.plan.faultRescue.outcome='recovered';},
     f=>{f.rescue.createdAt=at(60000);},f=>{f.rescue.updatedAt=at(60000);},f=>{f.plan.faultRescue.updatedAt=at(60000);},
     f=>{f.rescue.createdAt=at(10000);},f=>{f.rescue.ticket.scope='different_scope';}]) {
     const f=await fixture(t);change(f);await atomicJson(faultRescueFile(f.directory),f.rescue);
     const before=await readFile(f.retry,'utf8'),result=await markRuntimeHealthy(f.args);
     assert.equal(result.backoffReset,false);assert.equal(result.healthEpochRotated,false);assert.equal(await readFile(f.retry,'utf8'),before);
+  }
+});
+
+test('local unended or legacy status-only rescue cannot reset health or initialize an empty journal',async t=>{
+  for(const change of [r=>{r.phase='queued';},r=>{r.agentStopped=false;},r=>{delete r.agentProof.terminalEvidence;},
+    r=>{r.agentProof.status='interrupted';r.agentProof.completedAt=null;}]) {
+    const f=await fixture(t);change(f.rescue);await atomicJson(faultRescueFile(f.directory),f.rescue);
+    const before=await readFile(f.retry,'utf8');
+    await assert.rejects(markRuntimeHealthy(f.args),error=>error.healthDiagnostic?.reason==='local_fault_rescue_unsettled');
+    assert.equal(await readFile(f.retry,'utf8'),before);
+    await assert.rejects(recordReadOnlyHealth({directory:f.directory,config,plan:f.plan,snapshot:f.snapshot,ticket:f.rescue}),/termination/);
+    assert.equal(await readJson(path.join(f.directory,'operation.json')),null);
   }
 });
 
@@ -85,6 +99,7 @@ test('rotated official health re-arms only a later independent fault, without st
 test('a second closed independent rescue can rotate again, while the same old ticket cannot',async t=>{
   const f=await fixture(t);await markRuntimeHealthy(f.args);
   Object.assign(f.rescue,{failureId:'codex_failure_two',createdAt:at(70000),updatedAt:at(80000)});
+  f.rescue.agentProof=completedRescueProof(f.rescue);
   Object.assign(f.rescue.ticket,{id:'rescue_ffffffffffffffffffffffffffffffff',failureId:f.rescue.failureId});
   Object.assign(f.plan.faultRescue,{id:f.rescue.ticket.id,failureId:f.rescue.failureId,createdAt:at(71000),updatedAt:at(81000)});
   await atomicJson(faultRescueFile(f.directory),f.rescue);
@@ -115,6 +130,7 @@ test('administrator finish health entry preserves dedicated provenance and canno
   const f=await fixture(t),atNow=new Date().toISOString(),createdAt=new Date(Date.now()-2000).toISOString();
   f.rescue.scope='approved_member_ops';f.rescue.ticket.scope='approved_member_ops';f.rescue.outcome='handled';
   Object.assign(f.rescue,{createdAt,updatedAt:createdAt});
+  f.rescue.agentProof=completedRescueProof(f.rescue);
   Object.assign(f.plan.faultRescue,{scope:'approved_member_ops',outcome:'handled',createdAt,updatedAt:createdAt});
   f.snapshot.observedAt=atNow;f.plan.officialObservedAt=atNow;f.plan.checkedAt=atNow;
   await atomicJson(f.retry,{version:2,state:'healthy',healthyAt:new Date(Date.now()-10000).toISOString(),

@@ -1,3 +1,13 @@
+# NUMEMS agentless V14.2
+
+Developed by xcsong.
+
+Tag: `agentless-v14.2-source`. This public archive preserves the sanitized repository history; local source commit: `f80cd00f944903c14348e099f9342e740f06ff16`.
+
+Includes V14.1 rescue termination proof and atomic journal fixes, plus exact compatibility for the updated official workspace selector. 662 regression tests passed. Two real invitations were sent by the ordinary script and both employees became active. This patch did not re-test a live expired-member removal. Official login/security checks can still require administrator action.
+
+See [repair details](docs/V14.2-WORKSPACE-COMPATIBILITY.md), [rollback instructions](ROLLBACK-V14.2.md), and [release manifest](releases/agentless-v14.2-source/manifest.json). Runtime credentials, browser profiles and production data are excluded. Older release manifests remain historical snapshots.
+
 # NUMEMS agentless V14
 
 Developed by xcsong.

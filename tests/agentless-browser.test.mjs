@@ -7,7 +7,7 @@ import {validateConfig,ADMIN} from '../scripts/agentless/config.mjs';
 
 function html({members,invites,tab,selectorRole,delay=0,formTitle='邀请加入 My Workspace',seatCommits=true}) {
   const rows=(tab==='invites'?invites:members).map(email=>`<tr><td>${email===ADMIN?'Owner（你）':'Staff'}<br>${email}</td><td>角色类型<br>${email===ADMIN?'所有者':'成员'}</td><td>席位类型<br>高级</td><td><button aria-label="打开 ${email} 的操作" onclick="menu('${email}')">操作</button></td></tr>`).join('');
-  return `<!doctype html><html><head><meta charset="utf-8"></head><body><button aria-label="当前选择：My Workspace">My Workspace</button>
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body><button aria-label="选择 ChatGPT 工作空间或 Ads 账户。当前选择：My Workspace，ChatGPT 工作空间">My Workspace</button>
   <section><b>${4}</b><br><span>高级席位</span><dl><dt>已分配</dt><dd>${members.length+invites.length}</dd><dt>可用</dt><dd>${4-members.length-invites.length}</dd></dl></section>
   <button role="tab" aria-selected="${tab==='members'}">用户</button><button role="tab" aria-selected="${tab==='invites'}">待处理的邀请</button>
   <button aria-label="邀请成员" onclick="later(inviteDialog)">邀请成员</button>
@@ -28,7 +28,7 @@ function html({members,invites,tab,selectorRole,delay=0,formTitle='邀请加入 
 
 for(const [selectorRole,delay] of [['combobox',0],['button',0],['button',350]]) test(`official UI fixture: invitation, pending revoke, member removal (${selectorRole}, delay ${delay})`,async()=>{
   const browser=await chromium.launch({channel:'msedge',headless:true});
-  const context=await browser.newContext();const page=await context.newPage();page.setDefaultTimeout(3000);
+  const context=await browser.newContext({serviceWorkers:'block'});const page=await context.newPage();page.setDefaultTimeout(3000);
   let members=[ADMIN],invites=[],formTitle=delay?'邀请团队成员':'邀请加入 My Workspace',seatCommits=true;const clicks=[];
   await page.exposeFunction('fixtureAction',(kind,email)=>{
     assert.notEqual(email,ADMIN);clicks.push({kind,email});

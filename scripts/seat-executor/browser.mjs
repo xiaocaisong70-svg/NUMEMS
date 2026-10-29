@@ -160,7 +160,7 @@ export class BrowserAdapter {
     // Read its exact workspace identity; only() still requires a unique, visibly rendered button.
     const workspace = escape(this.config.workspaceName);
     const switcher = p.getByRole("button", { includeHidden: true,
-      name: new RegExp(`^(?:(?:当前选择[：:]|Current selection:)\\s*${workspace}|选择全局设置、ChatGPT 工作空间或 Ads 账户。当前选择[：:]\\s*${workspace}，ChatGPT 工作空间)$`) });
+      name: new RegExp(`^(?:(?:当前选择[：:]|Current selection:)\\s*${workspace}|选择(?:全局设置、| )ChatGPT 工作空间或 Ads 账户。当前选择[：:]\\s*${workspace}，ChatGPT 工作空间)$`) });
     await only(switcher, "工作空间选择器");
   }
   async load(tab = "members") {

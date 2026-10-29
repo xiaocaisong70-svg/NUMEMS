@@ -11,6 +11,7 @@ import {runBatch} from '../scripts/agentless/core.mjs';
 import {diagnoseHealthEvidence} from '../scripts/agentless/health-cycle.mjs';
 import {localContextRecoveryEligible} from '../scripts/agentless/main.mjs';
 import {recordReadOnlyHealth} from '../scripts/agentless/admin.mjs';
+import {completedRescueProof} from './helpers/completed-rescue-proof.mjs';
 
 async function fixture(t) {
   const dir=await mkdtemp(path.join(os.tmpdir(),'numems-rescue-readonly-'));
@@ -46,7 +47,9 @@ test('local unresolved dispatch fences startup; only a genuinely finished diagno
   for(const phase of ['prepared','sending','queued','uncertain','finishing']){
     await atomicJson(file,{version:1,phase});assert.equal(await localRecoveryOwned(file),true);
   }
-  await atomicJson(file,{version:1,phase:'finished',agentStopped:true,outcome:'unresolved',ticket:{id:'rescue_1234567890abcdef'}});
+  const closed={version:1,phase:'finished',agentStopped:true,outcome:'unresolved',ticket:{id:'rescue_1234567890abcdef'},
+    failureId:'fault-fixture',clientId:'client-fixture',threadId:'thread-fixture',createdAt:f.snapshot.observedAt};
+  await atomicJson(file,{...closed,agentProof:completedRescueProof(closed)});
   assert.equal(await localRecoveryOwned(file),false);
   assert.equal(cloudRecoveryOwned({faultRescue:{phase:'uncertain'}}),true);
 });

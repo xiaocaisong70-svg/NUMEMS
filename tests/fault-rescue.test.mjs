@@ -4,6 +4,7 @@ import {atomicJson,readJson} from '../scripts/agentless/journal.mjs';
 import {prepareFaultRescue,dispatchPreparedFaultRescue,reconcileFaultRescueDispatch,requestFaultRescueAck,
   settleFaultRescue,faultRescueFile,faultRescueGate,faultRescuePrompt} from '../scripts/agentless/fault-rescue.mjs';
 import {faultRescueTurnProof,readFaultRescueTurnProof,FaultRescueClient} from '../scripts/agentless/fault-rescue-client.mjs';
+import {isStoppedFaultRescueProof} from '../scripts/agentless/fault-rescue-proof.mjs';
 
 const base=Date.parse('2026-10-28T10:00:00.000Z');
 async function fixture(t) {
@@ -26,8 +27,9 @@ async function fixture(t) {
   }};
   let proof;
   const client={async enqueue(threadId,clientId,text){wakes++;const saved=await readJson(faultRescueFile(directory));assert.equal(saved.phase,'sending');assert.equal(saved.clientId,clientId);assert.ok(!text.includes(ticket.token));return{queuedSubmission:{id:'queue-fixture'}};},
-    async queued(){return[];},async observeTurnState(identity){return proof??{kind:'codex_turn_state',confirmed:true,stopped:true,
-      ...identity,turnId:'turn-fixture',linkedTurnId:'turn-fixture',status:'completed',observedAt:clock().toISOString(),source:'app_server_thread_read'};}};
+    async queued(){return[];},async observeTurnState(identity){return proof??faultRescueTurnProof({thread:{id:identity.threadId,
+      turns:[{id:'turn-fixture',status:'completed',startedAt:new Date(base-1000).toISOString(),completedAt:clock().toISOString(),
+        items:[{type:'userMessage',clientId:identity.clientUserMessageId}]}]}},identity,clock());}};
   const args={directory,config,portal,hostSafe:true,journalState:{phase:'settled'},clock,newId:()=> 'uuid-fixture'};
   return{directory,config,plan,portal,client,args,clock,advance(n){ms+=n;},setProof(p){proof=p;},
     get counts(){return{begins,finishCalls,wakes};},get ticket(){return ticket;},
@@ -119,7 +121,7 @@ test('server turn proof links exact userMessage.clientId and never treats queue 
   const id={threadId:'thread-fixture',clientUserMessageId:'client-fixture',queuedId:'queue-fixture'};
   const response={thread:{id:id.threadId,status:{type:'notLoaded'},turns:[]}};
   assert.equal(faultRescueTurnProof(response,id).confirmed,false);
-  response.thread.turns=[{id:'turn-fixture',status:'completed',items:[{type:'userMessage',clientId:id.clientUserMessageId,content:'not inspected'}]}];
+  response.thread.turns=[{id:'turn-fixture',status:'completed',startedAt:1793181600,completedAt:1793181610,items:[{type:'userMessage',clientId:id.clientUserMessageId,content:'not inspected'}]}];
   const p=faultRescueTurnProof(response,id);assert.equal(p.stopped,true);assert.equal(p.exclusiveTurn,true);
   response.thread.turns.push({...response.thread.turns[0],id:'duplicate'});assert.equal(faultRescueTurnProof(response,id).confirmed,false);
 });
@@ -129,6 +131,67 @@ test('a completed child does not release the active root turn and missing parent
   const r={thread:{id:id.threadId,turns:[child]}};assert.equal(faultRescueTurnProof(r,id).confirmed,false);
   r.thread.turns.push({id:'root-turn',status:'inProgress',items:[]});const p=faultRescueTurnProof(r,id);assert.equal(p.stopped,false);assert.equal(p.exclusiveTurn,false);
   child.status='inProgress';r.thread.turns[1].status='completed';assert.equal(faultRescueTurnProof(r,id).stopped,false);
+});
+
+test('actual interrupted/null App Server projection never releases a still executing rescue',()=>{
+  const id={threadId:'thread-fixture',clientUserMessageId:'numems-fault:actual-regression',queuedId:'queue-fixture'};
+  const turn={id:'turn-rescue',rootTurnId:'turn-rescue',status:'interrupted',startedAt:1793193605,
+    completedAt:null,itemsView:'summary',items:[{type:'userMessage',id:'msg-rescue',clientId:id.clientUserMessageId}]};
+  const response={thread:{id:id.threadId,status:{type:'notLoaded'},turns:[turn]}};
+  let p=faultRescueTurnProof(response,id,new Date('2026-10-28T13:21:20.147Z'));
+  assert.equal(p.confirmed,true);assert.equal(p.stopped,false);assert.equal(p.completedAt,null);
+  assert.equal(p.terminalEvidence,'status_and_completed_at');assert.equal(p.terminalChain[0].ended,false);
+  // The exact same turn later acquired a real completion receipt at 13:25:54.
+  turn.status='completed';turn.completedAt=1793193954;
+  p=faultRescueTurnProof(response,id,new Date('2026-10-28T13:26:00Z'));
+  assert.equal(p.stopped,true);assert.equal(p.completedAt,'2026-10-28T13:25:54.000Z');
+});
+
+test('all terminal enum values require valid ordered completion receipts on every linked turn',()=>{
+  const id={threadId:'thread-fixture',clientUserMessageId:'client-fixture'};
+  const ended={id:'ended-root',status:'completed',startedAt:1793181600,completedAt:1793181610,items:[]};
+  for(const status of ['completed','interrupted','failed'])for(const completedAt of [null,undefined,'invalid',1793181599,1793189999]) {
+    const child={id:'child',rootTurnId:'ended-root',status,startedAt:1793181600,completedAt,
+      items:[{type:'userMessage',clientId:id.clientUserMessageId}]};
+    const p=faultRescueTurnProof({thread:{id:id.threadId,turns:[child,ended]}},id,new Date('2026-10-28T10:01:00Z'));
+    assert.equal(p.confirmed,true);assert.equal(p.stopped,false,status+' '+String(completedAt));
+  }
+  for(const status of ['completed','interrupted','failed']) {
+    const child={id:'child',rootTurnId:'ended-root',status,startedAt:1793181600,completedAt:1793181610,
+      items:[{type:'userMessage',clientId:id.clientUserMessageId}]};
+    const response={thread:{id:id.threadId,turns:[child,{...ended,completedAt:null}]}};
+    assert.equal(faultRescueTurnProof(response,id,new Date('2026-10-28T10:01:00Z')).stopped,false);
+    response.thread.turns[1]=ended;
+    assert.equal(faultRescueTurnProof(response,id,new Date('2026-10-28T10:01:00Z')).stopped,true);
+  }
+});
+
+test('an active continuation descendant prevents release of the original completed client-bearing turn',()=>{
+  const id={threadId:'thread-fixture',clientUserMessageId:'client-fixture'};
+  const root={id:'root-turn',rootTurnId:'root-turn',status:'completed',startedAt:1793181600,completedAt:1793181610,
+    items:[{type:'userMessage',clientId:id.clientUserMessageId}]};
+  const child={id:'continuation-turn',rootTurnId:'root-turn',status:'inProgress',startedAt:1793181611,completedAt:null,items:[]};
+  const response={thread:{id:id.threadId,turns:[child,root]}};
+  let p=faultRescueTurnProof(response,id,new Date('2026-10-28T10:01:00Z'));
+  assert.equal(p.stopped,false);assert.equal(p.terminalFamily.length,2);
+  child.status='completed';child.completedAt=1793181620;
+  p=faultRescueTurnProof(response,id,new Date('2026-10-28T10:01:00Z'));
+  assert.equal(p.stopped,true);assert.equal(isStoppedFaultRescueProof(p,id,{now:new Date('2026-10-28T10:01:00Z')}),true);
+  p.terminalFamily[0].completedAt=null;
+  assert.equal(isStoppedFaultRescueProof(p,id,{now:new Date('2026-10-28T10:01:00Z')}),false);
+});
+
+test('pure stop validator rejects legacy persisted interrupted/null proof and forged family evidence',()=>{
+  const id={threadId:'thread-fixture',clientUserMessageId:'client-fixture',queuedId:'queue-fixture'},now=new Date('2026-10-28T10:01:00Z');
+  const turn={id:'root-turn',status:'interrupted',startedAt:1793181600,completedAt:1793181610,
+    items:[{type:'userMessage',clientId:id.clientUserMessageId}]};
+  const p=faultRescueTurnProof({thread:{id:id.threadId,turns:[turn]}},id,now);
+  assert.equal(isStoppedFaultRescueProof(p,id,{now}),true);
+  const legacy={...p,terminalEvidence:undefined,terminalChain:undefined,terminalFamily:undefined,completedAt:null};
+  assert.equal(isStoppedFaultRescueProof(legacy,id,{now}),false);
+  assert.equal(isStoppedFaultRescueProof({...p,readMethod:'thread/turns/list'},id,{now}),false);
+  assert.equal(isStoppedFaultRescueProof({...p,readMethod:'thread/turns/list',headRevalidated:true},id,{now}),true);
+  assert.equal(isStoppedFaultRescueProof(p,{...id,queuedId:'foreign'},{now}),false);
 });
 test('exceptional client cannot call old portal tools, create a model thread or grant approval',async()=>{
   const client=Object.create(FaultRescueClient.prototype);
@@ -185,14 +248,15 @@ function paginatedRequest(pages,calls) {
     calls.push({method,args});
     if(method==='thread/read') {assert.equal(args.includeTurns,false);return{thread:{id:identity.threadId,turns:[]}};}
     assert.equal(method,'thread/turns/list');assert.equal(args.itemsView,'summary');assert.equal(args.sortDirection,'desc');
-    return pages[index++]??{data:[],nextCursor:null};
+    return !args.cursor&&index>0?pages[0]:pages[index++]??{data:[],nextCursor:null};
   };
 }
 test('long-thread lifecycle uses official bounded summary pagination and retains no tool or message bodies',async()=>{
   const calls=[],request=paginatedRequest([{data:[summaryTurn('turn-fixture')],nextCursor:'older'}],calls);
   const proof=await readFaultRescueTurnProof(request,identity);
   assert.equal(proof.confirmed,true);assert.equal(proof.stopped,true);assert.equal(proof.exclusiveTurn,false);
-  assert.equal(proof.readMethod,'thread/turns/list');assert.equal(proof.pagesRead,1);assert.equal(calls.length,2);
+  assert.equal(proof.readMethod,'thread/turns/list');assert.equal(proof.pagesRead,1);assert.equal(calls.length,3);
+  assert.equal(proof.headRevalidated,true);assert.equal(isStoppedFaultRescueProof(proof,identity),true);
   assert.ok(!JSON.stringify(proof).includes('private-'));assert.ok(calls.every(c=>c.args.includeTurns!==true));
 });
 test('paginated metadata follows the exact root chain without treating a terminal parent as a terminal child',async()=>{
@@ -200,6 +264,36 @@ test('paginated metadata follows the exact root chain without treating a termina
   const request=paginatedRequest([{data:[child],nextCursor:'older'},{data:[root],nextCursor:null}],calls);
   const proof=await readFaultRescueTurnProof(request,identity,{pageSize:1});
   assert.equal(proof.confirmed,true);assert.equal(proof.stopped,false);assert.equal(proof.turnId,'root-turn');assert.equal(proof.pagesRead,2);
+});
+
+test('summary projection interrupted/null remains fenced until the same exact turn has a completedAt receipt',async t=>{
+  const f=await fixture(t);await f.prepare();await f.dispatch();
+  const r=await readJson(faultRescueFile(f.directory)),identity={threadId:r.threadId,clientUserMessageId:r.clientId,queuedId:r.queuedId};
+  const turn={id:'real-projection-turn',rootTurnId:'real-projection-turn',status:'interrupted',startedAt:base/1000-1,
+    completedAt:null,itemsView:'summary',items:[{type:'userMessage',id:'real-projection-item',clientId:r.clientId}]};
+  const request=async(method)=>method==='thread/read'?{thread:{id:r.threadId,turns:[],status:{type:'notLoaded'}}}:{data:[turn],nextCursor:null};
+  f.client.observeTurnState=async()=>readFaultRescueTurnProof(request,identity,{clock:f.clock});
+  assert.equal((await f.settle()).reason,'agent_stop_unconfirmed');assert.equal(f.counts.finishCalls,0);
+  assert.equal(faultRescueGate(await readJson(faultRescueFile(f.directory))).allowWorker,false);
+  turn.completedAt=base/1000;turn.status='completed';
+  assert.equal((await f.settle()).state,'finished');assert.equal(f.counts.finishCalls,1);
+});
+
+test('newer active same-root descendant is included before the older original message is found',async()=>{
+  const child=summaryTurn('continuation','continuation-client',{rootTurnId:'root-turn',status:'interrupted',completedAt:null});
+  const root=summaryTurn('root-turn');
+  const proof=await readFaultRescueTurnProof(paginatedRequest([{data:[child],nextCursor:'older'},{data:[root],nextCursor:null}],[]),identity,{pageSize:1});
+  assert.equal(proof.confirmed,true);assert.equal(proof.stopped,false);assert.equal(proof.terminalFamily.length,2);
+});
+
+test('a changed newest summary page invalidates tentative terminal evidence before any release',async()=>{
+  let lists=0;
+  const request=async(method)=>method==='thread/read'?{thread:{id:identity.threadId,turns:[]}}:
+    ++lists===1?{data:[summaryTurn('root-turn')],nextCursor:null}:
+      {data:[summaryTurn('new-continuation','other',{rootTurnId:'root-turn',status:'inProgress',completedAt:null}),summaryTurn('root-turn')],nextCursor:null};
+  const proof=await readFaultRescueTurnProof(request,identity);
+  assert.equal(proof.confirmed,true);assert.equal(proof.stopped,false);assert.equal(proof.reason,'turn_head_changed');
+  assert.equal(isStoppedFaultRescueProof(proof,identity),false);
 });
 test('finite pagination, absent client and unavailable root preserve unconfirmed ownership',async()=>{
   const absent=paginatedRequest([{data:[summaryTurn('one','other')],nextCursor:'a'},{data:[summaryTurn('two','other')],nextCursor:'b'}],[]);

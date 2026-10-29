@@ -4,6 +4,7 @@ import {readJson,atomicJson} from './journal.mjs';
 import {resolveFailureAlerts} from './alert.mjs';
 import {cloudRecoveryOwned} from './recovery-fence.mjs';
 import {isDedicatedObservation} from './browser.mjs';
+import {finishedFaultRescueEvidence} from './fault-rescue-ownership.mjs';
 
 const stamp=value=>typeof value==='string' && /(Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value));
 export const HEALTH_CLOCK_SKEW_MS=5000;
@@ -69,7 +70,7 @@ export function verifiedHealthEvidence(input) {
 async function newerClosedRescueEpoch(directory,plan,previous,evidence) {
   if(previous?.state!=='healthy')return null;
   const local=await readJson(path.join(directory,'fault-rescue.json')),cloud=plan.faultRescue;
-  if(local?.version!==1 || local.phase!=='finished' || local.agentStopped!==true ||
+  if(!finishedFaultRescueEvidence(local,{now:Date.parse(evidence.healthyAt)}) ||
       !['recovered','unresolved','needs_human','handled'].includes(local.outcome) || cloud?.phase!=='finished' ||
       cloud.outcome!==local.outcome || cloud.id!==local.ticket?.id || cloud.failureId!==local.failureId ||
       local.ticket?.failureId!==local.failureId || !['read_only_reconcile','approved_member_ops'].includes(cloud.scope) || local.ticket?.scope!==cloud.scope ||
@@ -86,7 +87,12 @@ async function newerClosedRescueEpoch(directory,plan,previous,evidence) {
 
 /** Repeated failures never reset backoff; only a new proven official health epoch does. */
 export async function markRuntimeHealthy({directory,config,plan,snapshot,journalState,clock=()=>new Date()}) {
-  const evidence=verifiedHealthEvidence({config,plan,snapshot,journalState,checkedAt:clock().toISOString()});
+  const checkedAt=clock().toISOString(),localRescue=await readJson(path.join(directory,'fault-rescue.json'));
+  if(localRescue&&!finishedFaultRescueEvidence(localRescue,{now:Date.parse(checkedAt)})) {
+    const error=new Error('Local fault rescue termination has not been verified; retain health and alert history.');
+    error.code='HEALTH_EVIDENCE_INVALID';error.healthDiagnostic={valid:false,reason:'local_fault_rescue_unsettled'};throw error;
+  }
+  const evidence=verifiedHealthEvidence({config,plan,snapshot,journalState,checkedAt});
   const file=path.join(directory,'browser-retry.json'),previous=await readJson(file);
   if(previous && previous.state!=='healthy') {
     if(previous.version!==1 || !stamp(previous.issuedAt) || !stamp(previous.statusCheckedAt) ||

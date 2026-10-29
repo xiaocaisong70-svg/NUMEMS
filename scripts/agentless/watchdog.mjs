@@ -9,6 +9,8 @@ import {loadConfig,runtimeDir} from './config.mjs';
 import {readJson,atomicJson} from './journal.mjs';
 import {restartDecision,reviewRetryDecision} from './watchdog-policy.mjs';
 import {browserRetryDecision} from './browser-retry-policy.mjs';
+import {isStoppedFaultRescueProof} from './fault-rescue-proof.mjs';
+import {stoppedFaultRescueEvidence,faultRescueIdentity} from './fault-rescue-ownership.mjs';
 import {faultRescueGate,faultRescueFile,faultRescueDeadline,dispatchPreparedFaultRescue,reconcileFaultRescueDispatch,
   settleFaultRescue} from './fault-rescue.mjs';
 const execute=promisify(execFile);
@@ -55,7 +57,6 @@ export async function processGate({host,lock},signal=pid=>process.kill(pid,0),in
 
 const stamp=value=>typeof value==='string'&&/(Z|[+-]\d{2}:\d{2})$/.test(value)&&Number.isFinite(Date.parse(value));
 const rescueCodes=new Set(['browser_unavailable','login_expired','unknown']);
-const finalTurnStates=new Set(['completed','failed','interrupted']);
 function stopVeto(stop,host,now) {
   if(!stop)return false;
   return stop.version!==1||typeof stop.id!=='string'||!/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.test(stop.id)||
@@ -90,9 +91,8 @@ export function faultRescueRestartDecision({host,status,journal,adminResult,resc
     adminResult?.command!=='finish-fault-rescue'||adminResult.requestId!==rescue.ticket?.id||adminResult.success!==true||adminResult.modelCalls!==0||
     adminResult.result?.rescueId!==rescue.ticket.id||adminResult.result.state!=='finished'||adminResult.result.outcome!=='recovered'||
     adminResult.result.failureId!==rescue.failureId)return deny;
-  const p=rescue.agentProof;
-  if(p?.kind!=='codex_turn_state'||p.source!=='app_server_thread_read'||p.confirmed!==true||p.stopped!==true||
-    p.threadId!==rescue.threadId||p.clientUserMessageId!==rescue.clientId||!finalTurnStates.has(p.status)||
+  const p=stoppedFaultRescueEvidence(rescue,{now});
+  if(!p||
     ![rescue.createdAt,rescue.updatedAt,p.observedAt,status.checkedAt,adminResult.startedAt,adminResult.finishedAt].every(stamp))return deny;
   if(Date.parse(rescue.createdAt)>Date.parse(p.observedAt)||Date.parse(p.observedAt)>Date.parse(rescue.updatedAt)||
     Date.parse(rescue.updatedAt)>Date.parse(status.checkedAt)||Date.parse(adminResult.startedAt)>Date.parse(p.observedAt)||
@@ -172,7 +172,7 @@ export async function superviseFaultRescue({directory,config,host,status,journal
   const health=r?.phase==='finished'?await readJson(path.join(directory,'browser-retry.json')):null;
   const newerHealth=health?.version===2&&health.state==='healthy'&&stamp(health.officialObservedAt)&&stamp(r?.createdAt)&&
     Date.parse(health.officialObservedAt)>Date.parse(r.createdAt);
-  const postRetry=r?.phase==='finished'&&['unresolved','handled'].includes(r.outcome)&&r.failureCode==='browser_unavailable'&&
+  const postRetry=!active&&r?.phase==='finished'&&['unresolved','handled'].includes(r.outcome)&&r.failureCode==='browser_unavailable'&&
     !newerHealth&&status?.state==='blocked'&&status.failureCode==='browser_unavailable'&&journal?.phase==='settled'&&journal.lease==null&&journal.receipt==null&&journal.submission==null;
   if(!active&&!candidate&&!postRetry)return {handled:false,rescue:r};
   if(config.liveActions!==true||config.browserMode!=='isolated_desktop'||config.headless!==false||config.legacyCheckerDisabled!==true)
@@ -213,10 +213,10 @@ export async function superviseFaultRescue({directory,config,host,status,journal
     try {await runProbe();}catch{return report('fault_rescue_recovery_probe_unavailable');}
     return report('fault_rescue_recovery_probe_exited');
   }
-  if(r?.phase==='finished'&&['unresolved','handled'].includes(r.outcome)&&!newerHealth)return {handled:false,rescue:r};
-  if(r?.phase==='finished'&&!candidate)return {handled:false,rescue:r};
+  if(!active&&r?.phase==='finished'&&['unresolved','handled'].includes(r.outcome)&&!newerHealth)return {handled:false,rescue:r};
+  if(!active&&r?.phase==='finished'&&!candidate)return {handled:false,rescue:r};
   if(config.faultRescue?.enabled!==true||!['read_only_reconcile','approved_member_ops'].includes(config.faultRescue.scope))return report('fault_rescue_dispatch_disabled');
-  if(!r||r.phase==='finished'||['preparing','uncertain'].includes(r.phase)&&!r.dispatchStartedAt&&r.reason!=='dispatch_intent_already_exists') {
+  if(!r||r.phase==='finished'&&faultRescueGate(r).allowWorker||['preparing','uncertain'].includes(r.phase)&&!r.dispatchStartedAt&&r.reason!=='dispatch_intent_already_exists') {
     try {await runAdmin('prepare-fault-rescue');}catch{}
     preparedThisTick=true;
     const proof=await refreshSafety();r=await readJson(faultRescueFile(directory));
@@ -246,9 +246,7 @@ export async function superviseFaultRescue({directory,config,host,status,journal
     r=await readJson(faultRescueFile(directory));
     const identity={threadId:r.threadId,clientUserMessageId:r.clientId,queuedId:r.queuedId??null};
     const proof=await client.observeTurnState(identity);
-    stopped=proof?.kind==='codex_turn_state'&&proof.source==='app_server_thread_read'&&proof.confirmed===true&&
-      proof.stopped===true&&proof.threadId===r.threadId&&proof.clientUserMessageId===r.clientId&&finalTurnStates.has(proof.status)&&
-      stamp(proof.observedAt)&&now().getTime()-Date.parse(proof.observedAt)<=60_000&&Date.parse(proof.observedAt)<=now().getTime()+5000;
+    stopped=isStoppedFaultRescueProof(proof,faultRescueIdentity(r),{now:now().getTime(),maxAgeMs:60_000});
     if(stopped) {r={...r,watchdogStopProof:proof};await atomicJson(faultRescueFile(directory),r);}
     else observationReason=(await settleFaultRescue({directory,hostSafe:true,clock:now,
       client:{observeTurnState:async()=>proof,interruptTrackedTurn:(...args)=>client.interruptTrackedTurn(...args)},
@@ -258,7 +256,7 @@ export async function superviseFaultRescue({directory,config,host,status,journal
   try {await runAdmin('finish-fault-rescue',r.ticket.id);}catch{}
   const proof=await refreshSafety();r=await readJson(faultRescueFile(directory));
   if(!faultRescueHostSafe({...proof,now:now().getTime()}))return report('fault_rescue_finish_host_not_closed');
-  return report(r?.phase==='finished'?'fault_rescue_finished':'fault_rescue_finish_unconfirmed');
+  return report(r?.phase==='finished'&&faultRescueGate(r,{now:now().getTime()}).allowWorker?'fault_rescue_finished':'fault_rescue_finish_unconfirmed');
 }
 
 export async function supervise({config,host,status,journal,adminResult,lock,retryRecord,reviewIntent,intentDigest,stopRequest,run,save,faultRescueRecord,

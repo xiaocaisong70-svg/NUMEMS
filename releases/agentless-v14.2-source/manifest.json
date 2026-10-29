@@ -1,0 +1,135 @@
+{
+  "release": "agentless-v14.2-source",
+  "sourceCommit": "f80cd00f944903c14348e099f9342e740f06ff16",
+  "baseSourceCommit": "fa24df3f901368edfa9936ee3ed193d25ab39c76",
+  "basePublishedCommit": "7494e5ec5cf645f24aea86590a9c3b203899d80f",
+  "publicHistoryOnly": true,
+  "tests": {
+    "passed": 662,
+    "failed": 0
+  },
+  "liveVerification": "Two real scripted invitations and automatic acceptance reconciliation passed. No new live member expiry removal was tested in this patch.",
+  "rollbackTag": "agentless-v14",
+  "changedSourceFiles": [
+    {
+      "path": "ROLLBACK-V14.1.md",
+      "sha256": "aa3edb835bd241b2ca6ef7c97997145652007df8d806ea2eab63644cc52096a3"
+    },
+    {
+      "path": "ROLLBACK-V14.2.md",
+      "sha256": "b7042fd32fcce5fa5c9bf9829c64f990473761f5588c139526ae0a98a44cd1e1"
+    },
+    {
+      "path": "docs/V14.1-REPAIR.md",
+      "sha256": "93074d416897a69b86df8588aef38b48e45e386779172bce5a894b31f14e5777"
+    },
+    {
+      "path": "docs/V14.2-WORKSPACE-COMPATIBILITY.md",
+      "sha256": "e00ed973a451b22a281a79ee25321b231eecffd953cfb12f7b489a498d326098"
+    },
+    {
+      "path": "package.json",
+      "sha256": "d00d5a7e138ad530d220c24c32e60579aec4d0b2f82acf385c07e82355337e75"
+    },
+    {
+      "path": "scripts/agentless/admin.mjs",
+      "sha256": "29a2705f275dad12a7e213fb7efa4259026754e2768df2323524340d65642d9e"
+    },
+    {
+      "path": "scripts/agentless/fault-rescue-client.mjs",
+      "sha256": "0b06555d6e84f63fe28bf38abd9a564ccb3b2fdefe9b102b66ad65a61df07514"
+    },
+    {
+      "path": "scripts/agentless/fault-rescue-ownership.mjs",
+      "sha256": "34d2f3942884bad7949c3651aa869cd7a3821a30ec5ecd07af0524f518054f6e"
+    },
+    {
+      "path": "scripts/agentless/fault-rescue-proof.mjs",
+      "sha256": "1e105c9e8d98d26428364f8bb5bda1e88a27c2d001b6e5e3a6f45bda8c46e071"
+    },
+    {
+      "path": "scripts/agentless/fault-rescue.mjs",
+      "sha256": "bc212146c03e73cecc23d004c6c126980c9a9fb13835edd11feb5b169a3f3561"
+    },
+    {
+      "path": "scripts/agentless/health-cycle.mjs",
+      "sha256": "79eb4e405678d804ec8857262bdfdb94322a289fa8a02baf9af5602bf5d3b4df"
+    },
+    {
+      "path": "scripts/agentless/isolated-desktop.ps1",
+      "sha256": "e58e2c3705ce1256d405c03baa625e75f3c781f3b5ea0623155759b28215926b"
+    },
+    {
+      "path": "scripts/agentless/journal.mjs",
+      "sha256": "fec10dfc5c2e6f1445b9edb988c6accc441895d423fce7f4470c63174b03e464"
+    },
+    {
+      "path": "scripts/agentless/recovery-fence.mjs",
+      "sha256": "86462a5041a108bfbe05dc774768007238abad49380d2796db64f76090eb4492"
+    },
+    {
+      "path": "scripts/agentless/rollback-v12.mjs",
+      "sha256": "9aabb8855d54eb3f0bf686b6a16fe1c062e3ce3ca5390d092bdd847ad2444ccc"
+    },
+    {
+      "path": "scripts/agentless/rollback-v13.mjs",
+      "sha256": "76ecbf1382558cd4eef3878c248f9027259f23b1d935b1db2aafb8fbfbc4b5dd"
+    },
+    {
+      "path": "scripts/agentless/watchdog.mjs",
+      "sha256": "afc27bf08fc30999fa8cc26a1c28177e594468535a71474c9d6ed97e181580f6"
+    },
+    {
+      "path": "scripts/seat-executor/browser.mjs",
+      "sha256": "885ec7f75dcb39fd5e2c001624e55506a6f481c91391b93d0940d5029746a4d8"
+    },
+    {
+      "path": "tests/agentless-browser.test.mjs",
+      "sha256": "84c005550aa637226ae37ae36abd8e6f1b133838e6a24985ec029b3992cc57cf"
+    },
+    {
+      "path": "tests/agentless-modal.test.mjs",
+      "sha256": "fa05b9d60ece21905afeba63ae9787c0241bb966725f442fbcd06ebe367c877e"
+    },
+    {
+      "path": "tests/atomic-json-windows-busy.test.mjs",
+      "sha256": "e442a65f5bce9b7c7e8dfa447c8ac99e7eeb062d3588fca38e079dc35485cc0e"
+    },
+    {
+      "path": "tests/fault-rescue-persisted-proof.test.mjs",
+      "sha256": "84213cd759522cdbce1375e1ccc95cc3cac13d2d5f1ef398362b8c969beaa9a2"
+    },
+    {
+      "path": "tests/fault-rescue-v14.test.mjs",
+      "sha256": "23b06ca59982ed9f5a9089b6876a003e8cdaa13817a55d74d2ce4d3292c04557"
+    },
+    {
+      "path": "tests/fault-rescue-watchdog.test.mjs",
+      "sha256": "d199e04e7bf6ca95490577ce93774ec6dc004dd0fc509cffc020f146f5e20df4"
+    },
+    {
+      "path": "tests/fault-rescue.test.mjs",
+      "sha256": "c8a8d29968a94bca5a742656dc8158bd890ec51b2b1608c19791f67b7022aa3a"
+    },
+    {
+      "path": "tests/helpers/completed-rescue-proof.mjs",
+      "sha256": "d5f439688bd11994a57643776f4924de1bf5690ef03fadef57ebd0e0da9078d4"
+    },
+    {
+      "path": "tests/rescue-health-epoch.test.mjs",
+      "sha256": "1eb644ce48b34638040c4025764dc6f452214ed4c234c249db0fb4b9f1b201d1"
+    },
+    {
+      "path": "tests/rescue-readonly.test.mjs",
+      "sha256": "35a3ee528013e8bc377780e39721acf84f35474b95ebc70d2336891c14760d65"
+    },
+    {
+      "path": "tests/rollback-v12.test.mjs",
+      "sha256": "d71c52a1305a3af941657bce3846e2db26efabf55367911dde9926d0d9ade6b3"
+    },
+    {
+      "path": "tests/rollback-v13.test.mjs",
+      "sha256": "868c6a51f0d2abe6fcb6c1dfe70115cc57f7ad1fb95d50a58c159088eafb2581"
+    }
+  ]
+}

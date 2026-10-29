@@ -46,15 +46,19 @@ test('modal background workspace guard remains strict without relying on the acc
       await load(modal(button('Current selection: My Workspace')));
       await assert.doesNotReject(adapter.guard());
     });
-    await t.test('observed full console label requires exact workspace and ChatGPT account type',async()=>{
-      const prefix='选择全局设置、ChatGPT 工作空间或 Ads 账户。当前选择：';
-      await load(modal(button(`${prefix}My Workspace，ChatGPT 工作空间`)));
-      await assert.doesNotReject(adapter.guard());
-      for(const label of [`${prefix}My Workspace Other，ChatGPT 工作空间`,`${prefix}My Workspace，Ads 账户`]){
-        await load(modal(button(label)));
-        await assert.rejects(adapter.guard(),/工作空间选择器/);
-      }
-    });
+    for(const prefix of ['选择全局设置、ChatGPT 工作空间或 Ads 账户。当前选择：','选择 ChatGPT 工作空间或 Ads 账户。当前选择：']){
+      for(const withModal of [false,true])await t.test(`full console label stays exact and unique (${prefix}, modal ${withModal})`,async()=>{
+        const render=background=>withModal?modal(background):`<!doctype html><html><head><meta charset="utf-8"></head><body><h1>My Workspace</h1>${background}</body></html>`;
+        const label=`${prefix}My Workspace，ChatGPT 工作空间`;
+        await load(render(button(label)));
+        await assert.doesNotReject(adapter.guard());
+        for(const background of [button(`${prefix}My Workspace Other，ChatGPT 工作空间`),
+          button(`${prefix}My Workspace，Ads 账户`),button(label)+button(label),button(label,'display:none')]){
+          await load(render(background));
+          await assert.rejects(adapter.guard(),/工作空间选择器/);
+        }
+      });
+    }
     await t.test('URL and workspace content guards are unchanged',async()=>{
       await load(modal(button()));
       await page.goto(`${fixtureOrigin}/workspace/wrong/members`);
